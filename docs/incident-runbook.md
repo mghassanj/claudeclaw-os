@@ -98,3 +98,24 @@ sqlite3 store/claudeclaw.db \
 ## When the runbook doesn't help
 
 `pkill -9 -f 'node.*dist/index.js'` and let launchd respawn. Last-resort hammer; you'll lose in-flight turns but the system comes back clean.
+
+## Max-plan throttle / rate limit hit
+
+Symptom: agents start failing with 429s, `query()` returns rate-limit errors, or main agent goes silent on Telegram while logs show `Pro/Max plan limit exceeded`.
+
+The Pro/Max plan assumes "ordinary individual usage" — an always-on multi-agent bot can hit limits faster than expected, especially during heavy mission days (deck builds, RAG ingestion, war-room sessions).
+
+**Fast switch to API-key billing (no code change, no restart):**
+
+1. Generate or retrieve an API key from `console.anthropic.com`.
+2. Edit `.env`:
+   ```
+   ANTHROPIC_API_KEY=sk-ant-api03-...
+   ```
+   Save. The agent SDK prefers `ANTHROPIC_API_KEY` over `CLAUDE_CODE_OAUTH_TOKEN` when both are present.
+3. Hot-reload: send `/respawn` to the main bot, or `sudo systemctl restart claudeclaw claudeclaw-{ops,comms,content,research}`.
+4. Switching back to Pro/Max: comment out or remove the `ANTHROPIC_API_KEY` line and restart.
+
+**Cost note:** API-key billing is per-token. Claude Opus 4.7 = $5/M input, $25/M output. A heavy day (~250 turns × 100K cache + 5K output average) lands around $5-15 USD. Use this as a fallback during throttle, not as a primary mode — Pro/Max is dramatically cheaper for typical use.
+
+**Fallback pre-flight:** keep an unset `# ANTHROPIC_API_KEY=` line commented in `.env` so the rotation is faster — uncomment, paste key, save.

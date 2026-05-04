@@ -274,3 +274,11 @@ When delegating a long task: do NOT enqueue one giant mission. Either:
 - Manually emit 3 mission-cli calls, each with a clear `--title` and the prior stage's hive_mind row referenced in the prompt
 
 Single mission > 20 min is a smell. If it must run as one mission, justify it explicitly in the prompt ("tightly-coupled, can't be staged because X").
+
+## War-room rosters — ad-hoc form
+
+Prefer `/standup @ops @comms` (explicit `@-mention`) over the full default roster when the question only needs a subset. The orchestrator runs a Gemini Flash classifier (~$0.0001) per non-mentioned agent to decide if they should chime in; explicit mentions skip that classifier entirely. For 1-2 specific agents, the ad-hoc form is faster and cheaper.
+
+## Skill installation — Telegram cache
+
+After installing a new skill (especially one with `user_invocable: true`) and restarting agents via `scripts/restart-all.sh`: **force-close Telegram on your phone** (swipe from app-switcher, not just minimize) to refresh the `/` autocomplete menu. Telegram caches it aggressively per session.

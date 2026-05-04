@@ -312,3 +312,24 @@ When launching a war room (text or voice), the orchestrator caps the active agen
 Per-turn tool budget is **8 calls** per agent. Past that the orchestrator emits a `system_note`, aborts the SDK subprocess, and the agent finalizes with text. Plan war-room work accordingly — long tool chains are not the right move.
 
 Full policy: `docs/warroom-mcp-policy.md`.
+
+## Memory recall trigger phrases
+
+To pull old conversations back into context efficiently, phrase recall queries with explicit trigger language:
+- "remember when we..."
+- "what did we discuss about..."
+- "find our prior conversation on..."
+
+These phrases activate the Layer 5 conversation-history recall (`[Conversation history recall]` block) and pull the relevant exchanges back without you needing to re-feed context.
+
+## Pinning high-importance memories
+
+Memories scored 0.8+ trigger a Telegram pin notification when saved. **Pinned memories never decay.**
+
+When you surface a memory in conversation that's clearly load-bearing (a Jisr/Master Works decision, a customer commitment, a non-obvious operational fact), suggest pinning it: "this looks like a 0.9-importance fact — want to pin it from the Telegram pin notification so it doesn't decay?"
+
+Decisions about Jisr architecture, Master Works strategy, customer agreements, and KSA-regulatory interpretations should be pinned as a default — they shouldn't time out after 90 days.
+
+## Dashboard System Health gauge
+
+The dashboard's System Health panel shows a context-window gauge (green / yellow / red). When it goes yellow, run `/newchat` + `/respin` proactively — don't wait for the `[compact]` event to fire mid-task. The gauge gives 10-15 turns of warning that the event doesn't.
