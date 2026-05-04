@@ -265,3 +265,50 @@ await page.goto('https://mail.google.com/');
 // ... do work ...
 await page.close();  // page, NOT browser
 ```
+
+## When things break — kill switches
+
+All flags below live in `.env` and **hot-reload in ~2 seconds**. Flip a flag to `false`, save, change applies. No restart needed. Verify via `GET /api/health?token=$DASHBOARD_TOKEN` — the `killSwitches` map echoes current state.
+
+| Flag | Disables | Use when |
+|---|---|---|
+| `LLM_SPAWN_ENABLED=false` | Every `query()` call (text + voice + agent chat + scheduler) | Tokens spiking, agent looping, runaway cost |
+| `MISSION_AUTO_ASSIGN_ENABLED=false` | Mission task auto-assignment | Mission queue stuck or assigning to wrong agent |
+| `SCHEDULER_ENABLED=false` | Cron-driven scheduled tasks + mission worker | Scheduled task is causing the problem |
+| `WARROOM_TEXT_ENABLED=false` | Text war-room sends only | Text-room bug, voice still works |
+| `WARROOM_VOICE_ENABLED=false` | Voice war-room start only | Pipecat / Daily issue, text still works |
+| `DASHBOARD_MUTATIONS_ENABLED=false` | All POST/PATCH/DELETE on dashboard | Suspicious activity, want read-only mode |
+
+**Verify a flag took effect:**
+```bash
+curl -s "http://localhost:8989/api/health?token=$DASHBOARD_TOKEN" | jq '.killSwitches'
+```
+
+**When the flag isn't enough — last resort:**
+```bash
+sudo pkill -9 -f 'node.*dist/index.js'
+# systemd respawns within 2-5s; you lose in-flight turns but the system comes back clean
+```
+
+For full incident procedures (cost spike, war-room broken, leaked DASHBOARD_TOKEN, migration failure, high disk, voice agent stuck): see `docs/incident-runbook.md`.
+
+**Trigger pattern** — when the user says "stop", "kill it", "tokens are spiking", "the bot is looping", "production is on fire", or sends an emoji like 🚨/🛑 — flip `LLM_SPAWN_ENABLED=false` first, ask questions second.
+
+## Recovering a stale session — `/newchat` + `/respin`
+
+If context feels stale, you've hit a `[compact]` system event, or a multi-iteration build is going sideways: don't keep grinding in the same session.
+
+1. Send `/newchat` — clean session, persistent SQLite memory still loads.
+2. Send `/respin` — pulls the last 20 turns back as historical context, preserving thread.
+
+**When to use:** the deck thrash on 2026-05-04 ran 6+ rebuild iterations in one stale session. The right move at iteration 2 was `/newchat` + `/respin`. Use it BEFORE attempting another rebuild iteration on a stuck artifact, not after.
+
+If a `[compact]` system event fires mid-task: finish the current sub-deliverable, then `/newchat` + `/respin`. Continuing past compaction in a multi-iteration build is the failure mode that caused the thrash.
+
+## War-room rotation and rosters
+
+When launching a war room (text or voice), the orchestrator caps the active agent set at **8**. If you `@-mention` more than 8, the over-cap agents queue and rotate in on subsequent turns. To skip the saved roster on a per-meeting basis, `@-mention` the exact agents you want — that overrides the default roster for that meeting only.
+
+Per-turn tool budget is **8 calls** per agent. Past that the orchestrator emits a `system_note`, aborts the SDK subprocess, and the agent finalizes with text. Plan war-room work accordingly — long tool chains are not the right move.
+
+Full policy: `docs/warroom-mcp-policy.md`.

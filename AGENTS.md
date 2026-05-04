@@ -236,3 +236,41 @@ This rule applies to ALL agents (content, comms, research, ops, main).
 5. **Hypothesis**: "WebRTC" is pipecat's generic "media init failed" error message — misleading. Real cause: browser closing the WebSocket before completing the upgrade handshake. Most likely: mic permission revoked between sessions.
 6. **Verify by reproducing**: open browser DevTools console, refresh war room, watch for the actual JS error that fires *before* pipecat's generic message. That tells us whether it's mic permission, network, an extension block, or something else.
 7. **Do not claim done** until the war room actually accepts a connection, streams audio, and the user confirms verbally.
+
+## Long-running missions — break work into stages
+
+Mission tasks have a hard timeout (default 30 min in our setup). Single missions that try to do "read sources + generate artifact + QA + deliver" all in one call have repeatedly hit the wall (deck thrash 2026-05-04: 1 timeout → 6 reactive rebuilds).
+
+**Rule:** if a task's natural budget is over ~20 min of focused work, **break it into stages**. Each stage is its own mission with its own ≤30 min budget, and stages hand off via `hive_mind` artifacts.
+
+### Canonical staging pattern
+
+```
+Stage 1: Plan / outline / extract source content    → produces SPEC artifact
+Stage 2: Build the artifact (deck/doc/report)       → produces ARTIFACT
+Stage 3: QA + delivery (deck-visual-qa, email gate) → produces DELIVERABLE
+```
+
+Each stage:
+- Reads the previous stage's `hive_mind` row to find the artifact path
+- Writes its own `hive_mind` row when done (artifact path in the `artifacts` JSON)
+- Uses `verification-pre-flight` to confirm inputs exist before starting
+
+### When to use the staging pattern
+
+Apply when ANY of:
+- Reading 3+ source documents
+- Generating ≥10 slides / pages / sections
+- Multiple output formats (PPTX + PDF + email body)
+- The task includes "design system" or "QA" or "review"
+- The user says "presentation" / "pitch deck" / "report" / "comprehensive" / "from scratch"
+
+For deck builds specifically, use the `mission-deck-template` skill — it auto-emits the 3 mission-cli calls with the right hand-offs.
+
+### What main agent does
+
+When delegating a long task: do NOT enqueue one giant mission. Either:
+- Invoke `mission-deck-template` (or analogous staging skill) which emits 3 missions in sequence, OR
+- Manually emit 3 mission-cli calls, each with a clear `--title` and the prior stage's hive_mind row referenced in the prompt
+
+Single mission > 20 min is a smell. If it must run as one mission, justify it explicitly in the prompt ("tightly-coupled, can't be staged because X").
