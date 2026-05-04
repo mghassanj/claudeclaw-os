@@ -1,4 +1,4 @@
-import { generateContent, parseJsonResponse } from './gemini.js';
+import { generateContent, parseJsonResponse } from "./anthropic.js";
 import {
   getUnconsolidatedMemories,
   saveConsolidationAtomic,

@@ -66,7 +66,7 @@ import {
   getRecentlySuggestedSplits,
 } from './db.js';
 import { computeNextRun } from './scheduler.js';
-import { generateContent, parseJsonResponse } from './gemini.js';
+import { generateContent, parseJsonResponse } from "./anthropic.js";
 import { getSecurityStatus } from './security.js';
 import { AGENT_ID_RE, agentExists, listAgentIds, loadAgentConfig, resolveAgentDir, setAgentModel } from './agent-config.js';
 import {

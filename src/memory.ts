@@ -19,7 +19,7 @@ import {
   searchMemories,
 } from './db.js';
 import { cosineSimilarity, embedText } from './embeddings.js';
-import { generateContent, parseJsonResponse } from './gemini.js';
+import { generateContent, parseJsonResponse } from "./anthropic.js";
 import { logger } from './logger.js';
 import { ingestConversationTurn } from './memory-ingest.js';
 import { buildObsidianContext } from './obsidian.js';
