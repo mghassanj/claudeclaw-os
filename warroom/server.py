@@ -20,8 +20,11 @@ Usage:
 Environment variables:
     WARROOM_MODE         "live" (default) or "legacy"
     WARROOM_PORT         port to listen on (default: 7860)
-    WARROOM_LIVE_MODEL   Gemini Live model id (default: whatever Pipecat ships)
-    WARROOM_LIVE_VOICE   Gemini Live voice name (default: "Charon")
+    WARROOM_LIVE_MODEL     Gemini Live model id (default: whatever Pipecat ships)
+    WARROOM_LIVE_VOICE     Gemini Live voice name (default: "Charon")
+    WARROOM_SPEECH_TIMEOUT seconds of silence before end-of-turn (default: 0.3)
+                           Lower = faster reply; too low cuts off natural pauses.
+                           Increase to 0.5-0.6 if Arabic pauses trigger false stops.
 
     GOOGLE_API_KEY       required for live mode
     DEEPGRAM_API_KEY     required for legacy mode
@@ -47,8 +50,8 @@ import json
 import logging
 import os
 import shutil
-import signal
 import subprocess
+import time
 from pathlib import Path
 
 # Ensure the warroom package is importable when run as a script
@@ -197,51 +200,21 @@ ANSWER_TIMEOUT_SEC = float(os.environ.get("WARROOM_ANSWER_TIMEOUT", "25"))
 
 
 async def _run_subprocess(cmd: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
-    """Run a subprocess with timeout. Returns (exit_code, stdout, stderr).
-
-    Runs the child in its own process group via ``start_new_session`` so a
-    timeout kill terminates the whole group. Without this, timing out an
-    agent-voice-bridge wrapper leaves the nested Claude Code process (and
-    whatever tools it spawned) running in the background and producing
-    spurious work after the voice turn has already failed.
-    """
+    """Run a subprocess with timeout. Returns (exit_code, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(PROJECT_ROOT),
-        start_new_session=True,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        pgid = None
         try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, OSError):
+            proc.kill()
+            await proc.wait()
+        except Exception:
             pass
-        if pgid is not None:
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-        else:
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
         return -1, "", "timeout"
     return proc.returncode or 0, stdout.decode(errors="replace").strip(), stderr.decode(errors="replace").strip()
 
@@ -384,26 +357,20 @@ async def answer_as_agent_handler(params):
         }, properties=silent)
         return
 
-    # Helper: push a server-message envelope to the browser. RTVI observer
-    # wraps it for the Pipecat JS client's onServerMessage callback.
-    # Best-effort — if the pipeline is mid-teardown the push can fail; the
-    # failure is non-fatal because the user-visible state is recoverable on
-    # the next interaction.
-    async def _push_event(payload: dict) -> None:
-        try:
-            await params.llm.push_frame(
-                RTVIServerMessageFrame(data=payload),
-                FrameDirection.DOWNSTREAM,
-            )
-        except Exception as exc:
-            logger.warning("answer_as_agent: push %s frame failed: %s", payload.get("event"), exc)
-
     # Fire the hand-up signal to the browser BEFORE the expensive
     # subprocess call. The RTVIObserver in the pipeline picks this up
     # and wraps it into an RTVI "server-message" envelope that the JS
     # client surfaces via onServerMessage. This is how the user sees
     # "research has their hand up" a beat before hearing the answer.
-    await _push_event({"event": "agent_selected", "agent": agent})
+    try:
+        hand_up_frame = RTVIServerMessageFrame(
+            data={"event": "agent_selected", "agent": agent},
+        )
+        await params.llm.push_frame(hand_up_frame, FrameDirection.DOWNSTREAM)
+    except Exception as exc:
+        # Non-fatal: the browser just won't show the animation. Log
+        # and continue to the actual answer.
+        logger.warning("answer_as_agent: push hand-up frame failed: %s", exc)
 
     logger.info("answer_as_agent: agent=%s question=%r", agent, question[:80])
 
@@ -418,24 +385,10 @@ async def answer_as_agent_handler(params):
 
     if code != 0:
         logger.error("answer_as_agent failed: code=%d stderr=%s", code, err[:200])
-        # Tell the browser to drop the hand-up animation immediately and
-        # surface a visible error so the user knows the agent did NOT
-        # answer rather than silently waiting for nothing. This covers both
-        # the 25s timeout path (silent stuck hand-up was the main UX bug)
-        # and OAuth-token-expired / bridge-failed paths (Gemini would have
-        # mumbled a vague recovery line; now the user sees a real banner).
-        await _push_event({"event": "hand_down", "agent": agent})
-        err_short = (err[:200] if err else "voice bridge failed")
-        # Heuristic: if stderr contains hints of OAuth/auth failure, surface
-        # an actionable message. Otherwise pass the raw stderr snippet.
-        err_lower = (err or "").lower()
-        if any(s in err_lower for s in ("oauth", "401", "unauthorized", "token", "credentials")):
-            err_short = "auth failed (token expired?). Run `claude login` and restart the war room."
-        await _push_event({"event": "agent_error", "agent": agent, "error": err_short})
         await params.result_callback({
             "ok": False,
             "agent": agent,
-            "error": err_short,
+            "error": err[:200] or "voice bridge failed",
         }, properties=silent)
         return
 
@@ -445,8 +398,6 @@ async def answer_as_agent_handler(params):
         payload = json.loads(out)
     except json.JSONDecodeError:
         logger.error("answer_as_agent: invalid JSON from bridge: %r", out[:200])
-        await _push_event({"event": "hand_down", "agent": agent})
-        await _push_event({"event": "agent_error", "agent": agent, "error": "invalid bridge output"})
         await params.result_callback({
             "ok": False,
             "agent": agent,
@@ -456,20 +407,12 @@ async def answer_as_agent_handler(params):
 
     response_text = payload.get("response")
     if payload.get("error") or not response_text:
-        err_msg = payload.get("error") or "empty response"
-        await _push_event({"event": "hand_down", "agent": agent})
-        await _push_event({"event": "agent_error", "agent": agent, "error": err_msg[:200]})
         await params.result_callback({
             "ok": False,
             "agent": agent,
-            "error": err_msg,
+            "error": payload.get("error") or "empty response",
         }, properties=silent)
         return
-
-    # Success: drop the hand-up animation now that the agent has actually
-    # answered. The browser's 6s auto-clear is a fallback; this fires the
-    # instant the spoken response arrives, which feels natural.
-    await _push_event({"event": "hand_down", "agent": agent})
 
     await params.result_callback({
         "ok": True,
@@ -522,16 +465,78 @@ async def run_live_mode():
     """Gemini Live native-audio pipeline with tool calling."""
     from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
     from pipecat.processors.aggregators.llm_context import LLMContext
-    from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+    from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
+    from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import SpeechTimeoutUserTurnStopStrategy
     from pipecat.adapters.schemas.function_schema import FunctionSchema
     from pipecat.adapters.schemas.tools_schema import ToolsSchema
     from pipecat.frames.frames import LLMContextFrame
     from personas import get_persona
 
+    from pipecat.frames.frames import (
+        MetricsFrame, UserStoppedSpeakingFrame, BotStartedSpeakingFrame
+    )
+    from pipecat.metrics.metrics import TTFBMetricsData, ProcessingMetricsData
+    from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+
+    class LatencyLogger(FrameProcessor):
+        """Intercepts timing frames to surface per-turn latency breakdowns.
+
+        Tracks two independent clocks:
+          • user_stopped_at  — set when UserStoppedSpeakingFrame passes through
+            (i.e. the moment the speech-timeout strategy fires and declares
+            end-of-turn; Gemini receives the turn-complete signal immediately
+            after this).
+          • bot_started_at   — set when BotStartedSpeakingFrame arrives
+            (i.e. Gemini's first audio frame has reached the pipeline).
+
+        The delta between the two is the *true* E2E latency from end-of-speech
+        to first audio out. It includes:
+            speech_timeout wait  +  Gemini network RTT  +  Gemini processing
+        TTFB from MetricsFrame covers only the last two legs (starts after the
+        timeout fires), so:
+            E2E ≈ speech_timeout + TTFB
+        """
+
+        def __init__(self):
+            super().__init__()
+            self._user_stopped_at: float | None = None
+
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+
+            if isinstance(frame, UserStoppedSpeakingFrame):
+                self._user_stopped_at = time.monotonic()
+                logger.info("⏱  VAD end-of-speech detected — waiting for Gemini")
+
+            elif isinstance(frame, BotStartedSpeakingFrame):
+                if self._user_stopped_at is not None:
+                    e2e_ms = (time.monotonic() - self._user_stopped_at) * 1000
+                    logger.info("⏱  E2E latency (EOSpeech → first audio): %.0f ms", e2e_ms)
+                    self._user_stopped_at = None
+
+            elif isinstance(frame, MetricsFrame):
+                for m in frame.data:
+                    if isinstance(m, TTFBMetricsData):
+                        logger.info(
+                            "⏱  TTFB [%s/%s]: %.0f ms",
+                            m.processor, m.model or "?", m.value * 1000,
+                        )
+                    elif isinstance(m, ProcessingMetricsData):
+                        logger.info(
+                            "⏱  Processing [%s/%s]: %.0f ms",
+                            m.processor, m.model or "?", m.value * 1000,
+                        )
+
+            await self.push_frame(frame, direction)
+
     check_required_keys({"GOOGLE_API_KEY": "Google AI (Gemini Live native audio)"})
 
     port = int(os.environ.get("WARROOM_PORT", "7860"))
     model = os.environ.get("WARROOM_LIVE_MODEL")  # None = use Pipecat's default
+    # Silence duration (seconds) before end-of-turn fires. Lower = faster
+    # replies; too low cuts natural pauses. Default 0.3 s (was 0.6 s).
+    speech_timeout = float(os.environ.get("WARROOM_SPEECH_TIMEOUT", "0.3"))
 
     # Determine which agent + mode is active. Defaults: ("main", "direct").
     # If the user has clicked an agent card or a mode button on the
@@ -664,12 +669,27 @@ async def run_live_mode():
     # it routes user speech / Gemini responses into the LLMContext and
     # triggers `set_context()` on the service so `_ready_for_realtime_input`
     # flips True and audio actually flows.
-    aggregators = LLMContextAggregatorPair(context)
+    # Disable Smart Turn (LocalSmartTurnAnalyzerV3) — fragments Arabic speech
+    # into 4+ false stops per utterance. Replace with timeout-based stop that
+    # uses Gemini Live final-transcription signals.
+    # speech_timeout = env WARROOM_SPEECH_TIMEOUT (default 0.3 s, was 0.6 s).
+    # Lower value → faster reply; raise to 0.5–0.6 if false stops appear.
+    aggregators = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            user_turn_strategies=UserTurnStrategies(
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=speech_timeout)],
+            ),
+        ),
+    )
+
+    latency_logger = LatencyLogger()
 
     pipeline = Pipeline([
         transport.input(),
         aggregators.user(),
         llm,
+        latency_logger,
         aggregators.assistant(),
         transport.output(),
     ])
@@ -714,8 +734,8 @@ async def run_live_mode():
     print_ready(port, "live")
     runner = PipelineRunner(handle_sigterm=True)
     logger.info(
-        "War Room LIVE mode on ws://0.0.0.0:%d (agent=%s mode=%s voice=%s model=%s tools=%d)",
-        port, active_agent, active_mode, voice, model or "pipecat-default", len(standard_tools),
+        "War Room LIVE mode on ws://0.0.0.0:%d (agent=%s mode=%s voice=%s model=%s tools=%d speech_timeout=%.2fs)",
+        port, active_agent, active_mode, voice, model or "pipecat-default", len(standard_tools), speech_timeout,
     )
     await runner.run(task)
     logger.info("War Room session ended.")
