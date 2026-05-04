@@ -120,3 +120,7 @@ agents/*/agent.yaml.backup
 # CWDs (sub-agents start with cwd=agents/<id>).
 .claude/claudex/
 agents/*/.claude/claudex/
+
+# Agents self-mirror skills here at runtime when they reference one in their CLAUDE.md.
+# Not source — content lives in ~/.claude/skills/ + /home/ubuntu/repos/skills/.
+agents/*/skills/
