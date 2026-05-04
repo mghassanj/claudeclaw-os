@@ -154,6 +154,39 @@ export async function downloadTelegramFile(
  * Transcribe an audio file using Groq's Whisper API.
  * Supports .ogg, .mp3, .wav, .m4a.
  */
+/**
+ * Detect Whisper transcription hallucinations. When audio is mostly silence
+ * or noise, the STT model sometimes emits one syllable on infinite repeat
+ * for the entire audio length (we observed 131K chars from a 30s clip).
+ *
+ * Length guard: rejects > 5000 chars (~5min legit transcript fits comfortably).
+ * Repetition guard: rejects when fewer than 15% of words are unique.
+ */
+function looksLikeHallucination(text: string): { hallucinated: boolean; reason?: string } {
+  if (!text) return { hallucinated: false };
+  if (text.length > 5000) {
+    return { hallucinated: true, reason: 'length=' + text.length + ' (>5000)' };
+  }
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length < 10) return { hallucinated: false };
+  const unique = new Set(words);
+  const ratio = unique.size / words.length;
+  if (ratio < 0.15) {
+    return {
+      hallucinated: true,
+      reason: 'uniqueRatio=' + ratio.toFixed(3) + ' (' + unique.size + '/' + words.length + ')',
+    };
+  }
+  return { hallucinated: false };
+}
+
+export class TranscriptionHallucinationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TranscriptionHallucinationError';
+  }
+}
+
 async function transcribeAudioGroq(filePath: string): Promise<string> {
   const env = readEnvFile(['GROQ_API_KEY']);
   const apiKey = env.GROQ_API_KEY;
@@ -265,14 +298,32 @@ export async function transcribeAudio(filePath: string): Promise<string> {
   // Try Groq first (cloud, fast)
   if (env.GROQ_API_KEY) {
     try {
-      return await transcribeAudioGroq(filePath);
+      const text = await transcribeAudioGroq(filePath);
+      if (text) {
+        const check = looksLikeHallucination(text);
+        if (check.hallucinated) {
+          logger.warn(
+            { reason: check.reason, sample: text.slice(0, 120) },
+            'Groq transcription looks hallucinated, trying local whisper',
+          );
+        } else {
+          return text;
+        }
+      }
     } catch (err) {
       logger.warn({ err }, 'Groq Whisper failed, trying local whisper-cpp');
     }
   }
 
-  // Fallback: local whisper-cpp
-  return await transcribeAudioLocal(filePath);
+  // Fallback: local whisper-cpp — if even this hallucinates, give up
+  const text = await transcribeAudioLocal(filePath);
+  const check = looksLikeHallucination(text);
+  if (check.hallucinated) {
+    throw new TranscriptionHallucinationError(
+      'Transcription appears to be a hallucination (' + (check.reason || 'unknown') + '). The audio may be silent, too noisy, or corrupted. Please re-record and try again.',
+    );
+  }
+  return text;
 }
 
 // ── TTS: ElevenLabs (primary) ────────────────────────────────────────────────

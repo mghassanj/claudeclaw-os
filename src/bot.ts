@@ -108,6 +108,7 @@ function checkContextWarning(chatId: string, sessionId: string | undefined, usag
 import {
   downloadTelegramFile,
   transcribeAudio,
+  TranscriptionHallucinationError,
   synthesizeSpeech,
   voiceCapabilities,
   UPLOADS_DIR,
@@ -1482,7 +1483,10 @@ export function createBot(): Bot {
       messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, `[Voice transcribed]: ${transcribed}`, wantsVoiceBack));
     } catch (err) {
       logger.error({ err }, 'Voice transcription failed');
-      await ctx.reply('Could not transcribe voice message. Try again.');
+      const reply = err instanceof TranscriptionHallucinationError
+        ? "Couldn't transcribe that — the audio sounded silent or too noisy. Try recording in a quieter spot."
+        : 'Could not transcribe voice message. Try again.';
+      await ctx.reply(reply);
     }
   });
 
