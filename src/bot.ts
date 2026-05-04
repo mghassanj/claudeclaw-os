@@ -123,7 +123,7 @@ const voiceEnabledChats = new Set<string>();
 const chatModelOverride = new Map<string, string>();
 
 const AVAILABLE_MODELS: Record<string, string> = {
-  opus: 'claude-opus-4-6',
+  opus: 'claude-opus-4-7',
   sonnet: 'claude-sonnet-4-5',
   haiku: 'claude-haiku-4-5',
 };
@@ -514,7 +514,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   const userModel = chatModelOverride.get(chatIdStr) ?? agentDefaultModel;
   const effectiveModel = (SMART_ROUTING_ENABLED && !userModel && classifyMessageComplexity(message) === 'simple')
     ? SMART_ROUTING_CHEAP_MODEL
-    : (userModel ?? 'claude-opus-4-6');
+    : (userModel ?? 'claude-opus-4-7');
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
