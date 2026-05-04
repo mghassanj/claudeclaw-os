@@ -20,8 +20,10 @@ import { formatForTelegram, splitMessage } from './bot.js';
 
 type Sender = (text: string) => Promise<void>;
 
-/** Max time (ms) a scheduled task can run before being killed. */
-const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+/** Max time (ms) a scheduled task can run before being killed.
+ *  Override via TASK_TIMEOUT_MS env var (e.g. 1800000 for 30 min). */
+const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || '', 10) || 30 * 60 * 1000;
+const TASK_TIMEOUT_LABEL = `${Math.round(TASK_TIMEOUT_MS / 60000)}m`;
 
 let sender: Sender;
 
@@ -96,8 +98,8 @@ async function runDueTasks(): Promise<void> {
         clearTimeout(timeout);
 
         if (result.aborted) {
-          updateTaskAfterRun(task.id, nextRun, 'Timed out after 10 minutes', 'timeout');
-          await sender(`⏱ Task timed out after 10m: "${task.prompt.slice(0, 60)}..." — killed.`);
+          updateTaskAfterRun(task.id, nextRun, `Timed out after ${TASK_TIMEOUT_LABEL}`, 'timeout');
+          await sender(`⏱ Task timed out after ${TASK_TIMEOUT_LABEL}: "${task.prompt.slice(0, 60)}..." — killed.`);
           logger.warn({ taskId: task.id }, 'Task timed out');
           return;
         }
@@ -174,14 +176,29 @@ async function runDueMissionTasks(): Promise<void> {
         if (cancelledByUser) {
           // Status is already 'cancelled' from the dashboard write — leave it.
           logger.info({ missionId: mission.id }, 'Mission task cancelled by user');
+        } else if (result.text?.trim()) {
+          // Watchdog fired but the agent produced output before the timer.
+          // Salvage as a partial completion: the user gets the work, downstream
+          // stages reading hive_mind see real artifacts. This closes the
+          // false-positive loop where "Mission timed out" notifications fired
+          // after a successful delivery (audit 2026-05-04).
+          const partial = result.text.trim();
+          completeMissionTask(mission.id, partial, 'completed');
+          logger.warn({ missionId: mission.id, len: partial.length }, 'Mission watchdog fired; partial result salvaged');
+          for (const chunk of splitMessage(formatForTelegram(partial))) {
+            await sender(chunk);
+          }
+          if (ALLOWED_CHAT_ID) {
+            const activeSession = getSession(ALLOWED_CHAT_ID, schedulerAgentId);
+            logConversationTurn(ALLOWED_CHAT_ID, 'user', '[Mission task: ' + mission.title + ']: ' + mission.prompt, activeSession ?? undefined, schedulerAgentId);
+            logConversationTurn(ALLOWED_CHAT_ID, 'assistant', partial, activeSession ?? undefined, schedulerAgentId);
+          }
         } else {
-          completeMissionTask(mission.id, null, 'failed', 'Timed out after 10 minutes');
-          logger.warn({ missionId: mission.id }, 'Mission task timed out');
+          completeMissionTask(mission.id, null, 'failed', `Timed out after ${TASK_TIMEOUT_LABEL}`);
+          logger.warn({ missionId: mission.id }, 'Mission task timed out (no output)');
           try {
             await sender('Mission task timed out: "' + mission.title + '"');
           } catch (sendErr) {
-            // Sender can fail for Telegram API blips or chat-not-found. We
-            // still want to see it so the user isn't silently unnotified.
             logger.warn({ err: sendErr, missionId: mission.id }, 'Failed to send mission timeout notification');
           }
         }
