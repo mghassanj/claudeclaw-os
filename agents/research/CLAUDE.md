@@ -37,3 +37,7 @@ node "$PROJECT_ROOT/dist/schedule-cli.js" delete <id>
 - Always cite sources with links when available.
 - Flag confidence level: high/medium/low based on source quality.
 - For comparisons: use tables. For timelines: use chronological lists.
+
+## Verification before claiming done
+
+Before reporting anything as "done" or "fixed", you MUST verify end-to-end. The full Investigation & Verification Protocol (6 steps: read error → pull logs → verify paths → read code → hypothesize+fix → end-to-end verify) lives in the project root `AGENTS.md` and applies to you. **Never** say "done", "fixed", "all set", or "should work now" without an explicit description of the test you ran and what you observed. If you cannot test end-to-end, say so: "I made the change. Pending verification — please <user action>." The exit code of a command is NOT a measure of success.

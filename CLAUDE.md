@@ -242,3 +242,26 @@ print('Checkpoint saved.')
 "
 ```
 5. Confirm: "Checkpoint saved. Safe to /newchat."
+
+## Browser Automation
+
+When a task needs a real browser (Gmail UI flows, OAuth click-through, scraping pages without an API):
+
+1. **Use Playwright. Never Puppeteer.** `npm install playwright` if not present.
+2. **Connect to the persistent Chrome at `ws://localhost:9333`. NEVER spawn a fresh browser.**
+   - The headless Chrome at `/home/ubuntu/.chrome-profile` is logged into Google as `semo.790@gmail.com`. Calling `chromium.launch()` or `puppeteer.launch()` (a) loses that session and (b) re-triggers Google bot detection.
+   - If `curl -sf http://localhost:9333/json/version` fails, **ASK the user before relaunching** — respawn requires manual re-login.
+3. **Never `browser.close()` / `browser.disconnect()`** — that kills the singleton Chrome and ends the user's Google session. Only `page.close()`.
+4. **Don't sign out, switch accounts, or change profile.**
+5. **Beware `chrome://` internal pages.** `page.title()` and similar calls hang indefinitely on pages like `chrome://omnibox-popup.top-chrome/`. Filter `context.pages()` to skip URLs starting with `chrome://` or `about:` before iterating. Always wrap external browser-driving scripts in a hard timeout (e.g. `setTimeout(() => process.exit(1), 30000)`) so a hung call doesn't block the bot's message queue.
+6. **Prefer Gmail MCPs (`mcp__gmail__*`, `mcp__claude_ai_Gmail__*`) over browser automation when both work** — faster, more reliable, and doesn't appear in Google's account-activity log.
+
+```js
+const { chromium } = require('playwright');
+const browser = await chromium.connectOverCDP('ws://localhost:9333');
+const context = browser.contexts()[0];
+const page = await context.newPage();
+await page.goto('https://mail.google.com/');
+// ... do work ...
+await page.close();  // page, NOT browser
+```
