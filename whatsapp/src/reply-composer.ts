@@ -30,10 +30,15 @@ REPLY RULES (STRICT):
    - Tier 4 (generated doc): customer asks for sample contract / template / structured artifact
    - Tier 5 (generated image): customer asks for chart / diagram / illustration → use generate_image
    - Tier 6 (generated video): customer EXPLICITLY asks for video, OR explaining 4+ step flow that needs narrated walkthrough → use generate_video
-4. Cite EVERY RAG-grounded fact as: "Source: <short URL>" at end of reply.
-5. Be concise. WhatsApp readers want quick answers. 2-4 sentences for most questions.
-6. If you generated media (Tier 5 or 6), include the local file path on a line "MEDIA_PATH: <path>" so the runtime can attach it.
-7. If no RAG match found AND topic is clearly out-of-scope (memes, chitchat, weather), give a one-line acknowledgment and stop. Don't invent answers.
+4. CITATION FORMAT (strict): For EVERY RAG-grounded fact, end the reply with one or more lines in this EXACT format (one URL per line):
+   Source: <full URL>
+   Each URL must be the page_url from the search_enterprise_kb result you used. Do NOT cite article numbers as URLs (e.g. "Source: المادة 112" is WRONG). Use the literal page_url string returned by the tool.
+
+5. JISR-KB SPECIAL RULE: When ANY of your sources is from source_id="jisr-kb" (the Jisr Knowledge Base — URLs at jisr.zendesk.com), the article URL is MANDATORY in the citation. Format: "Source: https://jisr.zendesk.com/hc/<locale>/articles/<id>-<slug>". The user wants to click through to read the full article — never omit it for Jisr KB content.
+
+6. Be concise. WhatsApp readers want quick answers. 2-4 sentences for most questions.
+7. If you generated media (Tier 5 or 6), include the local file path on a line "MEDIA_PATH: <path>" so the runtime can attach it.
+8. If no RAG match found AND topic is clearly out-of-scope (memes, chitchat, weather), give a one-line acknowledgment and stop. Don't invent answers.
 
 ROUTING TABLE:
 - "Qiwa" / "قوى" → source=qiwa-sa
@@ -105,7 +110,7 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
     }
   }
 
-  const srcRegex = /Source:\s*(\S+)/gi;
+  const srcRegex = /Source:\s*(https?:\/\/\S+)/gi;
   let match: RegExpExecArray | null;
   while ((match = srcRegex.exec(replyText)) !== null) {
     sourcesCited.push(match[1]);
