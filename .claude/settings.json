@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "rag": {
+      "command": "/home/ubuntu/rag-platform/.venv/bin/python",
+      "args": [
+        "/home/ubuntu/rag-platform/mcp/server.py"
+      ]
+    },
+    "imagegen": {
+      "command": "/home/ubuntu/rag-platform/.venv/bin/python",
+      "args": [
+        "/home/ubuntu/rag-platform/mcp/imagegen/server.py"
+      ]
+    },
+    "videogen": {
+      "command": "/home/ubuntu/rag-platform/.venv/bin/python",
+      "args": [
+        "/home/ubuntu/rag-platform/mcp/videogen/server.py"
+      ]
+    }
+  }
+}
