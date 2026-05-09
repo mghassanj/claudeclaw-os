@@ -23,11 +23,15 @@ if (!cfg0.enabled) {
 const state = buildClient();
 startHealthServer(state, cfg0.qrPort);
 
-state.client.on("message", async (msg) => {
+state.client.on("message_create", async (msg) => {
   let chatId = "";
   try {
     console.log("[wa] msg event fired");
     const cfg = currentConfig();
+    // Loop prevention: skip the bot's own outbound replies
+    if (msg.fromMe && (msg.body ?? "").startsWith("\u{1F916}")) return;
+    // Self-reply gate: only process Mohamed's own messages if explicitly enabled
+    if (msg.fromMe && !cfg.selfReply) return;
     const chat = await msg.getChat();
     console.log("[wa] chat:", chat.isGroup ? "group" : "dm", "name=", (chat as any).name ?? "?");
     if (!chat.isGroup) return;

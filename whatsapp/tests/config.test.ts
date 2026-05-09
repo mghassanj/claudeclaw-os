@@ -7,6 +7,7 @@ describe("config", () => {
     delete process.env.WHATSAPP_ALLOWED_GROUPS;
     delete process.env.WHATSAPP_TIERS_ENABLED;
     delete process.env.WHATSAPP_QR_PORT;
+    delete process.env.WHATSAPP_SELF_REPLY;
   });
 
   it("defaults: disabled, no groups, all tiers", () => {
@@ -45,5 +46,11 @@ describe("config", () => {
     const c = loadConfig();
     expect(c.isTierEnabled("1")).toBe(true);
     expect(c.isTierEnabled("5")).toBe(false);
+  });
+
+  it("selfReply defaults false; parses true", () => {
+    expect(loadConfig().selfReply).toBe(false);
+    process.env.WHATSAPP_SELF_REPLY = "true";
+    expect(loadConfig().selfReply).toBe(true);
   });
 });
