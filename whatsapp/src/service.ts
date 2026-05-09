@@ -13,6 +13,16 @@ import {
 } from "./tools/send.js";
 import { transcribeVoice } from "./tools/transcribe.js";
 
+async function safeContactName(msg: any): Promise<string> {
+  try {
+    const c = await msg.getContact();
+    return (c as any).pushname ?? (c as any).name ?? msg.author ?? msg.from ?? "unknown";
+  } catch {
+    // LID-typed senders (newer WhatsApp identity) sometimes can't be looked up
+    return msg.author ?? msg.from ?? "unknown";
+  }
+}
+
 const cfg0 = currentConfig();
 console.log("[wa] starting, enabled=", cfg0.enabled, "groups=", cfg0.allowedGroups);
 
@@ -59,8 +69,7 @@ state.client.on("message_create", async (msg) => {
 
     console.log("[wa] type:", inboundType, "lang:", detectLang(inboundText));
     const inboundLang = detectLang(inboundText);
-    const contact = await msg.getContact();
-    const sender = (contact as any).pushname ?? msg.author ?? "unknown";
+    const sender = await safeContactName(msg);
 
     await recordInbound({
       groupId: chatId,
@@ -82,10 +91,10 @@ state.client.on("message_create", async (msg) => {
     console.log("[wa] enabled=true, fetching thread context");
 
     const threadMsgs = await chat.fetchMessages({ limit: 8 });
-    const threadContext = await Promise.all(threadMsgs.map(async (m: any) => {
-      const c = await m.getContact();
-      return { sender: (c as any).pushname ?? "unknown", text: m.body ?? "" };
-    }));
+    const threadContext = await Promise.all(threadMsgs.map(async (m: any) => ({
+      sender: await safeContactName(m),
+      text: m.body ?? "",
+    })));
     console.log("[wa] thread context size:", threadContext.length);
 
     console.log("[wa] calling composeReply...");
