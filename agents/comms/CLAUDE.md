@@ -117,3 +117,18 @@ Before "done" / "sent" / "all set" you MUST follow the 6-step Investigation & Ve
 6. End-to-end verify (NOT exit-code-zero)
 
 For sent messages: confirm recipient, subject, attachment list, and timestamp. "Email queued for send" ≠ "Email delivered." If you cannot verify delivery, say so explicitly.
+
+## RAG source routing (added 2026-05-09)
+
+Before drafting customer emails about Saudi HR / payroll / compliance, ground the reply by calling `search_enterprise_kb` with a `source` filter per this table:
+
+| Topic in the email contains… | source filter |
+|---|---|
+| Qiwa, قوى | `qiwa-sa` |
+| Mudad, مدد | `mudad-com-sa` |
+| Ministry of HR, وزارة الموارد, HRSD | `hrsd-gov-sa` |
+| Vision 2030, رؤية 2030 | `vision2030-gov-sa` |
+| labor law, نظام العمل | `saudi-labor-law`, `saudi-labor-law-bylaws` |
+| GOSI, تأمينات | `gosi-social-insurance` |
+
+Quote the cited gov page URL in the email so the customer can verify. Match the customer's language (Arabic responses for Arabic emails). Don't paraphrase regulations from training data when a `search_enterprise_kb` lookup will give you the live, cited source text.

@@ -1,0 +1,25 @@
+name: Comms
+description: All human communication -- email, Slack, WhatsApp, YouTube comments, community forums, LinkedIn DMs
+
+telegram_bot_token_env: COMMS_BOT_TOKEN
+
+model: claude-sonnet-4-6
+
+warroom_tools:
+  - Bash
+  - Skill
+  - mcp:rag
+  - mcp:gmail
+  - mcp:claude_ai_Gmail
+  - mcp:slack
+
+# Optional: auto-inject your Obsidian vault into this agent's context.
+# Uncomment and point `vault:` at your real vault path. If you don't use
+# Obsidian, leave this whole block commented.
+# obsidian:
+#   vault: /path/to/your/obsidian/vault
+#   folders:
+#     - Projects/
+#     - Inbox/
+#   read_only:
+#     - Daily Notes/

@@ -151,3 +151,18 @@ Before "done" / "fixed" / "all set" you MUST follow the 6-step Investigation & V
 6. End-to-end verify (NOT exit-code-zero)
 
 For decks: "Verified" means `deck-visual-qa` passed AND a sample slide opens in libreoffice without error AND the user has the file. Not "I generated it." If you cannot test end-to-end, say so explicitly.
+
+## RAG source routing (added 2026-05-09)
+
+When building decks / canvases that touch Saudi HR / labor market / Vision 2030 topics, call `search_enterprise_kb` for grounded factual quotes — don't paraphrase from training data. Routing:
+
+| Slide / section topic contains… | source filter |
+|---|---|
+| Qiwa, قوى, Nitaqat, نطاقات | `qiwa-sa` |
+| Mudad, مدد, wage protection | `mudad-com-sa` |
+| Ministry of HR, HRSD, ministerial decisions | `hrsd-gov-sa` |
+| Vision 2030, رؤية 2030, strategic objectives | `vision2030-gov-sa` |
+| labor law text, articles, نظام العمل | `saudi-labor-law`, `saudi-labor-law-bylaws` |
+| GOSI rates, التأمينات | `gosi-social-insurance` |
+
+Always include the source URL as a footnote on slides that use this content. `search_enterprise_kb_visual` lets you find existing gov-published images / infographics if you need a reference visual.

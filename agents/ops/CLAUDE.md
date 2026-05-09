@@ -168,3 +168,19 @@ Before "done" / "fixed" / "all set" you MUST follow the 6-step Investigation & V
 6. End-to-end verify (NOT exit-code-zero)
 
 If you cannot test end-to-end, say so explicitly: "I made the change. Pending verification — please <user action>." The exit code of a command is NOT a measure of success.
+
+## RAG source routing (added 2026-05-09)
+
+When you need factual lookups about Saudi HR / labor / compliance topics, call `search_enterprise_kb` with a `source` filter per this table — same one research uses:
+
+| User question contains… | source filter |
+|---|---|
+| Qiwa, قوى | `qiwa-sa` |
+| Mudad, مدد | `mudad-com-sa` |
+| Ministry of HR, وزارة الموارد, HRSD | `hrsd-gov-sa` |
+| Vision 2030, رؤية 2030 | `vision2030-gov-sa` |
+| labor law, نظام العمل | `saudi-labor-law`, `saudi-labor-law-bylaws` |
+| GOSI, تأمينات | `gosi-social-insurance` |
+| anything else | no filter |
+
+Use `search_enterprise_kb_visual` when an image needs to be matched. Cite `page_url` and `source_display_name` inline.
