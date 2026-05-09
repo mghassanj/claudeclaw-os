@@ -26,14 +26,18 @@ startHealthServer(state, cfg0.qrPort);
 state.client.on("message", async (msg) => {
   let chatId = "";
   try {
+    console.log("[wa] msg event fired");
     const cfg = currentConfig();
     const chat = await msg.getChat();
+    console.log("[wa] chat:", chat.isGroup ? "group" : "dm", "name=", (chat as any).name ?? "?");
     if (!chat.isGroup) return;
     chatId = chat.id._serialized;
     const groupName = (chat as any).name ?? "";
     if (!cfg.isGroupAllowed(groupName)) return;
+    console.log("[wa] group allowed");
 
     if (await alreadyReplied(chatId, msg.id._serialized)) return;
+    console.log("[wa] not replied yet, processing");
 
     let inboundText = msg.body ?? "";
     let inboundType: "text" | "voice" | "image" = "text";
@@ -49,6 +53,7 @@ state.client.on("message", async (msg) => {
       inboundText = msg.body ?? "[image]";
     }
 
+    console.log("[wa] type:", inboundType, "lang:", detectLang(inboundText));
     const inboundLang = detectLang(inboundText);
     const contact = await msg.getContact();
     const sender = (contact as any).pushname ?? msg.author ?? "unknown";
@@ -64,21 +69,26 @@ state.client.on("message", async (msg) => {
       inboundLang,
       inboundAt: new Date(),
     });
+    console.log("[wa] inbound recorded");
 
     if (!cfg.enabled) {
       console.log("[wa] passive: logged. msg=", inboundText.slice(0, 60));
       return;
     }
+    console.log("[wa] enabled=true, fetching thread context");
 
     const threadMsgs = await chat.fetchMessages({ limit: 8 });
     const threadContext = await Promise.all(threadMsgs.map(async (m: any) => {
       const c = await m.getContact();
       return { sender: (c as any).pushname ?? "unknown", text: m.body ?? "" };
     }));
+    console.log("[wa] thread context size:", threadContext.length);
 
+    console.log("[wa] calling composeReply...");
     const result = await composeReply({
       inboundText, inboundLang, threadContext, groupName, config: cfg,
     });
+    console.log("[wa] composeReply done. tier=", result.chosenTier, "tools=", result.toolsCalled, "replyText.length=", result.replyText?.length ?? 0);
 
     let replyMsgId: string | null = null;
     let replyMediaUrl: string | null = null;
@@ -97,6 +107,7 @@ state.client.on("message", async (msg) => {
     const mediaMatch = result.replyText.match(/MEDIA_PATH:\s*(\S+)/);
     const cleanText = result.replyText.replace(/MEDIA_PATH:.*$/m, "").trim();
 
+    console.log("[wa] sending via", mediaMatch ? "media" : "text");
     if (mediaMatch && cfg.isTierEnabled(result.chosenTier)) {
       const filePath = mediaMatch[1];
       try {
@@ -116,6 +127,7 @@ state.client.on("message", async (msg) => {
         state.client, chatId, cleanText, msg.id._serialized,
       );
     }
+    console.log("[wa] sent. reply_msg_id=", replyMsgId);
 
     await recordReply({
       groupId: chatId, messageId: msg.id._serialized,
