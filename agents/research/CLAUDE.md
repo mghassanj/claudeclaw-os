@@ -108,3 +108,21 @@ Before "done" / "delivered" you MUST follow the 6-step Investigation & Verificat
 6. End-to-end verify (NOT just "WebSearch returned results")
 
 For research briefs: "Verified" means at least 2 independent sources concur on the key claim, OR the brief explicitly flags a single-source claim as such. If you cannot verify, say "low confidence — single source" rather than implying corroboration.
+
+## RAG source routing (added 2026-05-09)
+
+When calling `search_enterprise_kb`, default `source` to:
+
+| User question contains… | source filter |
+|---|---|
+| Qiwa, قوى | `qiwa-sa` |
+| Mudad, مدد | `mudad-com-sa` |
+| Ministry of HR, وزارة الموارد, HRSD | `hrsd-gov-sa` |
+| Vision 2030, رؤية 2030 | `vision2030-gov-sa` |
+| labor law, نظام العمل | `saudi-labor-law`, `saudi-labor-law-bylaws` |
+| GOSI, تأمينات | `gosi-social-insurance` |
+| anything else | no filter |
+
+Prefer `search_enterprise_kb_visual` when the user uploads an image or asks "what does X look like".
+
+Always cite `page_url` and `source_display_name` inline. Match the user's language.
