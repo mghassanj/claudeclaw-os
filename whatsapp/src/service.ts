@@ -12,6 +12,7 @@ import {
   sendText, sendMediaFromPath,
 } from "./tools/send.js";
 import { transcribeVoice } from "./tools/transcribe.js";
+import { extractDocument } from "./tools/extract_document.js";
 
 async function safeContactName(msg: any): Promise<string> {
   try {
@@ -56,6 +57,10 @@ state.client.on("message_create", async (msg) => {
     let inboundText = msg.body ?? "";
     let inboundType: "text" | "voice" | "image" = "text";
 
+    // inlineImage is set for image messages so composeReply can pass it to vision
+    let inlineImageBase64: string | undefined;
+    let inlineImageMime: string | undefined;
+
     if (msg.hasMedia && (msg.type === "audio" || msg.type === "ptt")) {
       const media = await msg.downloadMedia();
       const buf = Buffer.from(media.data, "base64");
@@ -64,7 +69,35 @@ state.client.on("message_create", async (msg) => {
       inboundType = "voice";
     } else if (msg.hasMedia && msg.type === "image") {
       inboundType = "image";
-      inboundText = msg.body ?? "[image]";
+      const media = await msg.downloadMedia();
+      inlineImageBase64 = media.data;           // already base64 from whatsapp-web.js
+      inlineImageMime = media.mimetype;
+      inboundText = (msg.body ?? "").trim() || "[image attached — describe or answer based on its content]";
+    } else if (msg.hasMedia && msg.type === "document") {
+      // document = PDF / docx / xlsx sent by customer
+      inboundType = "image"; // existing enum only has text/voice/image; documents lump under "image"
+      const media = await msg.downloadMedia();
+      const buf = Buffer.from(media.data, "base64");
+      const filename: string = (media as any).filename ?? msg.body ?? "";
+      console.log("[wa] document received:", filename, "mime:", media.mimetype, "bytes:", buf.length);
+      try {
+        const extracted = await extractDocument(buf, media.mimetype, filename);
+        const caption = (msg.body ?? "").trim();
+        inboundText = [
+          `[Document attached: ${filename || media.mimetype}, ${extracted.bytesIn} bytes]`,
+          "",
+          "Extracted content:",
+          extracted.text,
+          "",
+          caption
+            ? `Customer's message with the doc: ${caption}`
+            : "Answer the question implied by the document, or summarize it if no question was asked.",
+        ].join("\n");
+        console.log("[wa] document extracted, chars:", extracted.text.length);
+      } catch (e) {
+        console.warn("[wa] document extraction failed:", e);
+        inboundText = `[Document attached but couldn't extract its text: ${filename || media.mimetype}] Please tell the user the document type is unsupported or corrupted and ask them to share text or a PDF.`;
+      }
     }
 
     console.log("[wa] type:", inboundType, "lang:", detectLang(inboundText));
@@ -99,7 +132,14 @@ state.client.on("message_create", async (msg) => {
 
     console.log("[wa] calling composeReply...");
     const result = await composeReply({
-      inboundText, inboundLang, threadContext, groupName, config: cfg,
+      inboundText,
+      inboundLang,
+      threadContext,
+      groupName,
+      config: cfg,
+      inlineImage: inlineImageBase64 && inlineImageMime
+        ? { base64: inlineImageBase64, mime: inlineImageMime }
+        : undefined,
     });
     console.log("[wa] composeReply done. tier=", result.chosenTier, "tools=", result.toolsCalled, "replyText.length=", result.replyText?.length ?? 0);
 

@@ -1,4 +1,4 @@
-import { query, type SDKResultSuccess, type SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKResultSuccess, type SDKAssistantMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { routeToSource } from "./routing.js";
 import type { Config } from "./config.js";
 
@@ -8,6 +8,8 @@ export interface ComposeInput {
   threadContext: { sender: string; text: string }[];
   groupName: string;
   config: Config;
+  /** Present only for image messages — raw base64 from whatsapp-web.js + mimetype */
+  inlineImage?: { base64: string; mime: string };
 }
 
 export interface ComposeResult {
@@ -60,6 +62,8 @@ REPLY RULES (STRICT):
 
    f. **Specifically for SAUDI HR/payroll content**: always state which population the rate applies to (Saudi employees / non-Saudi employees / both) when discussing GOSI, labor law, end-of-service, etc. The two populations have very different rules and lumping them is dangerous.
 
+10. **INBOUND DOCUMENT / IMAGE RULE**: When the user message starts with "[Document attached:" or "[image attached", the document text or image has already been provided to you. Read it carefully and answer based on its content. Do NOT ask the user to re-send the document. If the document is a policy, contract, or HR form, extract the key facts and answer any question the customer posed. If no specific question was asked, provide a concise summary of the document's main points.
+
 ROUTING TABLE:
 - "Qiwa" / "قوى" → source=qiwa-sa
 - "Mudad" / "مدد" → source=mudad-com-sa
@@ -70,6 +74,54 @@ ROUTING TABLE:
 - otherwise: no source filter
 
 Return your reply as plain text. Do NOT include any preamble like "Here's the answer:" — just the answer itself.`;
+
+/**
+ * Build a prompt suitable for the SDK query() call.
+ *
+ * - Text-only (no image): returns a plain string — the normal fast path.
+ * - Image present: returns an AsyncIterable<SDKUserMessage> that yields one
+ *   synthetic user message containing an image content block followed by the
+ *   text block. This is the only way to inject vision content through the
+ *   claude-agent-sdk which accepts `string | AsyncIterable<SDKUserMessage>`.
+ */
+function buildPrompt(
+  userPrompt: string,
+  inlineImage: { base64: string; mime: string } | undefined,
+  sessionId: string,
+): string | AsyncIterable<SDKUserMessage> {
+  if (!inlineImage) return userPrompt;
+
+  // Validate mime is a supported vision type
+  const supportedMimes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+  const mime = supportedMimes.includes(inlineImage.mime) ? inlineImage.mime : "image/jpeg";
+
+  const userMsg: SDKUserMessage = {
+    type: "user",
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mime as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+            data: inlineImage.base64,
+          },
+        },
+        {
+          type: "text",
+          text: userPrompt,
+        },
+      ],
+    },
+  };
+
+  return (async function* () {
+    yield userMsg;
+  })();
+}
 
 export async function composeReply(input: ComposeInput): Promise<ComposeResult> {
   const t0 = Date.now();
@@ -95,8 +147,12 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
   let chosenTier = "1";
   let costEstimate = 0;
 
+  // Generate a session ID for the SDKUserMessage wrapper (only used for image path)
+  const sessionId = `wa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const prompt = buildPrompt(userPrompt, input.inlineImage, sessionId);
+
   for await (const msg of query({
-    prompt: userPrompt,
+    prompt,
     options: {
       systemPrompt: SYSTEM_PROMPT,
       model: "claude-sonnet-4-6",
