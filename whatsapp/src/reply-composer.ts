@@ -107,6 +107,7 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
         "mcp__imagegen__generate_image",
         "mcp__videogen__generate_video",
         "mcp__podcastgen__generate_podcast",
+        "mcp__infographicgen__generate_infographic",
         "mcp__slidegen__generate_slide_deck",
       ],
       cwd: "/home/ubuntu/claudeclaw-os",
@@ -147,6 +148,7 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
       else if (tp.tool_name.includes("videogen")) chosenTier = "6";
       else if (tp.tool_name.includes("podcastgen")) chosenTier = "7";
       else if (tp.tool_name.includes("slidegen")) chosenTier = "9";
+      else if (tp.tool_name.includes("infographicgen")) chosenTier = "12";
       else if (tp.tool_name.includes("visual")) chosenTier = "2";
     }
     if (msg.type === "result" && msg.subtype === "success") {
