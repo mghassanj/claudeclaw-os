@@ -109,6 +109,12 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
         "mcp__podcastgen__generate_podcast",
         "mcp__infographicgen__generate_infographic",
         "mcp__slidegen__generate_slide_deck",
+        "mcp__flashcardsgen__generate_flashcards",
+        "mcp__quizgen__generate_quiz",
+        "mcp__datatablegen__generate_data_table",
+        "mcp__reportsgen__generate_report",
+        "mcp__mindmapgen__generate_mind_map",
+        "mcp__videooverviewgen__generate_video_overview",
       ],
       cwd: "/home/ubuntu/claudeclaw-os",
       mcpServers: {
@@ -142,6 +148,12 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
           command: "/home/ubuntu/rag-platform/.venv/bin/python",
           args: ["/home/ubuntu/rag-platform/mcp/slidegen/server.py"],
         },
+        flashcardsgen: { type: "stdio" as const, command: "/home/ubuntu/rag-platform/.venv/bin/python", args: ["/home/ubuntu/rag-platform/mcp/flashcardsgen/server.py"] },
+        quizgen: { type: "stdio" as const, command: "/home/ubuntu/rag-platform/.venv/bin/python", args: ["/home/ubuntu/rag-platform/mcp/quizgen/server.py"] },
+        datatablegen: { type: "stdio" as const, command: "/home/ubuntu/rag-platform/.venv/bin/python", args: ["/home/ubuntu/rag-platform/mcp/datatablegen/server.py"] },
+        reportsgen: { type: "stdio" as const, command: "/home/ubuntu/rag-platform/.venv/bin/python", args: ["/home/ubuntu/rag-platform/mcp/reportsgen/server.py"] },
+        mindmapgen: { type: "stdio" as const, command: "/home/ubuntu/rag-platform/.venv/bin/python", args: ["/home/ubuntu/rag-platform/mcp/mindmapgen/server.py"] },
+        videooverviewgen: { type: "stdio" as const, command: "/home/ubuntu/rag-platform/.venv/bin/python", args: ["/home/ubuntu/rag-platform/mcp/videooverviewgen/server.py"] },
       },
       persistSession: false,
     },
@@ -154,6 +166,12 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
       else if (tp.tool_name.includes("podcastgen")) chosenTier = "7";
       else if (tp.tool_name.includes("slidegen")) chosenTier = "9";
       else if (tp.tool_name.includes("infographicgen")) chosenTier = "12";
+      else if (tp.tool_name.includes("flashcardsgen")) chosenTier = "13";
+      else if (tp.tool_name.includes("quizgen")) chosenTier = "14";
+      else if (tp.tool_name.includes("datatablegen")) chosenTier = "15";
+      else if (tp.tool_name.includes("reportsgen")) chosenTier = "16";
+      else if (tp.tool_name.includes("mindmapgen")) chosenTier = "10";
+      else if (tp.tool_name.includes("videooverviewgen")) chosenTier = "11";
       else if (tp.tool_name.includes("visual")) chosenTier = "2";
     }
     if (msg.type === "result" && msg.subtype === "success") {
