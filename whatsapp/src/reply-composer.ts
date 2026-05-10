@@ -132,6 +132,11 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
           command: "/home/ubuntu/rag-platform/.venv/bin/python",
           args: ["/home/ubuntu/rag-platform/mcp/podcastgen/server.py"],
         },
+        infographicgen: {
+          type: "stdio" as const,
+          command: "/home/ubuntu/rag-platform/.venv/bin/python",
+          args: ["/home/ubuntu/rag-platform/mcp/infographicgen/server.py"],
+        },
         slidegen: {
           type: "stdio" as const,
           command: "/home/ubuntu/rag-platform/.venv/bin/python",
