@@ -69,3 +69,27 @@ else
 fi
 
 echo "[$(date -u +%FT%TZ)] healthcheck OK"
+
+# === WhatsApp comms channel checks (added 2026-05-10) ===
+
+# 1. Service liveness
+if ! systemctl --user is-active --quiet claudeclaw-comms-whatsapp; then
+  /home/ubuntu/claudeclaw-os/scripts/notify.sh "🚨 claudeclaw-comms-whatsapp service inactive"
+fi
+
+# 2. WA Web auth health
+WA_STATE=$(curl -s --max-time 5 http://127.0.0.1:9334/health 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('state','unknown'))" 2>/dev/null || echo "unreachable")
+case "$WA_STATE" in
+  READY) ;;
+  QR_REQUIRED) /home/ubuntu/claudeclaw-os/scripts/notify.sh "🔗 WhatsApp QR rescan needed: ssh -L 9334:127.0.0.1:9334 ubuntu@13.204.65.145 then http://localhost:9334/qr" ;;
+  unreachable) /home/ubuntu/claudeclaw-os/scripts/notify.sh "⚠️ WhatsApp /health endpoint unreachable" ;;
+  *) /home/ubuntu/claudeclaw-os/scripts/notify.sh "⚠️ WhatsApp state=$WA_STATE (expected READY)" ;;
+esac
+
+# 3. Reply backlog
+if [ -n "${DATABASE_URL:-}" ]; then
+  BACKLOG=$(/usr/bin/psql "$DATABASE_URL" -At -c "SELECT count(*) FROM whatsapp_exchanges WHERE reply_at IS NULL AND inbound_at > now() - interval '5 minutes' AND error IS NULL" 2>/dev/null)
+  if [ "${BACKLOG:-0}" -gt 5 ]; then
+    /home/ubuntu/claudeclaw-os/scripts/notify.sh "📨 WhatsApp reply backlog: $BACKLOG pending in last 5 min"
+  fi
+fi
