@@ -88,8 +88,25 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
         "mcp__videogen__generate_video",
       ],
       cwd: "/home/ubuntu/claudeclaw-os",
-      // Load project settings so MCP servers from .claude/settings.json are picked up
-      settingSources: ["project"],
+      // Explicitly pass MCP servers — settingSources discovery does not reliably
+      // pick up servers added after first load (imagegen/videogen were missing).
+      mcpServers: {
+        rag: {
+          type: "stdio" as const,
+          command: "/home/ubuntu/rag-platform/.venv/bin/python",
+          args: ["/home/ubuntu/rag-platform/mcp/server.py"],
+        },
+        imagegen: {
+          type: "stdio" as const,
+          command: "/home/ubuntu/rag-platform/.venv/bin/python",
+          args: ["/home/ubuntu/rag-platform/mcp/imagegen/server.py"],
+        },
+        videogen: {
+          type: "stdio" as const,
+          command: "/home/ubuntu/rag-platform/.venv/bin/python",
+          args: ["/home/ubuntu/rag-platform/mcp/videogen/server.py"],
+        },
+      },
       // Don't persist ephemeral reply sessions to disk
       persistSession: false,
     },
