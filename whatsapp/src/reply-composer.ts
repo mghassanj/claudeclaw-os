@@ -31,6 +31,7 @@ REPLY RULES (STRICT):
    - Tier 5 (generated image): customer asks for chart / diagram / illustration → use generate_image
    - Tier 6 (generated video): customer EXPLICITLY asks for video, OR explaining 4+ step flow that needs narrated walkthrough → use generate_video
    - Tier 7 (generated audio podcast): customer asks for "audio version" / "podcast" / "summary I can listen to" / "send me audio of X" → use generate_podcast. NotebookLM produces a 5-15 min two-host podcast. Send "🤖 generating audio podcast, ~3-5 min..." interim text BEFORE calling generate_podcast because it takes that long. Pass the source TEXT (the relevant law/regulation content from RAG) to the tool, not just the user's question.
+   - Tier 9 (slide deck): customer asks for "slides" / "presentation" / "deck" / "PPT" → use generate_slide_deck. NotebookLM generates a .pptx in ~5-10 min. Send "🤖 generating slide deck, ~5-10 min..." interim text BEFORE calling. Pass the source TEXT (relevant law/regulation content from RAG) to the tool.
 4. CITATION FORMAT (strict): For EVERY RAG-grounded fact, end the reply with one or more lines in this EXACT format (one URL per line):
    Source: <full URL>
    Each URL must be the page_url from the search_enterprise_kb result you used. Do NOT cite article numbers as URLs (e.g. "Source: المادة 112" is WRONG). Use the literal page_url string returned by the tool.
@@ -88,6 +89,7 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
         "mcp__imagegen__generate_image",
         "mcp__videogen__generate_video",
         "mcp__podcastgen__generate_podcast",
+        "mcp__slidegen__generate_slide_deck",
       ],
       cwd: "/home/ubuntu/claudeclaw-os",
       mcpServers: {
@@ -111,6 +113,11 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
           command: "/home/ubuntu/rag-platform/.venv/bin/python",
           args: ["/home/ubuntu/rag-platform/mcp/podcastgen/server.py"],
         },
+        slidegen: {
+          type: "stdio" as const,
+          command: "/home/ubuntu/rag-platform/.venv/bin/python",
+          args: ["/home/ubuntu/rag-platform/mcp/slidegen/server.py"],
+        },
       },
       persistSession: false,
     },
@@ -121,6 +128,7 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
       if (tp.tool_name.includes("imagegen")) chosenTier = "5";
       else if (tp.tool_name.includes("videogen")) chosenTier = "6";
       else if (tp.tool_name.includes("podcastgen")) chosenTier = "7";
+      else if (tp.tool_name.includes("slidegen")) chosenTier = "9";
       else if (tp.tool_name.includes("visual")) chosenTier = "2";
     }
     if (msg.type === "result" && msg.subtype === "success") {
