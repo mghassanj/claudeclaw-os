@@ -30,6 +30,7 @@ REPLY RULES (STRICT):
    - Tier 4 (generated doc): customer asks for sample contract / template / structured artifact
    - Tier 5 (generated image): customer asks for chart / diagram / illustration → use generate_image
    - Tier 6 (generated video): customer EXPLICITLY asks for video, OR explaining 4+ step flow that needs narrated walkthrough → use generate_video
+   - Tier 7 (generated audio podcast): customer asks for "audio version" / "podcast" / "summary I can listen to" / "send me audio of X" → use generate_podcast. NotebookLM produces a 5-15 min two-host podcast. Send "🤖 generating audio podcast, ~3-5 min..." interim text BEFORE calling generate_podcast because it takes that long. Pass the source TEXT (the relevant law/regulation content from RAG) to the tool, not just the user's question.
 4. CITATION FORMAT (strict): For EVERY RAG-grounded fact, end the reply with one or more lines in this EXACT format (one URL per line):
    Source: <full URL>
    Each URL must be the page_url from the search_enterprise_kb result you used. Do NOT cite article numbers as URLs (e.g. "Source: المادة 112" is WRONG). Use the literal page_url string returned by the tool.
@@ -37,7 +38,7 @@ REPLY RULES (STRICT):
 5. JISR-KB SPECIAL RULE: When ANY of your sources is from source_id="jisr-kb" (the Jisr Knowledge Base — URLs at jisr.zendesk.com), the article URL is MANDATORY in the citation. Format: "Source: https://jisr.zendesk.com/hc/<locale>/articles/<id>-<slug>". The user wants to click through to read the full article — never omit it for Jisr KB content.
 
 6. Be concise. WhatsApp readers want quick answers. 2-4 sentences for most questions.
-7. If you generated media (Tier 5 or 6), include the local file path on a line "MEDIA_PATH: <path>" so the runtime can attach it.
+7. If you generated media (Tier 5, 6, or 7), include the local file path on a line "MEDIA_PATH: <path>" so the runtime can attach it.
 8. If no RAG match found AND topic is clearly out-of-scope (memes, chitchat, weather), give a one-line acknowledgment and stop. Don't invent answers.
 
 ROUTING TABLE:
@@ -86,10 +87,9 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
         "mcp__rag__search_enterprise_kb_visual",
         "mcp__imagegen__generate_image",
         "mcp__videogen__generate_video",
+        "mcp__podcastgen__generate_podcast",
       ],
       cwd: "/home/ubuntu/claudeclaw-os",
-      // Explicitly pass MCP servers — settingSources discovery does not reliably
-      // pick up servers added after first load (imagegen/videogen were missing).
       mcpServers: {
         rag: {
           type: "stdio" as const,
@@ -106,20 +106,23 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
           command: "/home/ubuntu/rag-platform/.venv/bin/python",
           args: ["/home/ubuntu/rag-platform/mcp/videogen/server.py"],
         },
+        podcastgen: {
+          type: "stdio" as const,
+          command: "/home/ubuntu/rag-platform/.venv/bin/python",
+          args: ["/home/ubuntu/rag-platform/mcp/podcastgen/server.py"],
+        },
       },
-      // Don't persist ephemeral reply sessions to disk
       persistSession: false,
     },
   })) {
-    // tool_progress events carry the tool name for every tool invocation
     if (msg.type === "tool_progress") {
       const tp = msg as SDKToolProgressMessage;
       toolsCalled.push(tp.tool_name);
       if (tp.tool_name.includes("imagegen")) chosenTier = "5";
       else if (tp.tool_name.includes("videogen")) chosenTier = "6";
+      else if (tp.tool_name.includes("podcastgen")) chosenTier = "7";
       else if (tp.tool_name.includes("visual")) chosenTier = "2";
     }
-    // result message carries the final text and cost
     if (msg.type === "result" && msg.subtype === "success") {
       const r = msg as SDKResultSuccess;
       replyText = r.result;
