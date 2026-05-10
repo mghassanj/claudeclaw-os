@@ -1,4 +1,4 @@
-import { query, type SDKResultSuccess, type SDKToolProgressMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKResultSuccess, type SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 import { routeToSource } from "./routing.js";
 import type { Config } from "./config.js";
 
@@ -158,21 +158,32 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
       persistSession: false,
     },
   })) {
-    if (msg.type === "tool_progress") {
-      const tp = msg as SDKToolProgressMessage;
-      toolsCalled.push(tp.tool_name);
-      if (tp.tool_name.includes("imagegen")) chosenTier = "5";
-      else if (tp.tool_name.includes("videogen")) chosenTier = "6";
-      else if (tp.tool_name.includes("podcastgen")) chosenTier = "7";
-      else if (tp.tool_name.includes("slidegen")) chosenTier = "9";
-      else if (tp.tool_name.includes("infographicgen")) chosenTier = "12";
-      else if (tp.tool_name.includes("flashcardsgen")) chosenTier = "13";
-      else if (tp.tool_name.includes("quizgen")) chosenTier = "14";
-      else if (tp.tool_name.includes("datatablegen")) chosenTier = "15";
-      else if (tp.tool_name.includes("reportsgen")) chosenTier = "16";
-      else if (tp.tool_name.includes("mindmapgen")) chosenTier = "10";
-      else if (tp.tool_name.includes("videooverviewgen")) chosenTier = "11";
-      else if (tp.tool_name.includes("visual")) chosenTier = "2";
+    // MCP tool calls arrive as assistant messages with mcp_tool_use content blocks.
+    // tool_progress only fires for long-running Bash/PowerShell tools, never for MCP.
+    if (msg.type === "assistant") {
+      const am = msg as SDKAssistantMessage;
+      const content = am.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          const b = block as any;
+          if ((b?.type === "tool_use" || b?.type === "mcp_tool_use") && typeof b?.name === "string") {
+            const toolName: string = b.name;
+            toolsCalled.push(toolName);
+            if (toolName.includes("imagegen")) chosenTier = "5";
+            else if (toolName.includes("videogen")) chosenTier = "6";
+            else if (toolName.includes("podcastgen")) chosenTier = "7";
+            else if (toolName.includes("slidegen")) chosenTier = "9";
+            else if (toolName.includes("infographicgen")) chosenTier = "12";
+            else if (toolName.includes("flashcardsgen")) chosenTier = "13";
+            else if (toolName.includes("quizgen")) chosenTier = "14";
+            else if (toolName.includes("datatablegen")) chosenTier = "15";
+            else if (toolName.includes("reportsgen")) chosenTier = "16";
+            else if (toolName.includes("mindmapgen")) chosenTier = "10";
+            else if (toolName.includes("videooverviewgen")) chosenTier = "11";
+            else if (toolName.includes("visual")) chosenTier = "2";
+          }
+        }
+      }
     }
     if (msg.type === "result" && msg.subtype === "success") {
       const r = msg as SDKResultSuccess;
