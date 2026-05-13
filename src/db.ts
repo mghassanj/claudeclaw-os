@@ -2242,6 +2242,39 @@ export function completeMissionTask(
   db.prepare(
     `UPDATE mission_tasks SET status = ?, result = ?, error = ?, completed_at = ? WHERE id = ?`,
   ).run(status, result, error ?? null, now, id);
+
+  // Silent-failure leak plug: when a mission is marked 'completed' but the
+  // agent never wrote a hive_mind row (empty / whitespace / sentinel /
+  // <20 chars after trim), the next stage of a multi-stage mission reads
+  // hive_mind, finds nothing, and stalls. Auto-log a 'mission-empty-output'
+  // event so the failure is observable. Threshold: 20 chars chosen because
+  // anything shorter cannot carry a real artifact pointer or summary; the
+  // known sentinel 'Task completed with no output.' is also matched
+  // explicitly. Failed missions already surface via status + error, so we
+  // only guard the 'completed' branch.
+  if (status === 'completed') {
+    const trimmed = (result ?? '').trim();
+    const SENTINEL = 'Task completed with no output.';
+    const isEmpty = trimmed.length === 0 || trimmed === SENTINEL || trimmed.length < 20;
+    if (isEmpty) {
+      try {
+        const task = db
+          .prepare('SELECT id, title, assigned_agent FROM mission_tasks WHERE id = ?')
+          .get(id) as { id: string; title: string; assigned_agent: string | null } | undefined;
+        const agent = task?.assigned_agent ?? 'main';
+        const title = task?.title ?? '(unknown)';
+        const signal = trimmed.length === 0
+          ? 'empty'
+          : trimmed === SENTINEL
+            ? 'sentinel'
+            : 'near-empty(<20chars)';
+        const summary = `Mission completed with no usable output. id=${id} title=${title} assigned_agent=${agent} signal=${signal} length=${trimmed.length}`;
+        logToHiveMind(agent, 'mission', 'mission-empty-output', summary, JSON.stringify({ missionId: id, title, assignedAgent: agent, signal, length: trimmed.length }));
+      } catch {
+        // Logging the silent-failure event must never break the completion path.
+      }
+    }
+  }
 }
 
 export function cancelMissionTask(id: string): boolean {
