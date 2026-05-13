@@ -2213,6 +2213,112 @@ export function getMissionTask(id: string): MissionTask | null {
   return (db.prepare('SELECT * FROM mission_tasks WHERE id = ?').get(id) as MissionTask) ?? null;
 }
 
+/**
+ * Mission rework-rate metric: how often is the same work re-dispatched?
+ *
+ * A row is counted as "rework" when either:
+ *  1. its title contains the literal '(RETRY)' tag (set when re-queueing a
+ *     previously-attempted stage), OR
+ *  2. its normalized title (lowercased, '(RETRY)' tag stripped, whitespace
+ *     collapsed) matches a prior *completed* mission on the same
+ *     assigned_agent whose completed_at is within the last 7 days before
+ *     this row's created_at.
+ *
+ * Returns one row per (week, agent) bucket for the last `weeks` weeks
+ * (default 4). Week is the Monday 00:00 UTC that begins the bucket.
+ * Unassigned missions (assigned_agent IS NULL) are excluded — rework is an
+ * agent-reliability signal.
+ */
+export interface MissionReworkRow {
+  week: string;            // 'YYYY-MM-DD' of the Monday that starts the bucket
+  agent: string;
+  retry_count: number;
+  total_missions: number;
+  rework_rate: number;     // retry_count / total_missions, rounded to 2 dp
+}
+
+export function getMissionReworkRate(weeks = 4): MissionReworkRow[] {
+  // Window start: midnight UTC of the Monday `weeks-1` weeks ago, so we
+  // include the current (in-progress) week plus `weeks-1` complete weeks.
+  const ONE_WEEK = 7 * 24 * 60 * 60;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const d = new Date(nowSec * 1000);
+  d.setUTCHours(0, 0, 0, 0);
+  const dayOfWeek = (d.getUTCDay() + 6) % 7; // 0 = Monday
+  const currentWeekStart = Math.floor(d.getTime() / 1000) - dayOfWeek * 24 * 60 * 60;
+  const windowStart = currentWeekStart - (weeks - 1) * ONE_WEEK;
+
+  const rows = db
+    .prepare(
+      `
+      WITH norm AS (
+        SELECT
+          id,
+          title,
+          assigned_agent,
+          created_at,
+          completed_at,
+          status,
+          TRIM(REPLACE(LOWER(REPLACE(title, '(RETRY)', '')), '  ', ' ')) AS norm_title
+        FROM mission_tasks
+        WHERE assigned_agent IS NOT NULL
+          AND created_at >= ?
+      ),
+      flagged AS (
+        SELECT
+          n.id,
+          n.assigned_agent,
+          n.created_at,
+          CASE
+            WHEN n.title LIKE '%(RETRY)%' THEN 1
+            WHEN EXISTS (
+              SELECT 1 FROM mission_tasks p
+              WHERE p.assigned_agent = n.assigned_agent
+                AND p.id != n.id
+                AND p.status = 'completed'
+                AND p.completed_at IS NOT NULL
+                AND p.completed_at < n.created_at
+                AND n.created_at - p.completed_at <= 604800
+                AND TRIM(REPLACE(LOWER(REPLACE(p.title, '(RETRY)', '')), '  ', ' ')) = n.norm_title
+            ) THEN 1
+            ELSE 0
+          END AS is_rework
+        FROM norm n
+      )
+      SELECT
+        CAST((created_at - ?) / 604800 AS INTEGER) AS week_index,
+        assigned_agent AS agent,
+        SUM(is_rework) AS retry_count,
+        COUNT(*) AS total_missions
+      FROM flagged
+      GROUP BY week_index, agent
+      ORDER BY week_index DESC, retry_count DESC, agent ASC
+      `,
+    )
+    .all(windowStart, windowStart) as Array<{
+      week_index: number;
+      agent: string;
+      retry_count: number;
+      total_missions: number;
+    }>;
+
+  return rows.map((r) => {
+    const weekStartSec = windowStart + r.week_index * ONE_WEEK;
+    const weekDate = new Date(weekStartSec * 1000);
+    const week = weekDate.toISOString().slice(0, 10);
+    const rework_rate = r.total_missions > 0
+      ? Math.round((r.retry_count / r.total_missions) * 100) / 100
+      : 0;
+    return {
+      week,
+      agent: r.agent,
+      retry_count: r.retry_count,
+      total_missions: r.total_missions,
+      rework_rate,
+    };
+  });
+}
+
 export function claimNextMissionTask(agentId: string): MissionTask | null {
   const txn = db.transaction(() => {
     const task = db

@@ -17,6 +17,14 @@ interface TokenStats {
 
 interface CostTimelineEntry { date: string; cost: number; turns: number; }
 
+interface ReworkRow {
+  week: string;
+  agent: string;
+  retry_count: number;
+  total_missions: number;
+  rework_rate: number;
+}
+
 interface Health {
   contextPct: number;
   turns: number;
@@ -35,6 +43,7 @@ export function Usage() {
     `/api/tokens?chatId=${encodeURIComponent(chatId)}`, 60_000,
   );
   const health = useFetch<Health>(`/api/health?chatId=${encodeURIComponent(chatId)}`, 30_000);
+  const rework = useFetch<{ weeks: number; rows: ReworkRow[] }>('/api/metrics/mission-rework?weeks=4', 60_000);
 
   const stats = tokens.data?.stats;
   const timeline = tokens.data?.costTimeline ?? [];
@@ -114,8 +123,88 @@ export function Usage() {
               </div>
             </div>
           )}
+
+          <ReworkPanel rows={rework.data?.rows ?? []} />
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * Mission rework rate panel. A "rework" is a mission that's either
+ * explicitly tagged (RETRY) or matches a recently-completed title from
+ * the same agent. High rework on a single agent signals a dev/prod gap
+ * — the agent works in isolation but flakes under real traffic.
+ *
+ * Shows the last 4 weeks × top-5 agents (by retry count over the window).
+ */
+function ReworkPanel({ rows }: { rows: ReworkRow[] }) {
+  if (rows.length === 0) {
+    return (
+      <div class="bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg p-4">
+        <div class="text-[10px] uppercase tracking-wider text-[var(--color-text-faint)] mb-3">Mission rework rate</div>
+        <div class="text-[11px] text-[var(--color-text-faint)] py-2">No mission activity in the last 4 weeks.</div>
+      </div>
+    );
+  }
+  // Rank agents by total retry count across the window, keep top 5.
+  const totalsByAgent = new Map<string, number>();
+  for (const r of rows) totalsByAgent.set(r.agent, (totalsByAgent.get(r.agent) ?? 0) + r.retry_count);
+  const topAgents = Array.from(totalsByAgent.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([a]) => a);
+  const weeks = Array.from(new Set(rows.map((r) => r.week))).sort().reverse();
+  // weekKey -> agent -> row, for O(1) lookup.
+  const byWeekAgent = new Map<string, Map<string, ReworkRow>>();
+  for (const r of rows) {
+    if (!byWeekAgent.has(r.week)) byWeekAgent.set(r.week, new Map());
+    byWeekAgent.get(r.week)!.set(r.agent, r);
+  }
+  return (
+    <div class="bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg p-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-[10px] uppercase tracking-wider text-[var(--color-text-faint)]">Mission rework rate</div>
+        <div class="text-[10px] text-[var(--color-text-muted)] tabular-nums">last 4w · top {topAgents.length} agents</div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-[11.5px] tabular-nums">
+          <thead>
+            <tr class="text-[10px] uppercase tracking-wider text-[var(--color-text-faint)]">
+              <th class="text-left font-normal py-1 pr-3">Week</th>
+              {topAgents.map((a) => (
+                <th key={a} class="text-right font-normal py-1 px-2">{a}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {weeks.map((w) => (
+              <tr key={w} class="border-t border-[var(--color-border)]">
+                <td class="py-1.5 pr-3 text-[var(--color-text-muted)]">{w}</td>
+                {topAgents.map((a) => {
+                  const cell = byWeekAgent.get(w)?.get(a);
+                  if (!cell || cell.total_missions === 0) {
+                    return <td key={a} class="py-1.5 px-2 text-right text-[var(--color-text-faint)]">—</td>;
+                  }
+                  const pct = Math.round(cell.rework_rate * 100);
+                  const tone = pct >= 30
+                    ? 'text-[var(--color-danger,#ef4444)]'
+                    : pct >= 10
+                      ? 'text-[var(--color-warn,#f59e0b)]'
+                      : 'text-[var(--color-text)]';
+                  return (
+                    <td key={a} class={`py-1.5 px-2 text-right ${tone}`}>
+                      <span>{pct}%</span>
+                      <span class="text-[var(--color-text-faint)] ml-1">({cell.retry_count}/{cell.total_missions})</span>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

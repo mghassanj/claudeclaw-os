@@ -38,6 +38,7 @@ import {
   assignMissionTask,
   getUnassignedMissionTasks,
   getMissionTaskHistory,
+  getMissionReworkRate,
   getAuditLog,
   getAuditLogCount,
   getRecentBlockedActions,
@@ -1626,6 +1627,16 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const limit = parseInt(c.req.query('limit') || '30', 10);
     const offset = parseInt(c.req.query('offset') || '0', 10);
     return c.json(getMissionTaskHistory(limit, offset));
+  });
+
+  // Mission rework-rate metric. Surfaces dev/prod gap: an agent that's
+  // reliable in dev but keeps re-dispatching the same title in prod is
+  // probably hitting an environment difference we should investigate.
+  // See getMissionReworkRate() in db.ts for the detection rules.
+  app.get('/api/metrics/mission-rework', (c) => {
+    const weeks = Math.max(1, Math.min(12, parseInt(c.req.query('weeks') || '4', 10)));
+    const rows = getMissionReworkRate(weeks);
+    return c.json({ weeks, rows });
   });
 
   // ── Live Meetings (Pika meet-cli wrapper) ──────────────────────────
