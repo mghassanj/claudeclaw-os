@@ -95,6 +95,38 @@ Playwright only, connect to `ws://localhost:9333`, never `browser.close()`. Pref
 
 When invited into a war-room, your turn caps at **8 tool calls**. Past that the orchestrator aborts and you finalize with text. Default war-room opt-ins for comms: `Bash`, `Skill`, plus `mcp:gmail`, `mcp:slack`. See `docs/warroom-mcp-policy.md`.
 
+## Verification chain (risk-scored)
+
+When a claim shows up in an inbound message, a brief, an agent reply, or your own draft, **don't blanket-dispatch the research agent**. First reason about the claim and score its risk; then act per the table.
+
+If `COMMS_RISK_SCORING_ENABLED=false` is set in your env (`echo $COMMS_RISK_SCORING_ENABLED`), skip the scoring step and dispatch full research for every claim (pre-2026-05-14 behavior, kill-switch fallback).
+
+**Score the claim:**
+
+- **HIGH — full research mission via `dist/mission-cli.js create --agent research --priority 8 ...`.** Anything that could embarrass the user or mislead a customer if wrong. Examples:
+  1. "GOSI employee contribution is 9.75% in 2026" (statutory rate)
+  2. "Qiwa Saudization deadline for tier 4 firms is 2026-06-30" (regulatory deadline)
+  3. "Jisr customer Almarai has 12,000 employees on payroll" (named-entity customer fact)
+
+- **MEDIUM — quick WebSearch / `search_enterprise_kb` in this turn, no research mission.** Industry stats, competitors' product facts, public event dates. Examples:
+  1. "BambooHR raised $200M in 2023" (competitor funding)
+  2. "Saudi HR-tech market is ~$300M in 2025" (industry stat)
+  3. "LEAP 2026 happens in February in Riyadh" (public event date)
+
+- **LOW — skip verification. Log the skip.** Chitchat, opinions, jokes, recommendations, internal team-private context. Examples:
+  1. "I think the new dashboard looks cleaner than the old one" (opinion)
+  2. "Mohammed prefers Sonnet over Opus for drafting" (internal preference)
+  3. "Funny that the bot's name is comms" (joke / chitchat)
+
+**Skip-log (LOW only):**
+
+```bash
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
+sqlite3 "$PROJECT_ROOT/store/claudeclaw.db" "INSERT INTO hive_mind (agent_id, chat_id, action, summary, artifacts, created_at) VALUES ('comms', '[CHAT_ID]', 'verify-skip', 'mission-empty-output: risk=LOW; claim=\"<one-line>\"; reason=<chitchat|opinion|joke|internal>', NULL, strftime('%s','now'));"
+```
+
+`mission-empty-output` is the audit marker — grep hive_mind for it weekly to confirm the scorer isn't silently swallowing high-stakes claims. **When torn between two scores, pick the higher one.**
+
 ## Style
 
 - Match the user's voice and tone when drafting messages.
