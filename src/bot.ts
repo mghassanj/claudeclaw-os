@@ -112,6 +112,7 @@ import {
   synthesizeSpeech,
   voiceCapabilities,
   UPLOADS_DIR,
+  checkVoiceArtifact,
 } from './voice.js';
 import { getSlackConversations, getSlackMessages, sendSlackMessage, SlackConversation } from './slack.js';
 import { getWaChats, getWaChatMessages, sendWhatsAppMessage, WaChat } from './whatsapp.js';
@@ -698,9 +699,34 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const textWithFooter = responseText ? responseText + costFooter : '';
     if (textWithFooter) {
       if (shouldSpeakBack) {
-        try {
+        tts_send: try {
           // Don't speak the cost footer, just the actual response
           const audioBuffer = await synthesizeSpeech(responseText);
+          // Voice-QA hard gate: re-transcribe via Gemini, block on low similarity.
+          const qaTmp = path.join(UPLOADS_DIR, '..', 'tmp', 'qa_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.ogg');
+          fs.mkdirSync(path.dirname(qaTmp), { recursive: true });
+          fs.writeFileSync(qaTmp, audioBuffer);
+          try {
+            const qa = await checkVoiceArtifact(responseText, qaTmp, 'audio/ogg');
+            if (!qa.passed && qa.hardGateEnabled) {
+              logToHiveMind(
+                AGENT_ID, chatIdStr,
+                'voice-artifact-rejected-hallucination',
+                'Telegram voice reply blocked: ' + (qa.reason ?? 'low similarity'),
+                JSON.stringify({ similarity: qa.similarity, threshold: qa.threshold, transcript: qa.transcript.slice(0, 500), script: responseText.slice(0, 500) }),
+              );
+              await ctx.reply('⚠️ Voice reply blocked by QA gate — the rendered audio drifted from the script (similarity ' + qa.similarity.toFixed(2) + ', threshold ' + qa.threshold + '). Falling back to text.');
+              for (const part of splitMessage(formatForTelegram(textWithFooter))) {
+                await ctx.reply(part, { parse_mode: 'HTML' });
+              }
+              break tts_send;
+            }
+            if (!qa.passed) {
+              logger.warn({ reason: qa.reason, similarity: qa.similarity }, 'voice-qa: failed but hard gate disabled — sending anyway');
+            }
+          } finally {
+            try { fs.unlinkSync(qaTmp); } catch { /* ignore */ }
+          }
           await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.ogg'));
         } catch (ttsErr) {
           logger.error({ err: ttsErr }, 'TTS failed, falling back to text');

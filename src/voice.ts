@@ -9,6 +9,7 @@ import { promisify } from 'util';
 
 import { logger } from './logger.js';
 import { readEnvFile } from './env.js';
+import { GoogleGenAI, createPartFromBase64 } from '@google/genai';
 
 const execFileAsync = promisify(execFile);
 
@@ -551,4 +552,172 @@ export function voiceCapabilities(): { stt: boolean; tts: boolean } {
       || !!env.KOKORO_URL
       || process.platform === 'darwin',
   };
+}
+
+// ── QA: Gemini re-transcription hard gate (Fix #4) ──────────────────────────
+//
+// Before sending any avatar/voice artifact (Tier 6 video, Tier 7 podcast, or
+// any Telegram voice reply), re-transcribe the rendered media via Gemini and
+// compare against the *original script text* the bot composed. If similarity
+// is low, the send is blocked: the voice/video gen layer hallucinated facts
+// (years, numbers, named entities) and the artifact is unsafe to ship.
+//
+// Flip off via VOICE_QA_HARD_GATE=false in .env (default = true).
+
+
+const VOICE_QA_MODEL = process.env.VOICE_QA_MODEL || 'gemini-2.0-flash';
+// Normalized-Levenshtein similarity threshold. < 0.85 → block.
+export const VOICE_QA_THRESHOLD = parseFloat(process.env.VOICE_QA_THRESHOLD || '0.85');
+
+let _qaClient: GoogleGenAI | null = null;
+function qaGeminiClient(): GoogleGenAI {
+  if (_qaClient) return _qaClient;
+  const env = readEnvFile(['GOOGLE_API_KEY']);
+  const key = env.GOOGLE_API_KEY || process.env.GOOGLE_API_KEY;
+  if (!key) throw new Error('GOOGLE_API_KEY not set — required for voice-QA gate');
+  _qaClient = new GoogleGenAI({ apiKey: key });
+  return _qaClient;
+}
+
+function mimeForPath(p: string): string {
+  const ext = path.extname(p).toLowerCase();
+  if (ext === '.mp4' || ext === '.m4v') return 'video/mp4';
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.ogg' || ext === '.oga' || ext === '.opus') return 'audio/ogg';
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.wav') return 'audio/wav';
+  if (ext === '.m4a') return 'audio/mp4';
+  return 'application/octet-stream';
+}
+
+/** True if the path is an audio or video artifact this gate should inspect. */
+export function isVoiceOrAvatarArtifact(filePath: string): boolean {
+  const m = mimeForPath(filePath);
+  return m.startsWith('audio/') || m.startsWith('video/');
+}
+
+/**
+ * Re-transcribe a voice/avatar media file via Gemini for QA.
+ * Returns the transcript text Gemini extracts from the actual rendered media.
+ */
+export async function transcribeForQA(mediaPath: string, mimeType?: string): Promise<string> {
+  const ai = qaGeminiClient();
+  const data = fs.readFileSync(mediaPath).toString('base64');
+  const mt = mimeType || mimeForPath(mediaPath);
+  const res = await ai.models.generateContent({
+    model: VOICE_QA_MODEL,
+    contents: [{
+      role: 'user',
+      parts: [
+        createPartFromBase64(data, mt),
+        { text: 'Transcribe the spoken audio in this media verbatim. Output transcript text ONLY, no preamble, no commentary, no markdown. If silent, output an empty string.' },
+      ],
+    }],
+    config: { temperature: 0 },
+  });
+  return (res.text ?? '').trim();
+}
+
+/** Normalize text for comparison: lowercase, strip punctuation, collapse whitespace. */
+function normalizeForCompare(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[،؛؟ً-ْ]/g, '') // arabic punct + tashkeel
+    .replace(/[\p{P}\p{S}]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Tiny iterative Levenshtein (O(n*m), small alloc). */
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = new Array(b.length + 1);
+  let curr = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[b.length];
+}
+
+/** Normalized similarity in [0,1]. 1 = identical. */
+export function normalizedSimilarity(a: string, b: string): number {
+  const na = normalizeForCompare(a);
+  const nb = normalizeForCompare(b);
+  if (!na && !nb) return 1;
+  const maxLen = Math.max(na.length, nb.length);
+  if (maxLen === 0) return 1;
+  return 1 - levenshtein(na, nb) / maxLen;
+}
+
+/**
+ * Detect specific high-risk factual deltas between script and transcript.
+ * Returns a reason string if a delta is found, else null. Years and standalone
+ * 2-4 digit numbers are checked: any number present in EITHER side that does
+ * not appear in the OTHER side counts as a delta.
+ */
+export function factualDelta(scriptText: string, transcript: string): string | null {
+  const numsScript = new Set((scriptText.match(/\b\d{2,4}\b/g) ?? []));
+  const numsTrans = new Set((transcript.match(/\b\d{2,4}\b/g) ?? []));
+  for (const n of numsScript) if (!numsTrans.has(n)) return `script-only number: ${n}`;
+  for (const n of numsTrans) if (!numsScript.has(n)) return `transcript-only number: ${n}`;
+  return null;
+}
+
+export interface VoiceQaResult {
+  passed: boolean;
+  similarity: number;
+  threshold: number;
+  reason?: string;
+  transcript: string;
+  hardGateEnabled: boolean;
+}
+
+/**
+ * Hard QA gate: re-transcribe the artifact, compare against script.
+ * Caller MUST block the send when `passed === false` and the hard gate is on.
+ */
+export async function checkVoiceArtifact(
+  scriptText: string,
+  mediaPath: string,
+  mimeType?: string,
+): Promise<VoiceQaResult> {
+  const env = readEnvFile(['VOICE_QA_HARD_GATE']);
+  const flag = (env.VOICE_QA_HARD_GATE ?? process.env.VOICE_QA_HARD_GATE ?? 'true').toLowerCase();
+  const hardGateEnabled = flag !== 'false' && flag !== '0';
+
+  let transcript = '';
+  try {
+    transcript = await transcribeForQA(mediaPath, mimeType);
+  } catch (err) {
+    // If Gemini itself fails, fail-CLOSED when hard gate is on.
+    logger.error({ err, mediaPath }, 'voice-qa: transcribeForQA threw');
+    return {
+      passed: !hardGateEnabled,
+      similarity: 0,
+      threshold: VOICE_QA_THRESHOLD,
+      reason: 'transcription_failed: ' + (err as Error).message?.slice(0, 200),
+      transcript: '',
+      hardGateEnabled,
+    };
+  }
+
+  const similarity = normalizedSimilarity(scriptText, transcript);
+  const delta = factualDelta(scriptText, transcript);
+  const lowSim = similarity < VOICE_QA_THRESHOLD;
+  if (lowSim || delta) {
+    const reason = delta
+      ? `factual-delta: ${delta}; similarity=${similarity.toFixed(3)}`
+      : `similarity ${similarity.toFixed(3)} < ${VOICE_QA_THRESHOLD}`;
+    return { passed: false, similarity, threshold: VOICE_QA_THRESHOLD, reason, transcript, hardGateEnabled };
+  }
+  return { passed: true, similarity, threshold: VOICE_QA_THRESHOLD, transcript, hardGateEnabled };
 }

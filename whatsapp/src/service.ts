@@ -11,6 +11,7 @@ import {
 import {
   sendText, sendMediaFromPath,
 } from "./tools/send.js";
+import { checkVoiceArtifact, isVoiceOrAvatarArtifact } from "./tools/voice-qa.js";
 import { transcribeVoice } from "./tools/transcribe.js";
 import { extractDocument } from "./tools/extract_document.js";
 
@@ -165,6 +166,35 @@ state.client.on("message_create", async (msg) => {
       const filePath = mediaMatch[1];
       try {
         await fs.access(filePath);
+        // Voice/avatar artifact hard gate: re-transcribe via Gemini, compare to script.
+        if (isVoiceOrAvatarArtifact(filePath)) {
+          const qa = await checkVoiceArtifact(cleanText, filePath);
+          if (!qa.passed && qa.hardGateEnabled) {
+            console.warn("[wa] voice-artifact-rejected-hallucination", {
+              tier: result.chosenTier, filePath, reason: qa.reason,
+              similarity: qa.similarity, threshold: qa.threshold,
+              script: cleanText.slice(0, 200), transcript: qa.transcript.slice(0, 200),
+            });
+            replyMsgId = await sendText(
+              state.client, chatId,
+              `⚠️ ${cleanText}\n\n_(media blocked by QA gate — rendered audio drifted from script: ${qa.reason ?? "low similarity"})_`,
+              msg.id._serialized,
+            );
+            replyMediaUrl = null;
+            await recordReply({
+              groupId: chatId, messageId: msg.id._serialized,
+              chosenTier: result.chosenTier, toolsCalled: result.toolsCalled,
+              sourcesCited: result.sourcesCited, replyText: cleanText, replyMediaUrl: null,
+              replyAt: new Date(), replyMsgId,
+              durationMs: result.durationMs, costEstimate: result.costEstimate,
+              error: `voice-artifact-rejected-hallucination: ${qa.reason ?? ""}`.slice(0, 500),
+            });
+            return;
+          }
+          if (!qa.passed) {
+            console.warn("[wa] voice-qa failed but hard gate disabled — sending anyway", qa.reason);
+          }
+        }
         replyMsgId = await sendMediaFromPath(
           state.client, chatId, filePath, cleanText, msg.id._serialized,
         );
