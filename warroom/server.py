@@ -64,6 +64,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -305,6 +306,102 @@ async def get_time_handler(params):
         "iso": now.isoformat(timespec="seconds"),
         "human": now.strftime("%A %B %-d, %-I:%M %p %Z"),
     })
+
+
+async def get_recent_activity_handler(params):
+    """Tool: return a structured digest of what's happened on the box recently.
+
+    Used when the user asks about state, status, recent activity, what's
+    running, what changed, or any 'do you know what we did' question. The
+    handler queries hive_mind, mission_tasks, recent commits, and kill
+    switches. Returns a single text block the bot reads back conversationally.
+    """
+    args = getattr(params, "arguments", None) or {}
+    try:
+        hours = int(args.get("hours", 6))
+    except (TypeError, ValueError):
+        hours = 6
+    hours = max(1, min(hours, 72))  # clamp 1-72h
+    cutoff = int(time.time()) - hours * 3600
+
+    db = str(PROJECT_ROOT / "store" / "claudeclaw.db")
+    hive_rows: list = []
+    mission_rows: list = []
+    try:
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT created_at, agent_id, action, summary "
+            "FROM hive_mind WHERE created_at >= ? ORDER BY created_at DESC LIMIT 15",
+            (cutoff,),
+        )
+        hive_rows = cur.fetchall()
+        cur.execute(
+            "SELECT created_at, COALESCE(completed_at, 0) AS completed_at, "
+            "assigned_agent, status, substr(title, 1, 80) AS title "
+            "FROM mission_tasks WHERE created_at >= ? OR status IN ('running','queued') "
+            "ORDER BY created_at DESC LIMIT 12",
+            (cutoff,),
+        )
+        mission_rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        logging.warning("get_recent_activity: db query failed: %s", e)
+
+    # Recent commits on main (last 5)
+    try:
+        code, stdout, _stderr = await _run_subprocess(
+            ["git", "log", "--oneline", "-5"], timeout=5.0,
+        )
+        commits = stdout if code == 0 else "(git log failed)"
+    except Exception:
+        commits = "(git log failed)"
+
+    # Active kill switches / feature flags from .env
+    env_lines: list = []
+    try:
+        with open(PROJECT_ROOT / ".env") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                if any(k in ln for k in ("ENABLED=", "HARD_GATE=", "_HARD_GATE", "SCORING_ENABLED")):
+                    env_lines.append(ln.split("#", 1)[0].strip())
+    except Exception:
+        pass
+
+    # Format as a single readable digest the bot can paraphrase
+    out = [f"=== Activity in last {hours}h ==="]
+    if hive_rows:
+        out.append("\nRecent agent actions (hive_mind):")
+        for r in hive_rows:
+            ts = time.strftime("%H:%M", time.localtime(r["created_at"]))
+            out.append(f"  [{ts}] {r['agent_id']}: {r['action']} — {(r['summary'] or '')[:120]}")
+    else:
+        out.append("\nNo hive_mind events in the window.")
+
+    if mission_rows:
+        out.append("\nMissions (running/queued/recent):")
+        for r in mission_rows:
+            ts = time.strftime("%H:%M", time.localtime(r["created_at"]))
+            done = ""
+            if r["completed_at"]:
+                done = f" → done {time.strftime('%H:%M', time.localtime(r['completed_at']))}"
+            out.append(f"  [{ts}] {r['assigned_agent']} {r['status']}: {r['title']}{done}")
+    else:
+        out.append("\nNo mission activity.")
+
+    out.append("\nRecent commits on main:")
+    out.append(commits if commits else "  (none)")
+
+    if env_lines:
+        out.append("\nActive feature flags / kill switches:")
+        for ln in env_lines:
+            out.append(f"  {ln}")
+
+    digest = "\n".join(out)
+    await params.result_callback({"ok": True, "digest": digest})
 
 
 async def list_agents_handler(params):
@@ -617,10 +714,30 @@ async def run_live_mode():
         required=[],
     )
 
+    recent_activity_schema = FunctionSchema(
+        name="get_recent_activity",
+        description=(
+            "Get a digest of what's actually happening on this box right now: "
+            "recent agent actions from hive_mind, currently running and recently "
+            "completed missions, the last few git commits on main, and which "
+            "feature flags/kill switches are active. Call this BEFORE answering "
+            "any question about state, status, what's running, what changed, "
+            "what we shipped, recent errors, or any 'do you know what's going on' "
+            "question. Do not guess or bluff — read the digest first."
+        ),
+        properties={
+            "hours": {
+                "type": "integer",
+                "description": "How many hours back to look (1-72, default 6).",
+            },
+        },
+        required=[],
+    )
+
     # answer_as_agent is only registered in auto mode. In direct mode,
     # Gemini should not be routing calls away from the pinned agent —
     # the pinned agent IS the one answering, via its own persona.
-    standard_tools = [delegate_schema, get_time_schema, list_agents_schema]
+    standard_tools = [delegate_schema, get_time_schema, list_agents_schema, recent_activity_schema]
     if active_mode == "auto":
         answer_schema = FunctionSchema(
             name="answer_as_agent",
@@ -676,6 +793,7 @@ async def run_live_mode():
     llm.register_function("delegate_to_agent", delegate_to_agent_handler)
     llm.register_function("get_time", get_time_handler)
     llm.register_function("list_agents", list_agents_handler)
+    llm.register_function("get_recent_activity", get_recent_activity_handler)
     if active_mode == "auto":
         llm.register_function("answer_as_agent", answer_as_agent_handler)
 
@@ -896,7 +1014,27 @@ async def run_realtime_mode():
         required=[],
     )
 
-    standard_tools = [delegate_schema, get_time_schema, list_agents_schema]
+    recent_activity_schema = FunctionSchema(
+        name="get_recent_activity",
+        description=(
+            "Get a digest of what's actually happening on this box right now: "
+            "recent agent actions from hive_mind, currently running and recently "
+            "completed missions, the last few git commits on main, and which "
+            "feature flags/kill switches are active. Call this BEFORE answering "
+            "any question about state, status, what's running, what changed, "
+            "what we shipped, recent errors, or any 'do you know what's going on' "
+            "question. Do not guess or bluff — read the digest first."
+        ),
+        properties={
+            "hours": {
+                "type": "integer",
+                "description": "How many hours back to look (1-72, default 6).",
+            },
+        },
+        required=[],
+    )
+
+    standard_tools = [delegate_schema, get_time_schema, list_agents_schema, recent_activity_schema]
     if active_mode == "auto":
         answer_schema = FunctionSchema(
             name="answer_as_agent",
@@ -952,6 +1090,7 @@ async def run_realtime_mode():
     llm.register_function("delegate_to_agent", delegate_to_agent_handler)
     llm.register_function("get_time", get_time_handler)
     llm.register_function("list_agents", list_agents_handler)
+    llm.register_function("get_recent_activity", get_recent_activity_handler)
     if active_mode == "auto":
         llm.register_function("answer_as_agent", answer_as_agent_handler)
 
