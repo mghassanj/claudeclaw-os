@@ -1235,9 +1235,11 @@ async function reloadMeetingAfterRespawn(statusLabel, targetAgent) {
     document.getElementById('micBtn').disabled = true;
     document.getElementById('micBtn').classList.remove('recording');
 
+    // 20s window: the backend single-flight kill+poll can take ~16s worst
+    // case (15 x 1s + 200ms tail). 15s was the previous default and timed out.
     var ready = false;
     var waited = 0;
-    while (!ready && waited < 15000) {
+    while (!ready && waited < 20000) {
       await new Promise(function(r){ setTimeout(r, 500); });
       waited += 500;
       try {
@@ -1614,9 +1616,11 @@ async function togglePin(agentId) {
     // Wait for the warroom server to come back up. Probe /api/warroom/start
     // (cheap endpoint that just returns the ws url) as a heartbeat for
     // the whole stack being healthy.
+    // 20s window: the backend single-flight kill+poll can take ~16s worst
+    // case (15 x 1s + 200ms tail). 15s was the previous default and timed out.
     var ready = false;
     var waited = 0;
-    while (!ready && waited < 15000) {
+    while (!ready && waited < 20000) {
       await new Promise(function(r){ setTimeout(r, 500); });
       waited += 500;
       try {

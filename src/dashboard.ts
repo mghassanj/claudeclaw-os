@@ -590,28 +590,18 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     // If the pin file was updated recently (agent switch while no meeting
     // was active), the running server has the wrong agent. Kill it so it
     // restarts with the correct persona/voice before we probe readiness.
+    //
+    // Single-flight: the frontend polls /api/warroom/start every 500ms during
+    // a switch. Without coalescing, each poll kicks off its own kill+wait
+    // cycle and they stomp on each other (kill→spawn→kill mid-spawn→repeat),
+    // leading to the 503 cascade users see as "switch failed". We share one
+    // restart promise across all concurrent callers.
     try {
       const pinStat = fs.statSync(WARROOM_PIN_PATH);
       const pinAge = Date.now() - pinStat.mtimeMs;
       if (pinAge < 30000) {
-        // Pin changed in the last 30 seconds. Kill the server so it
-        // picks up the new pin, then poll until it's ready.
-        await killWarroomAsync('pin changed recently, restarting for Start Meeting');
-        const net = await import('net');
-        let serverReady = false;
-        for (let attempt = 0; attempt < 15 && !serverReady; attempt++) {
-          await new Promise((r) => setTimeout(r, 1000));
-          serverReady = await new Promise<boolean>((resolve) => {
-            const sock = new net.Socket();
-            const t = setTimeout(() => { sock.destroy(); resolve(false); }, 1000);
-            sock.connect(WARROOM_PORT, '127.0.0.1', () => { clearTimeout(t); sock.destroy(); resolve(true); });
-            sock.on('error', () => { clearTimeout(t); sock.destroy(); resolve(false); });
-          });
-        }
-        if (serverReady) {
-          await new Promise((r) => setTimeout(r, 200));
-          return c.json({ ok: true, status: 'ready' });
-        }
+        const ready = await ensureWarroomRespawned();
+        if (ready) return c.json({ ok: true, status: 'ready' });
         return c.json({ ok: false, status: 'starting', error: 'War Room server restarting, try again' }, 503);
       }
     } catch { /* pin file might not exist yet, that's fine */ }
@@ -738,6 +728,38 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       logger.warn({ err, reason }, 'killWarroomAsync failed');
       return [];
     }
+  }
+
+  // Coalesce concurrent restart-and-probe cycles. The frontend polls
+  // /api/warroom/start every 500ms while switching agents; without this,
+  // every poll spawns its own kill+wait, and they kill each other's
+  // half-spawned children.
+  let warroomRestartInFlight: Promise<boolean> | null = null;
+  async function ensureWarroomRespawned(): Promise<boolean> {
+    if (warroomRestartInFlight) return warroomRestartInFlight;
+    warroomRestartInFlight = (async (): Promise<boolean> => {
+      try {
+        await killWarroomAsync('pin changed recently, single-flight restart');
+        const net = await import('net');
+        for (let attempt = 0; attempt < 15; attempt++) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const ok = await new Promise<boolean>((resolve) => {
+            const sock = new net.Socket();
+            const t = setTimeout(() => { sock.destroy(); resolve(false); }, 1000);
+            sock.connect(WARROOM_PORT, '127.0.0.1', () => { clearTimeout(t); sock.destroy(); resolve(true); });
+            sock.on('error', () => { clearTimeout(t); sock.destroy(); resolve(false); });
+          });
+          if (ok) {
+            await new Promise((r) => setTimeout(r, 200));
+            return true;
+          }
+        }
+        return false;
+      } finally {
+        warroomRestartInFlight = null;
+      }
+    })();
+    return warroomRestartInFlight;
   }
 
   app.post('/api/warroom/pin', async (c) => {
