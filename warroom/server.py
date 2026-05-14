@@ -783,9 +783,11 @@ async def run_realtime_mode():
         OpenAILLMContext,
         OpenAILLMContextFrame,
     )
-    from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
-    from pipecat.turns.user_turn_strategies import UserTurnStrategies
-    from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import SpeechTimeoutUserTurnStopStrategy
+    # OpenAI Realtime's create_context_aggregator() expects the OpenAI-flavor
+    # LLMUserAggregatorParams (with aggregation_timeout), NOT the universal one
+    # (with user_turn_strategies). Using the universal class crashes the
+    # aggregator on the first frame with AttributeError.
+    from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams
     from pipecat.adapters.schemas.function_schema import FunctionSchema
     from pipecat.adapters.schemas.tools_schema import ToolsSchema
     from personas import get_persona
@@ -953,16 +955,14 @@ async def run_realtime_mode():
     if active_mode == "auto":
         llm.register_function("answer_as_agent", answer_as_agent_handler)
 
-    # OpenAI Realtime exposes its own aggregator pair. We pass the same
-    # SpeechTimeoutUserTurnStopStrategy as live mode so interruption behavior
-    # stays identical across modes.
+    # OpenAI Realtime does its own server-side VAD (configured via the
+    # session — see session_properties on the LLM service). The local
+    # aggregator's aggregation_timeout is the buffer used to group streamed
+    # transcripts before flushing to context, not the end-of-turn detector.
+    # Match it to WARROOM_SPEECH_TIMEOUT for a similar-feeling cadence.
     aggregators = llm.create_context_aggregator(
         context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(
-                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=speech_timeout)],
-            ),
-        ),
+        user_params=LLMUserAggregatorParams(aggregation_timeout=speech_timeout),
     )
 
     latency_logger = LatencyLogger()
