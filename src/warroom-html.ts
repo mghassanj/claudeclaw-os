@@ -534,7 +534,13 @@ export function getWarRoomHtml(token: string, chatId: string, warroomPort: numbe
     text-align: center;
     font-family: 'JetBrains Mono', monospace;
     white-space: nowrap;
+    transition: color 0.3s ease;
   }
+  /* Pre-warm WS indicator: green = warm WS open, amber = connecting,
+     red-ish = warmer down. Only painted while no real meeting is live. */
+  .status-text.warm-ready { color: #22c55e; }
+  .status-text.warm-connecting { color: #f59e0b; }
+  .status-text.warm-down { color: #ef4444; }
 
   /* ── Live mic waveform ── */
   .wave-wrap {
@@ -812,6 +818,200 @@ function buildWsUrl() {
     + window.location.host + '/ws/warroom?token=' + encodeURIComponent(TOKEN);
 }
 
+// ── Client tuning constants ──
+// Jitter-buffer target. We hold incoming Gemini 24kHz PCM frames in a queue
+// and only forward them to the SDK's AudioWorklet player once this much
+// audio is staged. The worklet itself dequeues at sample-accurate rate via
+// AudioContext.currentTime, so once primed playback rides whatever cushion
+// we built. 200 ms ≈ 5 frames at the 40 ms cadence Gemini Live emits.
+const JITTER_BUFFER_MS = 200;
+// Drain threshold: if no frame arrives within this window after the queue
+// goes idle we treat the utterance as over and re-prime the buffer on the
+// next inbound frame. Without this we'd only prebuffer the very first
+// utterance and every subsequent reply would play with zero cushion.
+const JITTER_UTTERANCE_GAP_MS = 350;
+// Direct-tunnel port: when running on localhost the user is on their own
+// SSH tunnel so we can skip the dashboard proxy hop and talk to pipecat
+// straight. The pipecat WebsocketServerTransport has NO auth of its own,
+// so this path MUST be gated on a true localhost hostname check.
+const DIRECT_WS_PORT = WARROOM_PORT;
+
+function isLocalHostname() {
+  var h = window.location.hostname;
+  return h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '::1';
+}
+
+// Direct-to-pipecat WS URL. Pipecat's WebsocketServerTransport binds the
+// upgrade handler at '/' (no path), so just ws://localhost:PORT.
+function buildDirectWsUrl() {
+  return (window.location.protocol === 'https:' ? 'wss://' : 'ws://')
+    + window.location.hostname + ':' + DIRECT_WS_PORT + '/';
+}
+
+// Pick the URL to attempt FIRST. Always returns proxy URL when not on
+// localhost. On localhost it returns the direct URL; the caller is
+// responsible for falling back to buildWsUrl() if the direct probe fails.
+function preferredWsUrl() {
+  return isLocalHostname() ? buildDirectWsUrl() : buildWsUrl();
+}
+
+// Cheap reachability probe for the direct-pipecat URL: we open a raw WS,
+// wait up to 1.2s for 'open', then close immediately. Returns true if the
+// socket opened. Only used on localhost; the fallback is the proxy URL.
+function probeDirectWs(url, timeoutMs) {
+  return new Promise(function(resolve) {
+    var done = false;
+    var sock;
+    var t = setTimeout(function() {
+      if (done) return;
+      done = true;
+      try { if (sock) sock.close(); } catch (e) {}
+      resolve(false);
+    }, timeoutMs || 1200);
+    try {
+      sock = new WebSocket(url);
+    } catch (e) {
+      clearTimeout(t); resolve(false); return;
+    }
+    sock.onopen = function() {
+      if (done) return; done = true;
+      clearTimeout(t);
+      try { sock.close(1000, 'direct probe ok'); } catch (e) {}
+      resolve(true);
+    };
+    sock.onerror = function() {
+      if (done) return; done = true;
+      clearTimeout(t);
+      try { sock.close(); } catch (e) {}
+      resolve(false);
+    };
+    sock.onclose = function() {
+      if (done) return; done = true;
+      clearTimeout(t);
+      resolve(false);
+    };
+  });
+}
+
+// Resolve the WS URL to use for the next SDK connect. On localhost we
+// probe direct-pipecat first; if it doesn't answer in time we transparently
+// fall back to the dashboard proxy. Anywhere else (LAN host, public domain,
+// tunnel host) we go straight to the proxy URL and never expose pipecat
+// directly to a non-localhost origin.
+async function resolveWsUrl() {
+  if (!isLocalHostname()) return buildWsUrl();
+  var direct = buildDirectWsUrl();
+  try {
+    var ok = await probeDirectWs(direct, 1200);
+    if (ok) {
+      try { console.log('[WarRoom] direct WS reachable, skipping dashboard proxy:', direct); } catch (e) {}
+      return direct;
+    }
+  } catch (e) { /* fall through */ }
+  return buildWsUrl();
+}
+
+// ── Audio jitter buffer ──────────────────────────────────────────────────
+// The Pipecat SDK pipes incoming 24kHz Int16 PCM frames straight into a
+// stream_processor AudioWorklet. When a frame arrives late, the worklet
+// underruns and the user hears a click/gap ("breaky" sound). We sit in
+// front of the SDK's bufferBotAudio() and prebuffer JITTER_BUFFER_MS of
+// audio before letting the first frame reach the worklet, so the worklet's
+// own ring has a cushion to absorb network jitter. After priming we forward
+// each frame in arrival order; the worklet keeps dequeuing at the real-time
+// sample rate it owns. If frames stop for JITTER_UTTERANCE_GAP_MS we treat
+// the utterance as done and re-prime on the next inbound frame.
+function installJitterBuffer(transport) {
+  try {
+    var mm = transport && transport._mediaManager;
+    if (!mm || typeof mm.bufferBotAudio !== 'function') return;
+    if (mm.__jitterInstalled) return;
+    mm.__jitterInstalled = true;
+
+    var originalBufferBotAudio = mm.bufferBotAudio.bind(mm);
+    var SAMPLE_RATE = 24000; // Gemini Live default; matches WavStreamPlayer
+    var TARGET_SAMPLES = Math.floor(SAMPLE_RATE * JITTER_BUFFER_MS / 1000);
+    var queue = []; // [{ data: Int16Array | ArrayBuffer, id: string|undefined, samples: number }]
+    var queuedSamples = 0;
+    var primed = false;
+    var lastFrameAt = 0;
+    var gapTimer = null;
+
+    function clearGapTimer() {
+      if (gapTimer !== null) { clearTimeout(gapTimer); gapTimer = null; }
+    }
+    function scheduleGapTimer() {
+      clearGapTimer();
+      gapTimer = setTimeout(function() {
+        // No new frame for JITTER_UTTERANCE_GAP_MS. Flush anything still
+        // queued (we owe the user every sample) then re-prime so the next
+        // utterance also gets the 200 ms cushion.
+        while (queue.length) {
+          var f = queue.shift();
+          try { originalBufferBotAudio(f.data, f.id); } catch (e) {}
+        }
+        queuedSamples = 0;
+        primed = false;
+      }, JITTER_UTTERANCE_GAP_MS);
+    }
+
+    mm.bufferBotAudio = function(data, id) {
+      // Compute sample count without copying. Int16 = 2 bytes / sample.
+      var samples;
+      if (data instanceof Int16Array) samples = data.length;
+      else if (data && typeof data.byteLength === 'number') samples = data.byteLength >> 1;
+      else samples = 0;
+
+      lastFrameAt = Date.now();
+      if (primed) {
+        // Already past the warm-up — forward immediately. The SDK's
+        // AudioWorklet schedules playback via AudioContext.currentTime
+        // internally, so each forwarded chunk lands sample-accurate at
+        // the end of whatever's already buffered.
+        scheduleGapTimer();
+        return originalBufferBotAudio(data, id);
+      }
+
+      queue.push({ data: data, id: id, samples: samples });
+      queuedSamples += samples;
+      scheduleGapTimer();
+
+      if (queuedSamples >= TARGET_SAMPLES) {
+        // Hand the whole prebuffer to the worklet in arrival order. The
+        // worklet's stream_processor ring absorbs it and starts playing.
+        primed = true;
+        var last;
+        while (queue.length) {
+          var frame = queue.shift();
+          last = originalBufferBotAudio(frame.data, frame.id);
+        }
+        queuedSamples = 0;
+        return last;
+      }
+      // Still warming up: ack the frame to the SDK by returning the
+      // Int16Array view the caller expects (matches WavMediaManager).
+      if (data instanceof Int16Array) return data;
+      if (data instanceof ArrayBuffer) return new Int16Array(data);
+      return undefined;
+    };
+
+    // Cleanup on disconnect so a stale gap timer doesn't fire after the
+    // transport is torn down.
+    var originalDisconnect = mm.disconnect && mm.disconnect.bind(mm);
+    if (originalDisconnect) {
+      mm.disconnect = function() {
+        clearGapTimer();
+        queue.length = 0;
+        queuedSamples = 0;
+        primed = false;
+        return originalDisconnect();
+      };
+    }
+  } catch (e) {
+    try { console.warn('[WarRoom] jitter buffer install failed:', e); } catch (ignore) {}
+  }
+}
+
 let meetingActive = false;
 var currentMeetingId = null;
 var transcriptEntryCount = 0;
@@ -1062,10 +1262,11 @@ async function reloadMeetingAfterRespawn(statusLabel, targetAgent) {
       return;
     }
 
-    var wsUrl = buildWsUrl();
+    var wsUrl = await resolveWsUrl();
     var WebSocketTransport = window.PipecatWarRoom.WebSocketTransport;
     var PipecatClient = window.PipecatWarRoom.PipecatClient;
     currentTransport = new WebSocketTransport({ wsUrl: wsUrl });
+    installJitterBuffer(currentTransport);
     pipecatClient = new PipecatClient({
       transport: currentTransport,
       enableMic: true,
@@ -1444,10 +1645,11 @@ async function togglePin(agentId) {
     // Hold the switching guard until onConnected or onDisconnected
     // fires (whichever happens first). Clearing it right after the
     // sync connect() call lets a rapid second click race through.
-    var wsUrl = buildWsUrl();
+    var wsUrl = await resolveWsUrl();
     var WebSocketTransport = window.PipecatWarRoom.WebSocketTransport;
     var PipecatClient = window.PipecatWarRoom.PipecatClient;
     currentTransport = new WebSocketTransport({ wsUrl: wsUrl });
+    installJitterBuffer(currentTransport);
     pipecatClient = new PipecatClient({
       transport: currentTransport,
       enableMic: true,
@@ -1704,6 +1906,7 @@ function __warRoomCleanup() {
   try { stopWaveform(); } catch(e){}
   try { if (pipecatClient) { pipecatClient.disconnect(); pipecatClient = null; } } catch(e){}
   try { if (currentTransport) { forceCloseTransport(currentTransport); currentTransport = null; } } catch(e){}
+  try { closeWarmer('page unload'); } catch(e){}
 }
 window.addEventListener('pagehide', __warRoomCleanup);
 window.addEventListener('beforeunload', __warRoomCleanup);
@@ -1735,7 +1938,10 @@ async function toggleMeeting() {
         return;
       }
 
-      var wsUrl = data.ws_url || buildWsUrl();
+      // Close any pre-warm holding socket so the single pipecat client
+      // slot is free for the SDK connect that follows. See __warmer below.
+      closeWarmer('start meeting');
+      var wsUrl = data.ws_url || (await resolveWsUrl());
 
       // Create the Pipecat client with WebSocket transport
       var WebSocketTransport = window.PipecatWarRoom.WebSocketTransport;
@@ -1766,7 +1972,9 @@ async function toggleMeeting() {
         document.getElementById('micBtn').disabled = false;
         micActive = true;
         document.getElementById('micBtn').classList.add('recording');
-        document.getElementById('statusText').textContent = 'meeting active';
+        var __st = document.getElementById('statusText');
+        __st.textContent = 'meeting active';
+        __st.classList.remove('warm-ready', 'warm-connecting', 'warm-down');
 
         // Kill music (immediate on mobile, fade on desktop)
         var music = document.getElementById('bgMusic');
@@ -1794,6 +2002,7 @@ async function toggleMeeting() {
       var retryTimerHandle = null;
       function buildClient() {
         currentTransport = new WebSocketTransport({ wsUrl: wsUrl });
+        installJitterBuffer(currentTransport);
         return new PipecatClient({
           transport: currentTransport,
           enableMic: true,
@@ -1817,13 +2026,14 @@ async function toggleMeeting() {
               document.getElementById('micBtn').disabled = true;
               // Single auto-reconnect attempt after 2s. If it fails, give up
               // and let the user click Start Meeting manually.
-              setTimeout(function() {
+              setTimeout(async function() {
                 if (!meetingActive) return;
                 try {
                   var WebSocketTransport = window.PipecatWarRoom.WebSocketTransport;
                   var PipecatClient = window.PipecatWarRoom.PipecatClient;
-                  wsUrl = buildWsUrl();
+                  wsUrl = await resolveWsUrl();
                   currentTransport = new WebSocketTransport({ wsUrl: wsUrl });
+                  installJitterBuffer(currentTransport);
                   pipecatClient = new PipecatClient({
                     transport: currentTransport,
                     enableMic: true,
@@ -2035,6 +2245,9 @@ async function toggleMeeting() {
     var secs = duration % 60;
     document.getElementById('statusText').textContent = 'ended';
     addTranscriptEntry('system', 'Meeting ended. ' + mins + 'm ' + secs + 's. Cost: $' + totalCost.toFixed(3));
+    // Re-open the pre-warm WS so the NEXT Start Meeting click is also fast.
+    __warmerBackoff = 1000;
+    setTimeout(function() { if (!meetingActive) openWarmer(); }, 500);
   }
 }
 
@@ -2051,6 +2264,108 @@ function toggleMic() {
     document.getElementById('statusText').textContent = 'muted';
   }
 }
+
+// ── WebSocket pre-warm ───────────────────────────────────────────────────
+// Open a lightweight raw WS to the pipecat path on page load so the first
+// Start Meeting click doesn't pay the WS+TLS+proxy-upgrade cold-start cost.
+// We use a plain WebSocket (NOT the Pipecat SDK) so we don't trigger a mic
+// permission prompt — getUserMedia still gates on the user clicking
+// Start Meeting. The warmer is closed in toggleMeeting() before the SDK
+// connects so pipecat's single-client slot is free.
+var __warmer = null;        // active warm WebSocket
+var __warmerBackoff = 1000; // exp backoff for idle reconnect
+var __warmerRetryHandle = null;
+var __warmerClosedByUs = false;
+
+function setWarmStatus(text, cls) {
+  try {
+    var el = document.getElementById('statusText');
+    if (!el) return;
+    // Only paint warm-state strings while no meeting is active so we don't
+    // stomp on "meeting active" / "listening..." / "muted" labels.
+    if (meetingActive) return;
+    el.textContent = text;
+    el.classList.remove('warm-ready', 'warm-connecting', 'warm-down');
+    if (cls) el.classList.add(cls);
+  } catch (e) {}
+}
+
+function closeWarmer(reason) {
+  __warmerClosedByUs = true;
+  if (__warmerRetryHandle !== null) {
+    clearTimeout(__warmerRetryHandle);
+    __warmerRetryHandle = null;
+  }
+  if (__warmer) {
+    try { __warmer.close(1000, reason || 'warmer closed'); } catch (e) {}
+    __warmer = null;
+  }
+}
+
+async function openWarmer() {
+  if (meetingActive) return; // never warm while a real meeting is live
+  if (__warmer && (__warmer.readyState === 0 || __warmer.readyState === 1)) return;
+  __warmerClosedByUs = false;
+  setWarmStatus('connecting...', 'warm-connecting');
+  var url;
+  try { url = await resolveWsUrl(); } catch (e) { url = buildWsUrl(); }
+  var sock;
+  try { sock = new WebSocket(url); } catch (e) { scheduleWarmerRetry(); return; }
+  __warmer = sock;
+  sock.binaryType = 'arraybuffer';
+  sock.onopen = function() {
+    __warmerBackoff = 1000; // reset backoff on success
+    setWarmStatus('ready', 'warm-ready');
+    try { console.log('[WarRoom] pre-warm WS open:', url); } catch (e) {}
+  };
+  sock.onerror = function() { /* onclose follows; backoff is scheduled there */ };
+  sock.onclose = function() {
+    if (__warmer === sock) __warmer = null;
+    if (__warmerClosedByUs) return;
+    if (meetingActive) return; // real meeting took over, that's fine
+    setWarmStatus('reconnecting...', 'warm-down');
+    scheduleWarmerRetry();
+  };
+  // The pipecat server may push frames at the warmer (it shouldn't until
+  // we send a Pipecat ready frame, but be defensive). Drop them silently —
+  // the warmer doesn't own playback.
+  sock.onmessage = function() {};
+}
+
+function scheduleWarmerRetry() {
+  if (__warmerRetryHandle !== null) return;
+  if (meetingActive) return;
+  var delay = __warmerBackoff;
+  __warmerBackoff = Math.min(__warmerBackoff * 2, 30000); // cap at 30s
+  __warmerRetryHandle = setTimeout(function() {
+    __warmerRetryHandle = null;
+    openWarmer();
+  }, delay);
+}
+
+// Fire on DOMContentLoaded (or immediately if we're already past it).
+// The intro overlay covers the page until the user clicks, so warming
+// during the intro is pure win — there is no UI flicker to worry about.
+function __startWarmer() {
+  // Defer the actual probe by a short tick so the intro animation
+  // doesn't compete with a TLS handshake for the first frame budget.
+  setTimeout(function() { openWarmer(); }, 200);
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', __startWarmer, { once: true });
+} else {
+  __startWarmer();
+}
+// Stop trying to reconnect when the tab is hidden — saves battery and
+// avoids piling up retries while the user is on another tab.
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState === 'hidden') {
+    closeWarmer('tab hidden');
+  } else if (!meetingActive) {
+    __warmerBackoff = 1000;
+    openWarmer();
+  }
+});
 </script>
 </body>
 </html>`;
