@@ -1,13 +1,21 @@
 """
 War Room Voice Server for ClaudeClaw.
 
-Two modes, selected by the WARROOM_MODE environment variable:
+Three modes, selected by the WARROOM_MODE environment variable:
 
-  live   (default)   Gemini Live native-audio model + tool-calling.
+  realtime           OpenAI Realtime API (speech-to-speech + tool-calling).
+                     Lowest-latency option (~500-700 ms end-to-end); used for
+                     live customer demos. Pipeline shape is identical to `live`
+                     mode — same tools, same persona logic, same speech-timeout
+                     stop strategy — just a different LLM service in the slot.
+
+  live               Gemini Live native-audio model + tool-calling.
                      WebSocket → user aggregator → Gemini Live → assistant aggregator → WebSocket.
                      Gemini handles speech-to-speech in real time. For execution work, it
                      calls tools that hand off to sub-agents via mission-cli (async) or run
-                     inline (synchronous, fast answers like "what time is it").
+                     inline (synchronous, fast answers like "what time is it"). Kept as a
+                     fast fallback if OpenAI Realtime is unavailable mid-demo:
+                     `WARROOM_MODE=live` + dashboard restart and you're back on Gemini.
 
   legacy             The original stitched STT → router → Claude-bridge → TTS chain.
                      Higher latency, but every utterance goes through the full Claude Code
@@ -18,14 +26,20 @@ Usage:
     python warroom/server.py
 
 Environment variables:
-    WARROOM_MODE         "live" (default) or "legacy"
-    WARROOM_PORT         port to listen on (default: 7860)
-    WARROOM_LIVE_MODEL     Gemini Live model id (default: whatever Pipecat ships)
-    WARROOM_LIVE_VOICE     Gemini Live voice name (default: "Charon")
-    WARROOM_SPEECH_TIMEOUT seconds of silence before end-of-turn (default: 0.3)
-                           Lower = faster reply; too low cuts off natural pauses.
-                           Increase to 0.5-0.6 if Arabic pauses trigger false stops.
+    WARROOM_MODE              "realtime", "live", or "legacy"
+    WARROOM_PORT              port to listen on (default: 7860)
+    WARROOM_LIVE_MODEL        Gemini Live model id (default: whatever Pipecat ships)
+    WARROOM_LIVE_VOICE        Gemini Live voice name (default: "Charon")
+    WARROOM_REALTIME_MODEL    OpenAI Realtime model id (default: pipecat's built-in
+                              gpt-4o-realtime-preview-2025-06-03)
+    WARROOM_REALTIME_VOICE    OpenAI Realtime voice (default: "alloy"; valid: alloy,
+                              ash, ballad, coral, echo, fable, onyx, nova, sage,
+                              shimmer, verse)
+    WARROOM_SPEECH_TIMEOUT    seconds of silence before end-of-turn (default: 0.3)
+                              Lower = faster reply; too low cuts off natural pauses.
+                              Increase to 0.5-0.6 if Arabic pauses trigger false stops.
 
+    OPENAI_API_KEY       required for realtime mode
     GOOGLE_API_KEY       required for live mode
     DEEPGRAM_API_KEY     required for legacy mode
     CARTESIA_API_KEY     required for legacy mode
@@ -741,6 +755,264 @@ async def run_live_mode():
     logger.info("War Room session ended.")
 
 
+# ─── Mode 1b: OpenAI Realtime (speech-to-speech + tools) ───────────────────
+
+async def run_realtime_mode():
+    """OpenAI Realtime API pipeline with tool calling.
+
+    Architecturally identical to run_live_mode():
+        WebSocket → user aggregator → OpenAI Realtime → latency_logger
+                  → assistant aggregator → WebSocket
+    Same tool schemas, same persona logic, same speech-timeout stop strategy,
+    same LLMContextFrame seeding on connect. Only the LLM service changes.
+
+    Sample rates: OpenAI Realtime is 24 kHz in both directions (Gemini Live
+    was 16 kHz in / 24 kHz out). We override audio_in_sample_rate on the
+    transport via make_transport(audio_in_sr=24000).
+
+    Voice: WARROOM_REALTIME_VOICE env var, default "alloy". Valid OpenAI
+    voices: alloy, ash, ballad, coral, echo, fable, onyx, nova, sage,
+    shimmer, verse.
+
+    Model: WARROOM_REALTIME_MODEL env var; if unset, pipecat 0.0.108's
+    built-in default (gpt-4o-realtime-preview-2025-06-03) is used.
+    """
+    from pipecat.services.openai_realtime_beta import OpenAIRealtimeBetaLLMService
+    from pipecat.services.openai_realtime_beta.events import SessionProperties
+    from pipecat.processors.aggregators.openai_llm_context import (
+        OpenAILLMContext,
+        OpenAILLMContextFrame,
+    )
+    from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
+    from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import SpeechTimeoutUserTurnStopStrategy
+    from pipecat.adapters.schemas.function_schema import FunctionSchema
+    from pipecat.adapters.schemas.tools_schema import ToolsSchema
+    from personas import get_persona
+
+    from pipecat.frames.frames import (
+        MetricsFrame, UserStoppedSpeakingFrame, BotStartedSpeakingFrame
+    )
+    from pipecat.metrics.metrics import TTFBMetricsData, ProcessingMetricsData
+    from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+
+    class LatencyLogger(FrameProcessor):
+        """Same latency probe as live mode — see run_live_mode for details."""
+
+        def __init__(self):
+            super().__init__()
+            self._user_stopped_at: float | None = None
+
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+
+            if isinstance(frame, UserStoppedSpeakingFrame):
+                self._user_stopped_at = time.monotonic()
+                logger.info("⏱  VAD end-of-speech detected — waiting for OpenAI Realtime")
+
+            elif isinstance(frame, BotStartedSpeakingFrame):
+                if self._user_stopped_at is not None:
+                    e2e_ms = (time.monotonic() - self._user_stopped_at) * 1000
+                    logger.info("⏱  E2E latency (EOSpeech → first audio): %.0f ms", e2e_ms)
+                    self._user_stopped_at = None
+
+            elif isinstance(frame, MetricsFrame):
+                for m in frame.data:
+                    if isinstance(m, TTFBMetricsData):
+                        logger.info(
+                            "⏱  TTFB [%s/%s]: %.0f ms",
+                            m.processor, m.model or "?", m.value * 1000,
+                        )
+                    elif isinstance(m, ProcessingMetricsData):
+                        logger.info(
+                            "⏱  Processing [%s/%s]: %.0f ms",
+                            m.processor, m.model or "?", m.value * 1000,
+                        )
+
+            await self.push_frame(frame, direction)
+
+    check_required_keys({"OPENAI_API_KEY": "OpenAI (Realtime API)"})
+
+    port = int(os.environ.get("WARROOM_PORT", "7860"))
+    model = os.environ.get("WARROOM_REALTIME_MODEL")  # None → pipecat default
+    speech_timeout = float(os.environ.get("WARROOM_SPEECH_TIMEOUT", "0.3"))
+
+    active_agent, active_mode = read_pin_state()
+    logger.info("Active agent=%s mode=%s", active_agent, active_mode)
+
+    voice = os.environ.get("WARROOM_REALTIME_VOICE", "alloy")
+    system_prompt = get_persona(active_agent, mode=active_mode)
+
+    # OpenAI Realtime expects 24 kHz both in and out.
+    transport = make_transport(port, audio_in_sr=24000, audio_out_sr=24000)
+
+    # Same tool schemas as live mode. Pipecat's OpenAI adapter converts
+    # ToolsSchema → OpenAI tool format inside _send_session_update.
+    delegate_schema = FunctionSchema(
+        name="delegate_to_agent",
+        description=(
+            "Delegate a unit of work to one of the user's sub-agents. The sub-agent "
+            "runs the task asynchronously through its full Claude Code environment "
+            "and pings the user on Telegram when finished. Use this for anything that "
+            "requires real execution: research, drafting messages, file operations, "
+            "scheduling, running code. After calling this, tell the user verbally that "
+            "you've queued it and they'll be notified when done. DO NOT wait."
+        ),
+        properties={
+            "agent": {
+                "type": "string",
+                "enum": sorted(VALID_AGENTS),
+                "description": "Which sub-agent should handle this work.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Short 3-8 word label for the task (for the Telegram notification).",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Full instructions for the sub-agent. Be specific about what the user wants.",
+            },
+            "priority": {
+                "type": "integer",
+                "description": "Task priority 0-10 (default 5). Use 8+ only for truly urgent work.",
+            },
+        },
+        required=["agent", "title", "prompt"],
+    )
+
+    get_time_schema = FunctionSchema(
+        name="get_time",
+        description="Get the current wall clock time in the user's local timezone. Use when they ask what time it is.",
+        properties={},
+        required=[],
+    )
+
+    list_agents_schema = FunctionSchema(
+        name="list_agents",
+        description="List the user's sub-agents with their one-line role descriptions. Use when they ask 'who's on my team' or 'who can I delegate to'.",
+        properties={},
+        required=[],
+    )
+
+    standard_tools = [delegate_schema, get_time_schema, list_agents_schema]
+    if active_mode == "auto":
+        answer_schema = FunctionSchema(
+            name="answer_as_agent",
+            description=(
+                "Route the user's question to the best-fit specialist and return their "
+                "answer verbatim. Use this for EVERY substantive question in auto mode. "
+                "Pick the agent whose role matches the question. Speak a one-word "
+                "acknowledgment BEFORE calling this tool, then when it returns, read "
+                "the 'text' field verbatim with no commentary."
+            ),
+            properties={
+                "agent": {
+                    "type": "string",
+                    "enum": sorted(VALID_AGENTS),
+                    "description": "Which specialist should answer.",
+                },
+                "question": {
+                    "type": "string",
+                    "description": "The user's full question, cleaned up grammatically if needed.",
+                },
+            },
+            required=["agent", "question"],
+        )
+        standard_tools.append(answer_schema)
+
+    tools = ToolsSchema(standard_tools=standard_tools)
+
+    # OpenAI Realtime requires its own context type (universal LLMContext is
+    # not yet supported by OpenAIRealtimeBetaLLMService — it raises
+    # NotImplementedError on LLMContextFrame). The system prompt goes in as
+    # the first "system" message so pipecat extracts it as session
+    # instructions during _send_session_update.
+    context = OpenAILLMContext(
+        messages=[{"role": "system", "content": system_prompt}],
+        tools=tools,
+    )
+
+    # Session properties: voice + server-side audio format. Turn detection
+    # is left at the pipecat default — we drive end-of-turn via the
+    # SpeechTimeoutUserTurnStopStrategy on the user aggregator below, matching
+    # live mode so the UX (interruption, false-stop behavior) is consistent.
+    session_properties = SessionProperties(voice=voice)
+
+    llm_kwargs = dict(
+        api_key=os.environ["OPENAI_API_KEY"],
+        session_properties=session_properties,
+    )
+    if model:
+        llm_kwargs["model"] = model
+
+    llm = OpenAIRealtimeBetaLLMService(**llm_kwargs)
+
+    llm.register_function("delegate_to_agent", delegate_to_agent_handler)
+    llm.register_function("get_time", get_time_handler)
+    llm.register_function("list_agents", list_agents_handler)
+    if active_mode == "auto":
+        llm.register_function("answer_as_agent", answer_as_agent_handler)
+
+    # OpenAI Realtime exposes its own aggregator pair. We pass the same
+    # SpeechTimeoutUserTurnStopStrategy as live mode so interruption behavior
+    # stays identical across modes.
+    aggregators = llm.create_context_aggregator(
+        context,
+        user_params=LLMUserAggregatorParams(
+            user_turn_strategies=UserTurnStrategies(
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=speech_timeout)],
+            ),
+        ),
+    )
+
+    latency_logger = LatencyLogger()
+
+    pipeline = Pipeline([
+        transport.input(),
+        aggregators.user(),
+        llm,
+        latency_logger,
+        aggregators.assistant(),
+        transport.output(),
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
+        ),
+        # Same rationale as live mode — dashboard owns subprocess lifecycle,
+        # don't let pipecat second-guess it after 5 min of silence.
+        idle_timeout_secs=None,
+        cancel_on_idle_timeout=False,
+    )
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected; keeping pipeline alive for next meeting")
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected (realtime mode); resetting context and pushing OpenAILLMContextFrame")
+        # Drop accumulated history from prior meetings, keep the system
+        # prompt so the persona survives.
+        context.messages.clear()
+        context.add_message({"role": "system", "content": system_prompt})
+        # Seed the OpenAI context frame so the service installs tools +
+        # instructions on the realtime session before audio starts flowing.
+        await task.queue_frame(OpenAILLMContextFrame(context=context))
+
+    print_ready(port, "realtime")
+    runner = PipelineRunner(handle_sigterm=True)
+    logger.info(
+        "War Room REALTIME mode on ws://0.0.0.0:%d (agent=%s mode=%s voice=%s model=%s tools=%d speech_timeout=%.2fs)",
+        port, active_agent, active_mode, voice, model or "pipecat-default", len(standard_tools), speech_timeout,
+    )
+    await runner.run(task)
+    logger.info("War Room session ended.")
+
+
 # ─── Mode 2: Legacy stitched pipeline ──────────────────────────────────────
 
 async def run_legacy_mode():
@@ -809,9 +1081,11 @@ async def run_warroom():
         await run_legacy_mode()
     elif mode == "live":
         await run_live_mode()
+    elif mode == "realtime":
+        await run_realtime_mode()
     else:
         logger.error(
-            "Unknown WARROOM_MODE=%r. Expected 'live' or 'legacy'. Defaulting to 'live'.",
+            "Unknown WARROOM_MODE=%r. Expected 'realtime', 'live', or 'legacy'. Defaulting to 'live'.",
             mode,
         )
         await run_live_mode()
