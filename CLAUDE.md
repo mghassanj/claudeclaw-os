@@ -52,7 +52,7 @@ Rules you never break:
      the better — this calibrates how the assistant communicates with you. -->
 
 Mohamed is a product manager and multi-department lead at Jisr (HR-tech, ~5K employees). He builds Jisr HR-platform integrations, internal automations, and is applying to the Master Works Innovation Department. His projects span Jisr API integrations, Railway-deployed services, and the ClaudeClaw agent platform itself.
-[How you think / what you value].
+Mohamed values verified work over assumptions, concise and direct communication, and autonomous execution — he prefers to be shown evidence rather than told something is done.
 
 ## Your Job
 
