@@ -1,0 +1,33 @@
+{
+  "_doc": "Social-feed sources for daily HR-tech sweep. All endpoints free, no API keys. Three tiers: rss (parse XML, fastest), x_browser (Chromium scraping; auth_required entries use cookies from out/x-cookies.json), html_targets (URLs research WebFetches on demand). Maintained by hand — re-verify with `node scripts/social-feed/check-sources.js` quarterly.",
+  "rss": [
+    { "name": "Mercans Statutory Alerts (KSA)", "url": "https://mercans.com/feed/?cat=saudi-arabia", "category": "tier1-advisory", "lang": "en", "notes": "KSA payroll/labor alerts" },
+    { "name": "Mercans (all)", "url": "https://mercans.com/feed/", "category": "tier1-advisory", "lang": "en", "notes": "Full Mercans feed" },
+    { "name": "Arab News", "url": "https://www.arabnews.com/rss.xml", "category": "tier1-advisory", "lang": "en", "notes": "KSA English daily — labor/business desk" },
+    { "name": "Bayzat Blog", "url": "https://www.bayzat.com/blog/feed/", "category": "competitor", "lang": "en", "notes": "Gulf HR-tech competitor product blog" },
+    { "name": "Josh Bersin", "url": "https://joshbersin.com/feed/", "category": "thought-leader", "lang": "en", "notes": "Global HR-tech analyst" },
+    { "name": "HR Executive", "url": "https://hrexecutive.com/feed/", "category": "thought-leader", "lang": "en", "notes": "Global HR-tech news" }
+  ],
+  "x_browser": [
+    { "handle": "Qiwa_SA", "url": "https://x.com/Qiwa_SA", "category": "gov-ksa", "lang": "ar", "auth_required": false, "notes": "Qiwa platform — labor compliance" },
+    { "handle": "SaudiVision2030", "url": "https://x.com/SaudiVision2030", "category": "gov-ksa", "lang": "bilingual", "auth_required": false, "notes": "Vision 2030 program updates" },
+    { "handle": "Argaam", "url": "https://x.com/Argaam", "category": "tier1-advisory", "lang": "ar", "auth_required": false, "notes": "Argaam Business — KSA business news" },
+    { "handle": "HRSD_SA", "url": "https://x.com/HRSD_SA", "category": "gov-ksa", "lang": "ar", "auth_required": true, "notes": "Ministry of HR & Social Development — primary source for Saudization/Nitaqat" },
+    { "handle": "GOSI_SA", "url": "https://x.com/GOSI_SA", "category": "gov-ksa", "lang": "ar", "auth_required": true, "notes": "GOSI — social insurance announcements" },
+    { "handle": "Zatca_sa", "url": "https://x.com/Zatca_sa", "category": "gov-ksa", "lang": "ar", "auth_required": true, "notes": "Zakat / Tax / Customs Authority" },
+    { "handle": "SPAregions", "url": "https://x.com/SPAregions", "category": "gov-ksa", "lang": "ar", "auth_required": true, "notes": "Saudi Press Agency — real-time gov news" },
+    { "handle": "Mudad_sa", "url": "https://x.com/Mudad_sa", "category": "gov-ksa", "lang": "ar", "auth_required": true, "notes": "Mudad — Wage Protection System (verify handle)" },
+    { "handle": "Musaned_sa", "url": "https://x.com/Musaned_sa", "category": "gov-ksa", "lang": "ar", "auth_required": true, "notes": "Musaned — domestic worker platform (verify handle)" }
+  ],
+  "html_targets": [
+    { "name": "HRSD news (Arabic)", "url": "https://www.hrsd.gov.sa/ar/news", "category": "gov-ksa", "lang": "ar", "notes": "Ministry of HR — primary source for full press releases. Use WebFetch." },
+    { "name": "GOSI news (English)", "url": "https://www.gosi.gov.sa/portal/en/news", "category": "gov-ksa", "lang": "en", "notes": "GOSI long-form announcements. Use WebFetch." },
+    { "name": "Qiwa blog", "url": "https://www.qiwa.sa/en/blog", "category": "gov-ksa", "lang": "en", "notes": "Qiwa platform updates. Use WebFetch." },
+    { "name": "ZATCA news", "url": "https://zatca.gov.sa/en/MediaCenter/News", "category": "gov-ksa", "lang": "en", "notes": "Tax authority — payroll-tax adjacent. Use WebFetch." },
+    { "name": "Saudi Press Agency", "url": "https://www.spa.gov.sa/en", "category": "gov-ksa", "lang": "en", "notes": "First English source for cabinet/royal decisions. Use WebFetch." },
+    { "name": "KPMG GMS Flash Alerts", "url": "https://kpmg.com/xx/en/our-insights/insights/topics/global-mobility-services.html", "category": "tier1-advisory", "lang": "en", "notes": "KSA payroll/social-insurance alerts. Use WebFetch." },
+    { "name": "EY Tax Alerts", "url": "https://www.ey.com/en_gl/tax-alerts", "category": "tier1-advisory", "lang": "en", "notes": "Filter for KSA in body. Use WebFetch." },
+    { "name": "Saudi Gazette", "url": "https://saudigazette.com.sa/", "category": "tier1-advisory", "lang": "en", "notes": "KSA English daily. Use WebFetch." },
+    { "name": "Argaam (English)", "url": "https://www.argaam.com/en", "category": "tier1-advisory", "lang": "en", "notes": "KSA business news English. Use WebFetch." }
+  ]
+}
