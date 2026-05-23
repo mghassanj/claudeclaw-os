@@ -64,7 +64,7 @@ const SIDE_EFFECT_TOOLS = [
 const DEFAULT_AGENT_ALLOWLISTS: Record<string, string[]> = {
   // Main is the host. Default to read-only — when in doubt, route to a
   // specialist instead of doing the work directly.
-  main: [],
+  main: ['mcp:jisr-backend-codewiki', 'mcp:jisr-frontend-codewiki', 'mcp:performance-management-codewiki', 'mcp:applicant-tracking-system-codewiki', 'mcp:finway-codewiki', 'mcp:spend-management-codewiki', 'mcp:analytics-codewiki'],
   // Ops drives schedules and calendars; needs Bash + Skill.
   ops: ['Bash', 'Skill'],
   // Comms triages email and routes; needs Skill (gmail/slack) + Bash.

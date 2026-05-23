@@ -21,6 +21,20 @@ export interface McpStdioConfig {
   env?: Record<string, string>;
 }
 
+export interface McpHttpConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export interface McpSseConfig {
+  type: 'sse';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export type McpServerConfig = McpStdioConfig | McpHttpConfig | McpSseConfig;
+
 /**
  * Merge MCP server configs from user settings (~/.claude/settings.json) and
  * project settings (.claude/settings.json in cwd), optionally filtered by
@@ -29,8 +43,8 @@ export interface McpStdioConfig {
  * Exported so the voice bridge can reuse the exact same loader the text
  * bot uses — keeping behavior consistent across channels.
  */
-export function loadMcpServers(allowlist?: string[], projectCwd?: string): Record<string, McpStdioConfig> {
-  const merged: Record<string, McpStdioConfig> = {};
+export function loadMcpServers(allowlist?: string[], projectCwd?: string): Record<string, McpServerConfig> {
+  const merged: Record<string, McpServerConfig> = {};
 
   // Load from project settings (.claude/settings.json in cwd). `projectCwd`
   // lets callers (e.g. the voice bridge) target a specific sub-agent's
@@ -55,6 +69,15 @@ export function loadMcpServers(allowlist?: string[], projectCwd?: string): Recor
               command: cfg.command,
               ...(cfg.args ? { args: cfg.args as string[] } : {}),
               ...(cfg.env ? { env: cfg.env as Record<string, string> } : {}),
+            };
+          } else if (cfg.url && typeof cfg.url === 'string') {
+            // HTTP / SSE remote MCP. Default to 'http' (streamable HTTP)
+            // unless explicitly marked as 'sse'.
+            const transport = cfg.type === 'sse' ? 'sse' : 'http';
+            merged[name] = {
+              type: transport,
+              url: cfg.url,
+              ...(cfg.headers ? { headers: cfg.headers as Record<string, string> } : {}),
             };
           }
         }
