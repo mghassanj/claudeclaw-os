@@ -124,7 +124,9 @@ export function Usage() {
             </div>
           )}
 
-          <ReworkPanel rows={rework.data?.rows ?? []} />
+          {rework.data && rework.data.rows.length > 0 && (
+            <ReworkPanel rows={rework.data.rows} />
+          )}
         </div>
       )}
     </div>
