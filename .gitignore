@@ -124,3 +124,22 @@ agents/*/.claude/claudex/
 # Agents self-mirror skills here at runtime when they reference one in their CLAUDE.md.
 # Not source — content lives in ~/.claude/skills/ + /home/ubuntu/repos/skills/.
 agents/*/skills/
+
+# Local backups + recovery artifacts (manual edit safety nets)
+*.bak
+*.bak.*
+*.before-*
+
+# Personal daily reports (railway-admin, hr-tech-daily, etc.)
+/out/
+
+# Python caches
+**/__pycache__/
+
+# Social-feed scraper iteration artifacts
+/scripts/social-feed/node_modules/
+/scripts/social-feed/x-*.png
+/scripts/social-feed/x-google-login-v*.js
+/scripts/social-feed/x-google-login.js
+/scripts/social-feed/x-full-login.js
+/scripts/social-feed/x-full-step-*.png
