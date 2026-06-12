@@ -3137,13 +3137,11 @@ async function runWarmupIntro(rosterForIntro) {
 // cold meeting where /history has not resolved yet.
 function getRoster() {
   if (roster && roster.length) return roster;
-  return [
-    { id: 'main', name: 'Main' },
-    { id: 'research', name: 'Research' },
-    { id: 'comms', name: 'Comms' },
-    { id: 'content', name: 'Content' },
-    { id: 'ops', name: 'Ops' },
-  ];
+  // Generic fallback: capitalize the id. Replaced by the real roster
+  // from the server once /history resolves.
+  return ['main', 'research', 'comms', 'content', 'ops'].map(function(id) {
+    return { id: id, name: id.charAt(0).toUpperCase() + id.slice(1) };
+  });
 }
 
 async function loadHistoryThenConnect() {

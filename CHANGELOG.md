@@ -4,6 +4,21 @@ All notable changes to ClaudeClaw will be documented here.
 
 ## [unreleased] - 2026-05-01
 
+### Fixed — per-agent provider selection
+- Dashboard-created agents can now choose a full provider config at
+  creation time instead of being limited to Claude model selection.
+  The wizard supports Claude, OpenCode, Gemini, Codex, and custom ACP
+  providers, including provider model, speed/runtime mode, thinking mode,
+  and custom ACP command arguments.
+- Agent cards now expose a provider editor so existing agents can switch
+  provider/model/modes after creation. Sub-agent changes still surface the
+  required restart prompt because agent config is loaded at process start.
+- `/provider` now reports provider-specific model status for Codex,
+  Gemini, OpenCode, and custom ACP providers instead of showing the
+  misleading OpenCode fallback text for every non-Claude provider.
+- Agent startup logs include the loaded provider config to make launchd
+  and scheduled-task debugging clearer.
+
 ### Fixed — agent file-send awareness
 - New agents created via the dashboard wizard now always include the
   `[SEND_FILE:...]` / `[SEND_PHOTO:...]` marker documentation in their

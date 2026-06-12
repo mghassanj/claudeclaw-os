@@ -6,7 +6,7 @@ import { PageState } from '@/components/PageState';
 import { PrivacyToggle } from '@/components/PrivacyToggle';
 import { BrainGraph } from '@/components/BrainGraph';
 import { useFetch } from '@/lib/useFetch';
-import { formatRelativeTime } from '@/lib/format';
+import { formatRelativeTime, resolveAgentName, seedAgentNames } from '@/lib/format';
 import { privacyBlur } from '@/lib/privacy';
 import { hasWebGL } from '@/lib/webgl';
 
@@ -52,7 +52,11 @@ export function HiveMind() {
   const [filter, setFilter] = useState<string>('all');
   const [view, setView] = useState<ViewMode>(loadView());
   const [revealed, setRevealed] = useState<Set<number>>(new Set());
-  const agentList = useFetch<{ agents: { id: string }[] }>('/api/agents');
+  const agentList = useFetch<{ agents: { id: string; name?: string }[] }>('/api/agents');
+  // Seed the global name cache whenever we get an agents response.
+  useEffect(() => {
+    if (agentList.data?.agents) seedAgentNames(agentList.data.agents);
+  }, [agentList.data]);
   const path = filter === 'all'
     ? '/api/hive-mind?limit=200'
     : `/api/hive-mind?agent=${encodeURIComponent(filter)}&limit=200`;
@@ -94,7 +98,7 @@ export function HiveMind() {
           <>
             <Tab label="All" active={filter === 'all'} onClick={() => setFilter('all')} />
             {allAgents.map((id) => (
-              <Tab key={id} label={id} active={filter === id} onClick={() => setFilter(id)} />
+              <Tab key={id} label={resolveAgentName(id)} active={filter === id} onClick={() => setFilter(id)} />
             ))}
           </>
         }
@@ -158,7 +162,7 @@ export function HiveMind() {
                   <td class="px-3 py-2">
                     <span class="inline-flex items-center gap-1.5" style={{ color: AGENT_HUE[e.agent_id] || 'var(--color-text-muted)' }}>
                       <span class="inline-block w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'currentColor' }} />
-                      {e.agent_id}
+                      {resolveAgentName(e.agent_id)}
                     </span>
                   </td>
                   <td class="px-3 py-2 font-mono text-[11px] text-[var(--color-text-muted)]">{e.action}</td>

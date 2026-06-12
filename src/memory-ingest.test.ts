@@ -22,6 +22,21 @@ vi.mock('./security.js', () => ({
   getScrubbedSdkEnv: vi.fn(() => ({})),
 }));
 
+vi.mock('./active-provider.js', () => ({
+  getSelectedProviderConfig: vi.fn(() => ({ type: 'claude' })),
+  defaultModelForProvider: vi.fn(() => 'claude-haiku-4-5-20251001'),
+}));
+
+vi.mock('./agent-engine/index.js', () => ({
+  EngineFactory: {
+    forProvider: vi.fn(() => ({
+      async *invoke(): AsyncGenerator<never> {
+        throw new Error('mocked: provider engine unavailable in test env');
+      },
+    })),
+  },
+}));
+
 vi.mock('./env.js', () => ({
   readEnvFile: vi.fn(() => ({})),
 }));

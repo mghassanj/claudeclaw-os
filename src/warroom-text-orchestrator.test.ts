@@ -8,6 +8,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('./config.js', () => ({
   PROJECT_ROOT: '/tmp/test-orchestrator',
   CLAUDECLAW_CONFIG: '/tmp/test-orchestrator/config',
+  DEFAULT_CLAUDE_MODEL: 'claude-opus-4-8',
+  CLAUDE_MODEL_OPUS: 'claude-opus-4-8',
+  CLAUDE_MODEL_SONNET: 'claude-sonnet-4-6',
+  CLAUDE_MODEL_HAIKU: 'claude-haiku-4-5',
 }));
 
 vi.mock('./env.js', () => ({

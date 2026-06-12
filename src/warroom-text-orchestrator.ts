@@ -11,10 +11,9 @@
  *      "should this agent chime in?" classifier.
  *   6. Emits turn_complete.
  *
- * Every agent turn uses `query()` from @anthropic-ai/claude-agent-sdk on
- * the subscription OAuth path (same as Telegram and voice bridge). No API
- * key, no Gemini. Per-agent cwd via resolveAgentDir so externally configured
- * agents (under CLAUDECLAW_CONFIG/agents) work identically to repo-local ones.
+ * Every agent turn uses the user's selected provider. Per-agent cwd via
+ * resolveAgentDir so externally configured agents (under CLAUDECLAW_CONFIG/
+ * agents) work identically to repo-local ones.
  *
  * Callers should wrap handleTextTurn in messageQueue.enqueue("warroom-text:" +
  * meetingId, …) so concurrent sends for the same meeting serialize instead
@@ -25,7 +24,6 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 
-import { query } from '@anthropic-ai/claude-agent-sdk';
 import { PROJECT_ROOT, CLAUDECLAW_CONFIG } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
@@ -51,6 +49,7 @@ import {
   resolveAgentDir,
   loadAgentConfig,
   listAllAgents,
+  resolveAgentDisplayName,
 } from './agent-config.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { requireEnabled, KillSwitchDisabledError } from './kill-switches.js';
@@ -67,6 +66,13 @@ import {
   type RouterContext,
   type RouterDecision,
 } from './warroom-text-router.js';
+import { EngineFactory } from './agent-engine/index.js';
+import { defaultModelForProvider, getSelectedProviderConfig } from './active-provider.js';
+import {
+  decodeProviderSession,
+  encodeProviderSession,
+  sessionBelongsToProvider,
+} from './provider.js';
 
 // ── Roster helpers ───────────────────────────────────────────────────
 
@@ -76,11 +82,32 @@ export interface RosterAgent {
   description: string;
 }
 
-const MAIN_AGENT: RosterAgent = {
-  id: 'main',
-  name: 'Main',
-  description: 'General ops and triage',
-};
+/** Resolve the main agent entry dynamically from config. */
+function resolveMainAgent(): RosterAgent {
+  try {
+    const cfg = loadAgentConfig('main');
+    return {
+      id: 'main',
+      name: cfg.name || resolveAgentDisplayName('main'),
+      description: cfg.description || 'General ops and triage',
+    };
+  } catch {
+    return {
+      id: 'main',
+      name: resolveAgentDisplayName('main'),
+      description: 'General ops and triage',
+    };
+  }
+}
+
+/** Resolve display name for an agent from the roster, with fallback. */
+function agentLabel(agentId: string, rosterById?: Map<string, RosterAgent>): string {
+  if (rosterById) {
+    const entry = rosterById.get(agentId);
+    if (entry) return entry.name;
+  }
+  return resolveAgentDisplayName(agentId);
+}
 
 /**
  * Full roster for a text War Room. Main is always first. Other agents
@@ -92,7 +119,7 @@ export function getRoster(): RosterAgent[] {
   const extras = listAllAgents()
     .filter((a) => a.id !== 'main')
     .map((a) => ({ id: a.id, name: a.name, description: a.description }));
-  return [MAIN_AGENT, ...extras];
+  return [resolveMainAgent(), ...extras];
 }
 
 // ── Public API ────────────────────────────────────────────────────────
@@ -511,9 +538,9 @@ export async function handleTextTurn(
 }
 
 /**
- * Warm up the Claude Agent SDK path so the first real user turn feels
+ * Warm up the selected provider path so the first real user turn feels
  * faster. Fires a locked-down maxTurns=1 query with no tools — the first
- * invocation pays the Node module cache cost + any one-time SDK init.
+ * invocation pays provider startup and any one-time engine init.
  * Subsequent queries in the same Node process skip that overhead.
  *
  * Meant to be called when the user lands on the text War Room page, in
@@ -531,25 +558,27 @@ export async function warmupMeeting(): Promise<void> {
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 10_000);
     try {
-      // Tiny prompt, no tools, no settings sources, Haiku. This is the
-      // same lightweight config the router uses, so on Hit 1 we warm the
-      // exact code path that runs on every user turn.
-      for await (const ev of query({
-        prompt: singleTurn('say ok'),
-        options: {
-          model: 'claude-haiku-4-5-20251001',
-          allowedTools: [],
-          disallowedTools: ['*'],
-          settingSources: [],
-          maxTurns: 1,
-          permissionMode: 'bypassPermissions',
-          allowDangerouslySkipPermissions: true,
-          env: sdkEnvStripped(),
-          abortController: abort,
-        } as any,
+      // Tiny prompt, no tools, no settings sources. This is the same
+      // lightweight config the router uses, so on Hit 1 we warm the exact
+      // provider path that runs on every user turn.
+      const provider = getSelectedProviderConfig();
+      const engine = EngineFactory.forProvider(provider);
+      for await (const ev of engine.invoke({
+        prompt: 'say ok',
+        provider,
+        cwd: PROJECT_ROOT,
+        model: defaultModelForProvider(provider, 'claude-haiku-4-5-20251001'),
+        allowedTools: [],
+        disallowedTools: ['*'],
+        settingSources: [],
+        maxTurns: 1,
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        env: sdkEnvStripped(),
+        abortController: abort,
       })) {
         // drain
-        if ((ev as any).type === 'result') break;
+        if (ev.type === 'result') break;
       }
       _warmupDone = true;
       logger.info('text War Room warmup complete');
@@ -579,12 +608,11 @@ export function isWarmupDone(): boolean {
 }
 
 // ── Per-agent SDK warmup ─────────────────────────────────────────────
-// Each agent runs in its own Claude Agent SDK subprocess with its own
-// cwd, MCP allowlist, and CLAUDE.md. The first call to query() for a
+// Each agent runs in its own selected-provider subprocess with its own
+// cwd, MCP allowlist, and CLAUDE.md. The first engine call for a
 // given agent pays a real cold-start: subprocess spawn, settings
-// resolution, MCP load, system prompt build, prompt-cache miss against
-// Anthropic. Once warm (within ~5 min of last call), subsequent queries
-// are dramatically faster.
+// resolution, MCP load, and system prompt build. Once warm (within ~5 min
+// of last call), subsequent queries are dramatically faster.
 //
 // Slash commands /standup and /discuss run 5 agents back-to-back. Without
 // pre-warming, agents 2–5 each pay sequential cold start, easily blowing
@@ -616,27 +644,26 @@ export async function warmupAgentSDK(agentId: string): Promise<void> {
       const abort = new AbortController();
       const timer = setTimeout(() => abort.abort(), AGENT_WARMUP_TIMEOUT_MS);
       try {
-        for await (const ev of query({
-          prompt: singleTurn('ok'),
-          options: {
-            cwd: agentDir,
-            // Haiku for speed — we only need to spin up the SDK and warm
-            // the network path. The real turn uses the agent's actual
-            // model; Anthropic's prompt cache spans models for the same
-            // session less aggressively, but the subprocess + SDK +
-            // MCP boot is the dominant cost we're amortizing here.
-            model: 'claude-haiku-4-5-20251001',
-            allowedTools: [],
-            disallowedTools: ['*'],
-            settingSources: [],
-            maxTurns: 1,
-            permissionMode: 'bypassPermissions',
-            allowDangerouslySkipPermissions: true,
-            env: sdkEnvStripped(),
-            abortController: abort,
-          } as any,
+        const provider = getSelectedProviderConfig();
+        const engine = EngineFactory.forProvider(provider);
+        for await (const ev of engine.invoke({
+          prompt: 'ok',
+          provider,
+          cwd: agentDir,
+          // Lightweight model for speed when Claude is selected. For ACP
+          // providers, use the selected provider/model because its adapter
+          // owns the actual warmup behavior.
+          model: defaultModelForProvider(provider, 'claude-haiku-4-5-20251001'),
+          allowedTools: [],
+          disallowedTools: ['*'],
+          settingSources: [],
+          maxTurns: 1,
+          permissionMode: 'bypassPermissions',
+          allowDangerouslySkipPermissions: true,
+          env: sdkEnvStripped(),
+          abortController: abort,
         })) {
-          if ((ev as any).type === 'result') break;
+          if (ev.type === 'result') break;
         }
         _warmupAgentDone.add(agentId);
         logger.info({ agentId }, 'agent SDK warmed');
@@ -1386,8 +1413,12 @@ async function runAgentTurn(args: RunAgentTurnArgs): Promise<string> {
   // conversation_log queries; those need the real Telegram chat id
   // (`meetingChatId`).
   const sessionChatId = `warroom-text:${meetingId}`;
+  const provider = getSelectedProviderConfig();
   const sessionId = getSession(sessionChatId, agentId) ?? undefined;
-  const isFirstTurn = !sessionId;
+  const providerSessionId = sessionBelongsToProvider(sessionId, provider)
+    ? decodeProviderSession(provider, sessionId)
+    : undefined;
+  const isFirstTurn = !providerSessionId;
 
   // Framing hint: on the first turn we explain the meeting format.
   // On every turn we append a short transcript of what OTHER agents
@@ -1503,7 +1534,7 @@ async function runAgentTurn(args: RunAgentTurnArgs): Promise<string> {
     type: 'status_update',
     turnId,
     phase: 'streaming',
-    label: `${agentId === 'main' ? 'Main' : agentId} is typing…`,
+    label: `${agentLabel(agentId)} is typing…`,
     agentId,
   });
 
@@ -1522,6 +1553,7 @@ async function runAgentTurn(args: RunAgentTurnArgs): Promise<string> {
   // tool loops within an agent's maxTurns headroom.
   const TOOL_BUDGET_PER_TURN = 8;
   let toolCallsMade = 0;
+  const seenProviderToolCalls = new Set<string>();
   // Track tool work so we can surface a meaningful fallback when the
   // agent burns its turn budget on tools and never produces final text.
   // Without this the user sees an empty bubble and has no idea the agent
@@ -1565,66 +1597,134 @@ async function runAgentTurn(args: RunAgentTurnArgs): Promise<string> {
     // Caught below so we can emit a clean system_note instead of crashing
     // the orchestrator and leaving the bubble stuck.
     requireEnabled('LLM_SPAWN_ENABLED');
-    for await (const ev of query({
-      prompt: singleTurn(framedText),
-      options: {
-        cwd: agentDir,
-        resume: sessionId,
-        settingSources: ['project', 'user'],
-        // War-room runs with the SDK's default permission mode — no
-        // bypassPermissions, no allowDangerouslySkipPermissions. Combined
-        // with the per-agent tool policy below, every side-effect tool
-        // call now goes through the SDK's permission machinery.
-        permissionMode: 'default',
-        // Tool policy from warroom-tool-policy.ts. Read-only built-ins
-        // are always allowed; side-effect tools (Bash, Write, etc.) are
-        // opted-in per agent via agent.yaml `warroom_tools`. MCP servers
-        // are filtered to those the agent explicitly lists.
-        allowedTools: toolPolicy.allowedTools,
-        disallowedTools: toolPolicy.disallowedTools,
-        // Text War Room is a group chat, but specialists doing real
-        // multi-step work (load skill → plan → mkdir → write file → post
-        // → finalize) need ≥6 turns. The previous cap of 4 cut content
-        // off mid-skill on a real LinkedIn-post request and produced an
-        // empty bubble. Bump specialists to 8 and main to 10 so a normal
-        // skill flow can complete without being cliff-edged. Cost is
-        // bounded by the per-agent budget timer (45-75s) so a runaway
-        // tool loop still gets killed at the wall-clock layer.
-        maxTurns: agentId === 'main' ? 10 : 8,
-        env: sdkEnvStripped(),
-        ...(Object.keys(mcpServers).length ? { mcpServers } : {}),
-        includePartialMessages: true,
-        abortController: abortCtrl,
-        ...(agentModel ? { model: agentModel } : {}),
-      } as any,
+    const engine = EngineFactory.forProvider(provider);
+    for await (const ev of engine.invoke({
+      prompt: framedText,
+      provider,
+      cwd: agentDir,
+      sessionId: providerSessionId,
+      settingSources: ['project', 'user'],
+      // War-room runs with the SDK's default permission mode. Combined
+      // with the per-agent tool policy below, every side-effect tool call
+      // goes through the SDK's permission machinery.
+      permissionMode: 'default',
+      allowedTools: toolPolicy.allowedTools,
+      disallowedTools: toolPolicy.disallowedTools,
+      maxTurns: agentId === 'main' ? 10 : 8,
+      env: sdkEnvStripped(),
+      ...(Object.keys(mcpServers).length ? { mcpServers } : {}),
+      includePartialMessages: true,
+      abortController: abortCtrl,
+      ...(defaultModelForProvider(provider, agentModel) ? { model: defaultModelForProvider(provider, agentModel) } : {}),
     })) {
-      const e = ev as Record<string, unknown>;
-      if (e.type === 'system' && e.subtype === 'init') {
-        newSessionId = e.session_id as string | undefined;
+      if (ev.type === 'session') {
+        newSessionId = ev.sessionId;
+      }
+      if (ev.type === 'text_delta') {
+        fullText += ev.delta;
+        channel.emit({ type: 'agent_chunk', turnId, agentId, role, delta: ev.delta });
+      }
+      if (ev.type === 'progress' && ev.progress.type === 'tool_active') {
+        const toolUseId = ev.progress.toolCallId ?? `${agentId}:${ev.progress.description}`;
+        const isFirstToolEvent = !seenProviderToolCalls.has(toolUseId);
+        if (isFirstToolEvent) {
+          seenProviderToolCalls.add(toolUseId);
+          toolNamesUsed.push(ev.progress.description);
+          toolCallsMade++;
+          channel.emit({
+            type: 'tool_call',
+            turnId, agentId,
+            toolUseId,
+            tool: ev.progress.description,
+            argsPreview: ev.progress.locations?.map((loc) => loc.line ? `${loc.path}:${loc.line}` : loc.path).join(', ') ?? '',
+          });
+          try {
+            insertAuditLog(
+              agentId,
+              meetingChatId || '',
+              'tool_call',
+              `${ev.progress.description} (${ev.progress.kind ?? 'provider'})`.slice(0, 2000),
+              false,
+            );
+          } catch (auditErr) {
+            logger.warn({ err: auditErr instanceof Error ? auditErr.message : auditErr }, 'audit log write failed');
+          }
+          if (toolCallsMade > TOOL_BUDGET_PER_TURN) {
+            channel.emit({
+              type: 'system_note',
+              turnId,
+              text: `${agentLabel(agentId)} hit the per-turn tool budget (${TOOL_BUDGET_PER_TURN} calls). Asking them to wrap up.`,
+              tone: 'warn',
+              dismissable: true,
+            });
+            try { abortCtrl.abort(); } catch { /* noop */ }
+          }
+        }
+        if (ev.progress.status === 'completed' || ev.progress.status === 'failed') {
+          channel.emit({
+            type: 'tool_result',
+            turnId, agentId,
+            toolUseId,
+            status: ev.progress.status === 'failed' ? 'error' : 'ok',
+            resultPreview: ev.progress.status,
+          });
+        }
+      }
+      const e = ev.raw as Record<string, unknown> | undefined;
+      if (!e) {
+        if (ev.type === 'result') {
+          if (typeof ev.text === 'string' && ev.text.length > fullText.length) fullText = ev.text;
+          stopReason = ev.stopReason;
+          gotResult = true;
+          try {
+            if (ev.usage) {
+              saveTokenUsage(
+                sessionChatId,
+                undefined,
+                ev.usage.inputTokens,
+                ev.usage.outputTokens,
+                ev.usage.cacheReadInputTokens,
+                ev.usage.lastCallCacheRead + ev.usage.lastCallInputTokens,
+                ev.usage.totalCostUsd,
+                ev.usage.didCompact,
+                agentId,
+              );
+            }
+          } catch (err) {
+            logger.warn(
+              { err: err instanceof Error ? err.message : err, agentId, meetingId },
+              'failed to persist warroom token usage (non-fatal)',
+            );
+          }
+        }
+        if (cancelFlag.cancelled) break;
+        continue;
       }
       if (e.type === 'stream_event') {
         const inner = e.event as Record<string, unknown> | undefined;
         if (inner?.type === 'content_block_delta') {
           const delta = inner.delta as Record<string, unknown> | undefined;
           const text = typeof delta?.text === 'string' ? (delta.text as string) : '';
-          if (text) {
+          if (text && ev.type !== 'text_delta') {
             fullText += text;
             channel.emit({ type: 'agent_chunk', turnId, agentId, role, delta: text });
           }
         }
       }
-      // Tool-call visibility: surface every MCP / SDK tool invocation as
+      // Tool-call visibility: surface every MCP / engine tool invocation as
       // its own event so the UI can render "research called web_search(…)"
       // under the agent bubble. Without this, a hallucinated "I'll create
-      // the slot" reads identical to a real tool call. The Claude Agent
-      // SDK reports tool use as `assistant` messages whose `content`
-      // includes blocks of `type: 'tool_use'`, and tool results come back
-      // as `user` messages whose blocks are `type: 'tool_result'`.
+      // the slot" reads identical to a real tool call. Engines report tool
+      // use as assistant messages whose `content` includes blocks of
+      // `type: 'tool_use'`, and tool results come back as user messages
+      // whose blocks are `type: 'tool_result'`.
       if (e.type === 'assistant') {
         const msg = e.message as Record<string, unknown> | undefined;
         const blocks = (msg?.content as Array<Record<string, unknown>> | undefined) ?? [];
         for (const b of blocks) {
           if (b.type === 'tool_use' && typeof b.id === 'string' && typeof b.name === 'string') {
+            if (seenProviderToolCalls.has(b.id)) continue;
+            seenProviderToolCalls.add(b.id);
             toolNamesUsed.push(b.name);
             toolCallsMade++;
             // Compact arg preview — full args can be huge (file dumps,
@@ -1663,7 +1763,7 @@ async function runAgentTurn(args: RunAgentTurnArgs): Promise<string> {
               channel.emit({
                 type: 'system_note',
                 turnId,
-                text: `${agentId === 'main' ? 'Main' : agentId} hit the per-turn tool budget (${TOOL_BUDGET_PER_TURN} calls). Asking them to wrap up.`,
+                text: `${agentLabel(agentId)} hit the per-turn tool budget (${TOOL_BUDGET_PER_TURN} calls). Asking them to wrap up.`,
                 tone: 'warn',
                 dismissable: true,
               });
@@ -1798,7 +1898,7 @@ async function runAgentTurn(args: RunAgentTurnArgs): Promise<string> {
     && !timedOut
     && !channel.isTurnFinalized(turnId);
   if (sessionSaveAllowed) {
-    setSession(sessionChatId, newSessionId!, agentId);
+    setSession(sessionChatId, encodeProviderSession(provider, newSessionId!) ?? newSessionId!, agentId);
   } else if (newSessionId) {
     logger.debug({
       agentId, meetingId, role, turnId,
@@ -1830,7 +1930,7 @@ async function runAgentTurn(args: RunAgentTurnArgs): Promise<string> {
       reason: timedOut ? 'agent timed out' : (incomplete ? 'cancelled before content' : 'no content'),
     });
     if (role === 'primary') {
-      const agentLabel = agentId === 'main' ? 'Main' : agentId;
+      const displayLabel = agentLabel(agentId);
       // Build a richer fallback when we know the agent ran out of headroom
       // mid-tool-loop. Empty text + tool calls + max_turns stop reason =
       // "did real work, ran out of room before finalizing." Surface what
@@ -1840,19 +1940,19 @@ async function runAgentTurn(args: RunAgentTurnArgs): Promise<string> {
       let note: string;
       if (hitMaxTurns && usedTools.length > 0) {
         const toolList = usedTools.slice(0, 4).join(', ') + (usedTools.length > 4 ? `, +${usedTools.length - 4} more` : '');
-        note = `${agentLabel} ran out of turns mid-task (tools used: ${toolList}). Ask them what landed and what's still pending, or break the request into smaller asks.`;
+        note = `${displayLabel} ran out of turns mid-task (tools used: ${toolList}). Ask them what landed and what's still pending, or break the request into smaller asks.`;
       } else if (timedOut) {
-        note = `${agentLabel} ran past its time budget without finishing. Try again, narrow the question, or @-mention a specific agent.`;
+        note = `${displayLabel} ran past its time budget without finishing. Try again, narrow the question, or @-mention a specific agent.`;
       } else if (incomplete) {
-        note = `${agentLabel} was cancelled before sending a reply.`;
+        note = `${displayLabel} was cancelled before sending a reply.`;
       } else if (usedTools.length > 0) {
         // Tools fired but no final text and we didn't hit max_turns — the
         // agent likely got into a state it couldn't recover from. Same
         // surface, slightly different framing.
         const toolList = usedTools.slice(0, 4).join(', ');
-        note = `${agentLabel} called ${toolList} but didn't finalize a reply. Ask them what happened, or @-mention another agent.`;
+        note = `${displayLabel} called ${toolList} but didn't finalize a reply. Ask them what happened, or @-mention another agent.`;
       } else {
-        note = `${agentLabel} didn't produce a reply. Try rephrasing or @-mention a specific agent.`;
+        note = `${displayLabel} didn't produce a reply. Try rephrasing or @-mention a specific agent.`;
       }
       channel.emit({
         type: 'system_note',
@@ -1984,20 +2084,6 @@ function normalizeForIngestion(userText: string): string {
 
 // ── Utilities shared with voice bridge pattern ───────────────────────
 
-async function* singleTurn(text: string): AsyncGenerator<{
-  type: 'user';
-  message: { role: 'user'; content: string };
-  parent_tool_use_id: null;
-  session_id: string;
-}> {
-  yield {
-    type: 'user',
-    message: { role: 'user', content: text },
-    parent_tool_use_id: null,
-    session_id: '',
-  };
-}
-
 function sdkEnvStripped(): Record<string, string | undefined> {
   // Delegate to the shared scrubber in security.ts so every SDK entry
   // point in the codebase strips the same set of secret-shaped vars.
@@ -2044,4 +2130,3 @@ export function maybeLogWarRoomToHive(
   logFn(agentId, meetingChatId, action, summary);
   return { logged: true, action, summary };
 }
-

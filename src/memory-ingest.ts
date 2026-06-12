@@ -5,6 +5,8 @@ import { getMemoriesWithEmbeddings, saveStructuredMemoryAtomic } from './db.js';
 import { logger } from './logger.js';
 import { readEnvFile } from './env.js';
 import { getScrubbedSdkEnv } from './security.js';
+import { EngineFactory } from './agent-engine/index.js';
+import { defaultModelForProvider, getSelectedProviderConfig } from './active-provider.js';
 
 // Callback for notifying when a high-importance memory is created.
 // Set by bot.ts to send a Telegram notification.
@@ -26,11 +28,9 @@ function isQuotaError(err: unknown): boolean {
 }
 
 /**
- * Extract a memory via Claude Haiku through the Agent SDK on the OAuth
- * subscription path. Used as the PRIMARY extractor — Gemini was hitting
- * 429 RESOURCE_EXHAUSTED on free-tier quota, leaving every conversation
- * with no long-term memory written. Haiku via OAuth uses the same auth
- * the agents use; no extra API key required.
+ * Extract a memory via the selected agent provider. Used as the PRIMARY
+ * extractor — Gemini API fallback can hit 429 RESOURCE_EXHAUSTED on
+ * free-tier quota, leaving conversations with no long-term memory written.
  *
  * Returns the raw JSON string the model produced (or empty string on
  * failure). Caller is responsible for parsing + validation, same as
@@ -39,44 +39,30 @@ function isQuotaError(err: unknown): boolean {
 export async function extractViaClaude(prompt: string, timeoutMs = 15_000): Promise<string> {
   const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
   const env = getScrubbedSdkEnv(secrets);
+  const provider = getSelectedProviderConfig();
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), timeoutMs);
   let text = '';
   try {
-    async function* turn(): AsyncGenerator<{
-      type: 'user';
-      message: { role: 'user'; content: string };
-      parent_tool_use_id: null;
-      session_id: string;
-    }> {
-      yield {
-        type: 'user',
-        message: { role: 'user', content: prompt },
-        parent_tool_use_id: null,
-        session_id: '',
-      };
-    }
-    for await (const ev of query({
-      prompt: turn(),
-      options: {
-        model: 'claude-haiku-4-5-20251001',
-        allowedTools: [],
-        disallowedTools: ['*'],
-        settingSources: [],
-        maxTurns: 1,
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        env,
-        abortController: abort,
-      } as any,
+    const engine = EngineFactory.forProvider(provider);
+    for await (const ev of engine.invoke({
+      prompt,
+      provider,
+      cwd: process.cwd(),
+      model: defaultModelForProvider(provider, 'claude-haiku-4-5-20251001'),
+      allowedTools: [],
+      disallowedTools: ['*'],
+      settingSources: [],
+      maxTurns: 1,
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
+      env,
+      abortController: abort,
     })) {
-      const e = ev as Record<string, unknown>;
-      if (e.type === 'result' && typeof e.result === 'string') {
-        text = e.result;
-      }
+      if (ev.type === 'result' && typeof ev.text === 'string') text = ev.text;
     }
   } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err }, 'Memory extraction (Claude Haiku) failed');
+    logger.warn({ err: err instanceof Error ? err.message : err, provider: provider.type }, 'Memory extraction via selected provider failed');
     throw err;
   } finally {
     clearTimeout(timer);
@@ -177,16 +163,16 @@ export async function ingestConversationTurn(
       .replace('{USER_MESSAGE}', userMessage.slice(0, 2000))
       .replace('{ASSISTANT_RESPONSE}', assistantResponse.slice(0, 2000));
 
-    // Primary path: Claude Haiku via OAuth (no API key, no quota wall).
-    // We swapped from Gemini because the free-tier RESOURCE_EXHAUSTED
-    // was hitting on every turn and silently killing memory ingestion.
+    // Primary path: the selected provider via the agent engine. Gemini
+    // remains a fallback because its free-tier RESOURCE_EXHAUSTED errors
+    // were hitting on every turn and silently killing memory ingestion.
     let raw: string;
     try {
       raw = await extractViaClaude(prompt);
-    } catch (claudeErr) {
+    } catch (providerErr) {
       // Fallback: try Gemini if it has a key configured. The 429 backoff
       // path inside the catch below handles quota errors gracefully.
-      logger.warn({ err: claudeErr instanceof Error ? claudeErr.message : claudeErr }, 'Claude extraction failed; falling back to Gemini');
+      logger.warn({ err: providerErr instanceof Error ? providerErr.message : providerErr }, 'selected-provider extraction failed; falling back to Gemini');
       raw = await generateContent(prompt);
     }
     const result = parseJsonResponse<ExtractionResult & { skip?: boolean }>(raw);

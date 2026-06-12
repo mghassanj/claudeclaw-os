@@ -168,6 +168,7 @@ function createSchema(database: Database.Database): void {
       output_tokens   INTEGER NOT NULL DEFAULT 0,
       cache_read      INTEGER NOT NULL DEFAULT 0,
       context_tokens  INTEGER NOT NULL DEFAULT 0,
+      context_window  INTEGER,
       cost_usd        REAL NOT NULL DEFAULT 0,
       did_compact     INTEGER NOT NULL DEFAULT 0,
       created_at      INTEGER NOT NULL
@@ -466,6 +467,13 @@ function runMigrations(database: Database.Database): void {
   if (!hasContextTokens) {
     database.exec(`ALTER TABLE token_usage ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0`);
   }
+  // Add context_window column (the model's real window, e.g. Opus 4.8 = 1M).
+  // Nullable: NULL on old rows / engines that don't report one, so consumers
+  // fall back to CONTEXT_LIMIT.
+  const hasContextWindow = cols.some((c) => c.name === 'context_window');
+  if (!hasContextWindow) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN context_window INTEGER`);
+  }
 
   // Multi-agent: migrate sessions table to composite primary key (chat_id, agent_id)
   // Check if PK is composite by looking at pk column count in pragma
@@ -510,6 +518,9 @@ function runMigrations(database: Database.Database): void {
   }
   if (!taskColNames.includes('last_status')) {
     database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN last_status TEXT`);
+  }
+  if (!taskColNames.includes('acceptance_check')) {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN acceptance_check TEXT`);
   }
 
   // ── Memory V2 migration ──────────────────────────────────────────────
@@ -1233,6 +1244,7 @@ export interface ScheduledTask {
   agent_id: string;
   started_at: number | null;
   last_status: 'success' | 'failed' | 'timeout' | null;
+  acceptance_check: string | null;
 }
 
 export function createScheduledTask(
@@ -1241,12 +1253,13 @@ export function createScheduledTask(
   schedule: string,
   nextRun: number,
   agentId = 'main',
+  acceptanceCheck: string | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id)
-     VALUES (?, ?, ?, ?, 'active', ?, ?)`,
-  ).run(id, prompt, schedule, nextRun, now, agentId);
+    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id, acceptance_check)
+     VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
+  ).run(id, prompt, schedule, nextRun, now, agentId, acceptanceCheck);
 }
 
 export function getDueTasks(agentId = 'main'): ScheduledTask[] {
@@ -1730,12 +1743,13 @@ export function saveTokenUsage(
   costUsd: number,
   didCompact: boolean,
   agentId = 'main',
+  contextWindow: number | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId);
+    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id, context_window)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId, contextWindow);
 }
 
 export interface SessionTokenSummary {
@@ -1744,6 +1758,8 @@ export interface SessionTokenSummary {
   totalOutputTokens: number;
   lastCacheRead: number;
   lastContextTokens: number;
+  /** The active model's real context window from the last turn; null if unknown. */
+  lastContextWindow: number | null;
   totalCostUsd: number;
   compactions: number;
   firstTurnAt: number;
@@ -2070,11 +2086,11 @@ export function getSessionTokenUsage(sessionId: string): SessionTokenSummary | n
   // Falls back to cache_read for backward compat with rows before the migration
   const lastRow = db
     .prepare(
-      `SELECT cache_read, context_tokens FROM token_usage
+      `SELECT cache_read, context_tokens, context_window FROM token_usage
        WHERE session_id = ?
        ORDER BY created_at DESC LIMIT 1`,
     )
-    .get(sessionId) as { cache_read: number; context_tokens: number } | undefined;
+    .get(sessionId) as { cache_read: number; context_tokens: number; context_window: number | null } | undefined;
 
   return {
     turns: row.turns,
@@ -2082,6 +2098,7 @@ export function getSessionTokenUsage(sessionId: string): SessionTokenSummary | n
     totalOutputTokens: row.totalOutputTokens,
     lastCacheRead: lastRow?.cache_read ?? 0,
     lastContextTokens: lastRow?.context_tokens ?? lastRow?.cache_read ?? 0,
+    lastContextWindow: lastRow?.context_window ?? null,
     totalCostUsd: row.totalCostUsd,
     compactions: row.compactions,
     firstTurnAt: row.firstTurnAt,

@@ -6,6 +6,10 @@ dist/
 
 # Environment — never commit API keys
 .env
+# Env backups (e.g. rotate-oauth-token.py) — full copies of .env, contain live secrets
+.env.*.bak-rotate
+.env.bak-rotate
+*.bak-rotate
 
 # Runtime data — NEVER commit. Contains WhatsApp/Slack messages,
 # session tokens, conversation logs, and database files.
@@ -109,6 +113,7 @@ agents/*/avatar.png
 agents/*/.no-avatar
 agents/*/CLAUDE.md.backup
 agents/*/agent.yaml.backup
+.kaizen
 
 # Local Claude Code skills — these are user-specific workflow configs
 # (absolute paths, private repo refs). Keep them out of the shared repo.

@@ -8,7 +8,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { X, Search, RotateCw, Sparkles, ChevronDown, ChevronRight, SlidersHorizontal } from 'lucide-preact';
-import { formatRelativeTime } from '@/lib/format';
+import { formatRelativeTime, resolveAgentName } from '@/lib/format';
 
 interface HiveEntry {
   id: number;
@@ -1403,7 +1403,7 @@ export function BrainGraph3D({ entries, agentFilter, agentColors, blurOn }: Prop
                 style={{ backgroundColor: agentColors[hoveredEntry.agent_id] || 'var(--color-text-muted)' }}
               />
               <span class="font-mono text-[10.5px] text-[var(--color-text-muted)]">
-                @{hoveredEntry.agent_id} · {hoveredEntry.action}
+                {resolveAgentName(hoveredEntry.agent_id)} · {hoveredEntry.action}
               </span>
               <span class="text-[10px] text-[var(--color-text-faint)] ml-auto tabular-nums">
                 {formatRelativeTime(hoveredEntry.created_at)}
@@ -1474,7 +1474,7 @@ function DetailPanel({
     <>
       <header class="flex items-center px-4 py-3 border-b border-[var(--color-border)] gap-2">
         <span class="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
-        <span class="font-mono text-[12px] text-[var(--color-text)]">@{entry.agent_id}</span>
+        <span class="font-mono text-[12px] text-[var(--color-text)]">{resolveAgentName(entry.agent_id)}</span>
         {lobeLabel && (
           <span class="text-[10px] uppercase tracking-wider text-[var(--color-text-faint)] ml-1">{lobeLabel}</span>
         )}

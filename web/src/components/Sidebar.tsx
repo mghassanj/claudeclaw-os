@@ -1,10 +1,13 @@
 import { Link, useLocation } from 'wouter-preact';
 import { Search, ChevronDown, X } from 'lucide-preact';
+import { useState } from 'preact/hooks';
 import { ROUTES, SECTION_LABEL, type RouteSection } from '@/lib/routes';
 import { WorkspaceSwitcher } from './WorkspaceSwitcher';
 import { commandPaletteOpen } from '@/lib/command-palette';
 import { chatUnread } from '@/lib/chat-stream';
-import { useFetch } from '@/lib/useFetch';
+import { invalidateFetchCache, useFetch } from '@/lib/useFetch';
+import { apiPatch } from '@/lib/api';
+import { pushToast } from '@/lib/toasts';
 import { sidebarOpen, closeSidebar } from '@/lib/sidebar';
 import {
   collapsedSections,
@@ -112,40 +115,124 @@ export function Sidebar() {
   );
 }
 
-interface Health { killSwitches: Record<string, boolean>; }
+interface Health {
+  killSwitches: Record<string, boolean>;
+}
+
+interface ProviderStatus {
+  providerType: 'claude' | 'opencode' | 'gemini' | 'codex' | 'acp';
+  label: string;
+  model: string;
+  runtime: string;
+  acpEnabled?: boolean;
+}
 
 function SidebarFooter() {
-  const { data } = useFetch<Health>('/api/health', 30_000);
-  const switches = data?.killSwitches || {};
+  const health = useFetch<Health>('/api/health', 30_000);
+  const provider = useFetch<ProviderStatus>('/api/provider/status', 15_000);
+  const [switching, setSwitching] = useState(false);
+  const switches = health.data?.killSwitches || {};
   const off = Object.entries(switches).filter(([, on]) => !on);
   const anyOff = off.length > 0;
   const name = workspaceName.value;
+  const providerType = provider.data?.providerType ?? 'claude';
+  const acpEnabled = provider.data?.acpEnabled ?? false;
+
+  async function switchProvider(nextType: string) {
+    if (nextType === providerType || switching) return;
+    setSwitching(true);
+    try {
+      const nextProvider = nextType === 'claude'
+        ? { type: 'claude', model: 'claude-opus-4-8' }
+        : { type: nextType };
+      await apiPatch('/api/agents/main/provider', { provider: nextProvider });
+      invalidateFetchCache('/api/provider/status');
+      invalidateFetchCache('/api/health');
+      invalidateFetchCache('/api/agents');
+      provider.refresh();
+      health.refresh();
+      pushToast({
+        tone: 'success',
+        title: 'Provider set to ' + providerLabel(nextType),
+        description: providerDescription(nextType),
+      });
+    } catch (err: any) {
+      pushToast({ tone: 'error', title: 'Provider change failed', description: err?.message || String(err), durationMs: 7000 });
+    } finally {
+      setSwitching(false);
+    }
+  }
+
   return (
-    <Link
-      href="/settings"
-      class="px-3 py-3 border-t border-[var(--color-border)] text-[12px] text-[var(--color-text-faint)] hover:bg-[var(--color-elevated)] transition-colors"
-    >
-      <div class="flex items-center gap-2.5">
-        <div
-          class="w-7 h-7 rounded-full flex items-center justify-center text-[var(--color-text-muted)]"
-          style={{
-            backgroundColor: anyOff
-              ? 'color-mix(in srgb, var(--color-status-failed) 18%, transparent)'
-              : 'var(--color-elevated)',
-            color: anyOff ? 'var(--color-status-failed)' : 'var(--color-text-muted)',
-          }}
-        >
-          ●
-        </div>
-        <div class="flex-1 min-w-0">
-          <div class="text-[var(--color-text)] text-[12.5px] font-medium truncate">{name}</div>
-          <div class="truncate text-[11px]">
-            {anyOff
-              ? off.length + ' kill switch' + (off.length === 1 ? '' : 'es') + ' off'
-              : 'All systems normal'}
+    <div class="border-t border-[var(--color-border)]">
+      <div class="px-3 py-2.5 border-b border-[var(--color-border)]">
+        <div class="flex items-center justify-between gap-2">
+          <div class="min-w-0">
+            <div class="text-[11px] uppercase text-[var(--color-text-faint)]">Runtime</div>
+            <div class="text-[12.5px] font-medium text-[var(--color-text)] truncate">{provider.data?.label ?? 'Claude'}</div>
           </div>
+          {acpEnabled ? (
+            <select
+              value={providerType}
+              disabled={switching}
+              onChange={(event) => switchProvider((event.currentTarget as HTMLSelectElement).value)}
+              class="h-8 max-w-[116px] rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 text-[12px] text-[var(--color-text)] disabled:opacity-60"
+              aria-label="Switch main provider"
+            >
+              <option value="claude">Claude</option>
+              <option value="opencode">OpenCode</option>
+              <option value="gemini">Gemini</option>
+              <option value="codex">Codex</option>
+            </select>
+          ) : null}
+        </div>
+        <div class="mt-1.5 text-[11px] leading-snug text-[var(--color-text-muted)]">
+          <span class="text-[var(--color-text-faint)]">Model</span>{' '}
+          <span class="break-all">{provider.data?.model ?? 'claude-opus-4-8'}</span>
         </div>
       </div>
-    </Link>
+
+      <Link
+        href="/settings"
+        class="block px-3 py-3 text-[12px] text-[var(--color-text-faint)] hover:bg-[var(--color-elevated)] transition-colors"
+      >
+        <div class="flex items-center gap-2.5">
+          <div
+            class="w-7 h-7 rounded-full flex items-center justify-center text-[var(--color-text-muted)]"
+            style={{
+              backgroundColor: anyOff
+                ? 'color-mix(in srgb, var(--color-status-failed) 18%, transparent)'
+                : 'var(--color-elevated)',
+              color: anyOff ? 'var(--color-status-failed)' : 'var(--color-text-muted)',
+            }}
+          >
+            ●
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="text-[var(--color-text)] text-[12.5px] font-medium truncate">{name}</div>
+            <div class="truncate text-[11px]">
+              {anyOff
+                ? off.length + ' kill switch' + (off.length === 1 ? '' : 'es') + ' off'
+                : 'All systems normal'}
+            </div>
+          </div>
+        </div>
+      </Link>
+    </div>
   );
+}
+
+function providerLabel(type: string): string {
+  if (type === 'claude') return 'Claude';
+  if (type === 'gemini') return 'Gemini';
+  if (type === 'codex') return 'Codex';
+  if (type === 'acp') return 'Custom ACP';
+  return 'OpenCode';
+}
+
+function providerDescription(type: string): string {
+  if (type === 'opencode') return 'OpenCode will use its configured default model.';
+  if (type === 'gemini') return 'Requires Gemini CLI on PATH. Model/auth are managed by Gemini.';
+  if (type === 'codex') return 'Requires the codex-acp adapter on PATH. Auth is managed by Codex.';
+  return 'Takes effect on the next message.';
 }

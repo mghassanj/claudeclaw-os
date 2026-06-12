@@ -21,6 +21,7 @@ function getClient(): GoogleGenAI {
  * Returns a float array (768 dimensions for text-embedding-004).
  */
 export async function embedText(text: string): Promise<number[]> {
+  if (!GOOGLE_API_KEY) return [];
   const ai = getClient();
   const result = await ai.models.embedContent({
     model: EMBEDDING_MODEL,

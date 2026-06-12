@@ -5,7 +5,7 @@ import { PageState } from '@/components/PageState';
 import { AgentAvatar } from '@/components/AgentAvatar';
 import { apiGet, apiPost } from '@/lib/api';
 
-interface VoiceRow { agent: string; gemini_voice: string; voice_id: string; name: string; is_default: boolean; }
+interface VoiceRow { agent: string; display_name?: string; gemini_voice: string; voice_id: string; name: string; is_default: boolean; }
 interface CatalogEntry { name: string; style: string; }
 
 // Top-level page (kept reachable at /voices for back-compat). The body
@@ -132,7 +132,7 @@ export function VoicesPane({ embedded }: VoicesPaneProps) {
                 >
                   <AgentAvatar agentId={r.agent} size={32} running />
                   <div class="flex-1 min-w-0">
-                    <div class="text-[13.5px] text-[var(--color-text)] font-medium truncate">{r.agent}</div>
+                    <div class="text-[13.5px] text-[var(--color-text)] font-medium truncate">{r.display_name || r.agent}</div>
                     {isDirty && <div class="text-[10.5px] text-[var(--color-accent)]">modified</div>}
                   </div>
                   <select

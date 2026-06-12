@@ -15,6 +15,7 @@ if [ -z "$NODE_PATH" ]; then
   echo "Error: node not found on PATH. Install Node 20+ first." >&2
   exit 1
 fi
+NODE_BIN_DIR="$(dirname "$NODE_PATH")"
 
 echo "ClaudeClaw launchd installer"
 echo "============================"
@@ -67,6 +68,7 @@ for plist in "$LAUNCHD_DIR"/com.claudeclaw.*.plist; do
   sed -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
       -e "s|__HOME__|$HOME|g" \
       -e "s|__NODE_PATH__|$NODE_PATH|g" \
+      -e "s|__NODE_BIN_DIR__|$NODE_BIN_DIR|g" \
       "$plist" > "$dest"
   launchctl load "$dest"
 done

@@ -15,6 +15,15 @@ export interface FetchState<T> {
 // session — a hard refresh starts cold.
 const _cache = new Map<string, unknown>();
 
+const FETCH_INVALIDATED_EVENT = 'claudeclaw:fetch-invalidated';
+
+export function invalidateFetchCache(prefix?: string): void {
+  for (const key of Array.from(_cache.keys())) {
+    if (!prefix || key.startsWith(prefix)) _cache.delete(key);
+  }
+  window.dispatchEvent(new CustomEvent(FETCH_INVALIDATED_EVENT, { detail: { prefix } }));
+}
+
 /**
  * Tiny GET-with-polling hook. Re-fetches on `path` change and on a fixed
  * interval if `pollMs` is given. Aborts in-flight requests on unmount /
@@ -57,6 +66,18 @@ export function useFetch<T = unknown>(path: string | null, pollMs = 0): FetchSta
     const id = setInterval(() => setTick((t) => t + 1), pollMs);
     return () => clearInterval(id);
   }, [pollMs]);
+
+  useEffect(() => {
+    if (path === null) return;
+    function onInvalidated(event: Event) {
+      const prefix = (event as CustomEvent<{ prefix?: string }>).detail?.prefix;
+      if (!prefix || path.startsWith(prefix)) {
+        setTick((t) => t + 1);
+      }
+    }
+    window.addEventListener(FETCH_INVALIDATED_EVENT, onInvalidated);
+    return () => window.removeEventListener(FETCH_INVALIDATED_EVENT, onInvalidated);
+  }, [path]);
 
   // When the path changes, swap to the new cached value (or null) so we
   // never show stale data from a different endpoint.

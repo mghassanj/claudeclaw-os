@@ -35,6 +35,12 @@ export interface ChatEvent {
   content?: string;
   source?: 'telegram' | 'dashboard';
   description?: string;
+  progressKind?: string;
+  status?: string;
+  kind?: string;
+  toolCallId?: string;
+  locations?: Array<{ path: string; line?: number | null }>;
+  planEntries?: Array<{ content: string; status: string; priority?: string }>;
   processing?: boolean;
   // Inline photo payload — emitted alongside assistant_message when the
   // agent reply included a [SEND_PHOTO|http(s) URL] marker. The chat

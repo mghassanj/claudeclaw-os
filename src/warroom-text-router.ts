@@ -1,10 +1,9 @@
 /**
  * Text War Room router and intervention gate.
  *
- * Both functions issue a locked-down `query()` call through the Claude Agent
- * SDK — same OAuth/subscription path Telegram and the voice bridge use. No
- * API key required. The prompts run on Haiku with zero tools, no CLAUDE.md
- * loading, no settings sources: pure classifier mode.
+ * Both functions issue a locked-down engine call through the user's selected
+ * provider. The prompts run with zero tools, no instruction loading, and no
+ * settings sources: pure classifier mode.
  *
  * Failure tolerant: any thrown error, timeout (>8s), or unparseable JSON
  * falls back to a deterministic default (primary = pinnedAgent ?? 'main',
@@ -12,16 +11,18 @@
  * decision so the UI can show a subtle "degraded routing" indicator.
  */
 
-import { query } from '@anthropic-ai/claude-agent-sdk';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { isEnabled } from './kill-switches.js';
+import { PROJECT_ROOT } from './config.js';
+import { EngineFactory } from './agent-engine/index.js';
+import { defaultModelForProvider, getSelectedProviderConfig } from './active-provider.js';
 
 const ROUTER_MODEL = 'claude-haiku-4-5-20251001';
-// Budget: Claude Agent SDK subprocess cold-start is ~3-5s before the first
-// token even flows, plus Haiku's actual classification latency. 20s covers
-// p99 on a warm machine; the dashboard's progressive status bar hides this
+// Budget: provider subprocess cold-start can take several seconds before
+// the first token even flows, plus classification latency. 20s covers p99
+// on a warm machine; the dashboard's progressive status bar hides this
 // latency from the user by showing "Routing…" immediately.
 const ROUTER_TIMEOUT_MS = 20_000;
 
@@ -66,18 +67,27 @@ function sdkEnvStripped(): Record<string, string | undefined> {
   return getScrubbedSdkEnv(secrets);
 }
 
-async function* singleTurn(text: string): AsyncGenerator<{
-  type: 'user';
-  message: { role: 'user'; content: string };
-  parent_tool_use_id: null;
-  session_id: string;
-}> {
-  yield {
-    type: 'user',
-    message: { role: 'user', content: text },
-    parent_tool_use_id: null,
-    session_id: '',
-  };
+async function runClassifierTurn(prompt: string, abort: AbortController): Promise<string> {
+  const provider = getSelectedProviderConfig();
+  const engine = EngineFactory.forProvider(provider);
+  let text = '';
+  for await (const ev of engine.invoke({
+    prompt,
+    provider,
+    cwd: PROJECT_ROOT,
+    model: defaultModelForProvider(provider, ROUTER_MODEL),
+    allowedTools: [],
+    disallowedTools: ['*'],
+    settingSources: [],
+    maxTurns: 1,
+    permissionMode: 'bypassPermissions',
+    allowDangerouslySkipPermissions: true,
+    env: sdkEnvStripped(),
+    abortController: abort,
+  })) {
+    if (ev.type === 'result') text = ev.text ?? '';
+  }
+  return text;
 }
 
 /**
@@ -216,23 +226,7 @@ export async function routeMessage(ctx: RouterContext): Promise<RouterDecision> 
   const t0 = Date.now();
 
   try {
-    for await (const ev of query({
-      prompt: singleTurn(prompt),
-      options: {
-        model: ROUTER_MODEL,
-        allowedTools: [],
-        disallowedTools: ['*'],
-        settingSources: [],
-        maxTurns: 1,
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        env: sdkEnvStripped(),
-        abortController: abort,
-      } as any,
-    })) {
-      const e = ev as Record<string, unknown>;
-      if (e.type === 'result') text = (e.result as string | undefined) ?? '';
-    }
+    text = await runClassifierTurn(prompt, abort);
   } catch (err) {
     logger.warn({
       err: err instanceof Error ? err.message : err,
@@ -269,9 +263,9 @@ export async function routeMessage(ctx: RouterContext): Promise<RouterDecision> 
 // Same cold-start math as the router. Gates fire sequentially after the
 // primary finishes, so a 25s budget adds at most 50s to a turn (2 max
 // interveners). The UI shows "Checking if anyone wants to add…" so the
-// user knows the pause is intentional. 15s was too tight — Haiku + SDK
-// init consistently exceeded it, which forced every gate to time out
-// and drop interveners silently.
+// user knows the pause is intentional. 15s was too tight with cold-start
+// provider init, which forced every gate to time out and drop interveners
+// silently.
 const GATE_TIMEOUT_MS = 25_000;
 
 function buildGatePrompt(ctx: InterventionContext): string {
@@ -307,23 +301,7 @@ export async function interventionGate(ctx: InterventionContext): Promise<Interv
   let text = '';
 
   try {
-    for await (const ev of query({
-      prompt: singleTurn(buildGatePrompt(ctx)),
-      options: {
-        model: ROUTER_MODEL,
-        allowedTools: [],
-        disallowedTools: ['*'],
-        settingSources: [],
-        maxTurns: 1,
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        env: sdkEnvStripped(),
-        abortController: abort,
-      } as any,
-    })) {
-      const e = ev as Record<string, unknown>;
-      if (e.type === 'result') text = (e.result as string | undefined) ?? '';
-    }
+    text = await runClassifierTurn(buildGatePrompt(ctx), abort);
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err, candidate: ctx.candidateAgentId }, 'intervention gate failed');
     clearTimeout(timer);

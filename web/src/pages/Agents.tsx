@@ -5,7 +5,7 @@ import { PageHeader } from '@/components/PageHeader';
 import { Pill, StatusDot } from '@/components/Pill';
 import { PageState } from '@/components/PageState';
 import { Modal } from '@/components/Modal';
-import { ModelPicker } from '@/components/ModelPicker';
+import { ProviderConfigEditor, type ProviderConfig } from '@/components/ProviderConfigEditor';
 import { AgentAvatar } from '@/components/AgentAvatar';
 import { AgentDetail } from '@/components/AgentDetail';
 import { AgentSuggestionBadge, AgentSuggestionModal, useAgentSuggestions, type AgentSuggestion } from '@/components/AgentSuggestions';
@@ -21,6 +21,7 @@ interface Agent {
   name: string;
   description: string;
   model: string;
+  provider: ProviderConfig;
   running: boolean;
   todayTurns: number;
   todayCost: number;
@@ -31,9 +32,8 @@ interface Template { id: string; name: string; description: string; }
 export function Agents() {
   const { data, loading, error, refresh } = useFetch<{ agents: Agent[] }>('/api/agents', 30_000);
   const [wizardOpen, setWizardOpen] = useState(false);
-  const [pendingAction, setPendingAction] = useState<string | null>(null);
-  const [bulkModel, setBulkModel] = useState<string>('');
   const [detailAgent, setDetailAgent] = useState<Agent | null>(null);
+  const [providerAgent, setProviderAgent] = useState<Agent | null>(null);
   const [openedSuggestion, setOpenedSuggestion] = useState<AgentSuggestion | null>(null);
   const [suggestionPrefill, setSuggestionPrefill] = useState<AgentSuggestion | null>(null);
   const [refreshingSuggestions, setRefreshingSuggestions] = useState(false);
@@ -68,36 +68,6 @@ export function Agents() {
     setWizardOpen(true);
   }
 
-  async function setAllModels(model: string) {
-    setPendingAction('bulk-model');
-    try {
-      const res = await apiPatch<{ ok: boolean; updated: string[]; restartRequired: string[] }>('/api/agents/model', { model });
-      setBulkModel(model);
-      const restartCount = res.restartRequired?.length || 0;
-      if (restartCount > 0) {
-        pushToast({
-          tone: 'warn',
-          title: `${restartCount} agent${restartCount === 1 ? '' : 's'} need restart`,
-          description: 'Yaml updated, but running processes still use the old model: ' + res.restartRequired.join(', '),
-          durationMs: 0,
-          action: {
-            label: 'Restart all',
-            run: async () => {
-              await Promise.all(res.restartRequired.map((id) => apiPost(`/api/agents/${id}/restart`).catch(() => null)));
-              pushToast({ tone: 'success', title: 'Restarting agents', description: restartCount + ' processes bouncing.' });
-              setTimeout(refresh, 3000);
-            },
-          },
-        });
-      } else {
-        pushToast({ tone: 'success', title: 'Model set for all agents', description: 'Now running on ' + model });
-      }
-      refresh();
-    } catch (err: any) {
-      pushToast({ tone: 'error', title: 'Bulk model change failed', description: err?.message || String(err), durationMs: 6000 });
-    } finally { setPendingAction(null); }
-  }
-
   return (
     <div class="flex flex-col h-full">
       <PageHeader
@@ -107,12 +77,6 @@ export function Agents() {
             <span class="text-[11px] text-[var(--color-text-muted)] tabular-nums mr-2">
               {agents.filter((a) => a.running).length} live · {agents.length} total
             </span>
-            <ModelPicker
-              size="md"
-              value={bulkModel}
-              onSelect={setAllModels}
-              disabled={pendingAction === 'bulk-model'}
-            />
             {suggestions.length > 0 ? (
               // Cached on mount via useAgentSuggestions — clicking is
               // INSTANT, not a scan. Opens the first suggestion's modal
@@ -177,6 +141,7 @@ export function Agents() {
                 agent={a}
                 onChange={refresh}
                 onOpen={() => setDetailAgent(a)}
+                onConfigureProvider={() => setProviderAgent(a)}
                 suggestions={suggestions}
                 onOpenSuggestion={(s) => setOpenedSuggestion(s)}
               />
@@ -196,6 +161,7 @@ export function Agents() {
         } : undefined}
       />
       <AgentDetail agent={detailAgent} onClose={() => setDetailAgent(null)} />
+      <AgentProviderModal agent={providerAgent} onClose={() => setProviderAgent(null)} onChange={refresh} />
       <AgentSuggestionModal
         suggestion={openedSuggestion}
         onClose={() => setOpenedSuggestion(null)}
@@ -206,10 +172,11 @@ export function Agents() {
   );
 }
 
-function AgentCard({ agent, onChange, onOpen, suggestions, onOpenSuggestion }: {
+function AgentCard({ agent, onChange, onOpen, onConfigureProvider, suggestions, onOpenSuggestion }: {
   agent: Agent;
   onChange: () => void;
   onOpen: () => void;
+  onConfigureProvider: () => void;
   suggestions: AgentSuggestion[];
   onOpenSuggestion: (s: AgentSuggestion) => void;
 }) {
@@ -229,34 +196,6 @@ function AgentCard({ agent, onChange, onOpen, suggestions, onOpenSuggestion }: {
     } finally {
       setBusy(null);
     }
-  }
-
-  async function setModel(model: string) {
-    setBusy('model');
-    try {
-      const res = await apiPatch<{ ok: boolean; restartRequired: boolean }>(`/api/agents/${agent.id}/model`, { model });
-      if (res.restartRequired) {
-        pushToast({
-          tone: 'warn',
-          title: agent.id + ' needs a restart',
-          description: `Model is now ${model}, but the running process is still on the old one.`,
-          durationMs: 0,
-          action: {
-            label: 'Restart now',
-            run: async () => {
-              await apiPost(`/api/agents/${agent.id}/restart`);
-              pushToast({ tone: 'success', title: agent.id + ' restarting', description: 'Should be live again in a few seconds.' });
-              setTimeout(onChange, 2500);
-            },
-          },
-        });
-      } else {
-        pushToast({ tone: 'success', title: 'Model set to ' + model, description: 'Takes effect on the next message.' });
-      }
-      onChange();
-    } catch (err: any) {
-      pushToast({ tone: 'error', title: 'Model change failed', description: err?.message || String(err), durationMs: 6000 });
-    } finally { setBusy(null); }
   }
 
   const isMain = agent.id === 'main';
@@ -289,7 +228,14 @@ function AgentCard({ agent, onChange, onOpen, suggestions, onOpenSuggestion }: {
       )}
 
       <div class="flex items-center gap-2 mb-3 flex-wrap" onClick={(e) => e.stopPropagation()}>
-        <ModelPicker value={agent.model} onSelect={setModel} disabled={busy === 'model'} />
+        <button
+          type="button"
+          onClick={onConfigureProvider}
+          class="inline-flex items-center gap-1 rounded font-medium border transition-colors px-1.5 py-0.5 text-[10px] bg-[var(--color-elevated)] text-[var(--color-text-muted)] border-[var(--color-border)] hover:text-[var(--color-text)] hover:border-[var(--color-border-strong)]"
+          title="Configure provider, model, speed, and thinking"
+        >
+          {providerLabel(agent.provider)} · {agent.model || 'default'}
+        </button>
         {agent.running ? <Pill tone="done">running</Pill> : <Pill tone="cancelled">offline</Pill>}
       </div>
 
@@ -359,6 +305,69 @@ function AgentCard({ agent, onChange, onOpen, suggestions, onOpenSuggestion }: {
   );
 }
 
+function providerLabel(provider?: ProviderConfig): string {
+  if (!provider) return 'Provider';
+  if (provider.type === 'claude') return 'Claude';
+  if (provider.type === 'opencode') return 'OpenCode';
+  if (provider.type === 'gemini') return 'Gemini';
+  if (provider.type === 'codex') return 'Codex';
+  return 'ACP';
+}
+
+function AgentProviderModal({ agent, onClose, onChange }: { agent: Agent | null; onClose: () => void; onChange: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const providerStatus = useFetch<{ acpEnabled?: boolean }>('/api/provider/status', 30_000);
+  if (!agent) return null;
+  const currentAgent = agent;
+
+  async function save(provider: ProviderConfig) {
+    if (provider.type === 'acp' && !provider.command?.trim()) {
+      pushToast({ tone: 'error', title: 'Command required', description: 'Custom ACP needs a command.' });
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await apiPatch<{ restartRequired: boolean }>(`/api/agents/${currentAgent.id}/provider`, { provider });
+      onChange();
+      if (res.restartRequired) {
+        pushToast({
+          tone: 'warn',
+          title: currentAgent.id + ' needs a restart',
+          description: 'Provider config saved. Restart this agent before it uses the new provider.',
+          durationMs: 0,
+          action: {
+            label: 'Restart now',
+            run: async () => {
+              await apiPost(`/api/agents/${currentAgent.id}/restart`);
+              pushToast({ tone: 'success', title: currentAgent.id + ' restarting', description: 'Should be live again in a few seconds.' });
+              setTimeout(onChange, 2500);
+            },
+          },
+        });
+      } else {
+        pushToast({ tone: 'success', title: 'Provider saved', description: 'Takes effect on the next message.' });
+      }
+      onClose();
+    } catch (err: any) {
+      pushToast({ tone: 'error', title: 'Provider save failed', description: err?.message || String(err), durationMs: 7000 });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open={!!currentAgent} onClose={onClose} title={`${currentAgent.name || currentAgent.id} Provider`} width={520}>
+      <ProviderConfigEditor
+        value={currentAgent.provider}
+        fallbackModel={currentAgent.model}
+        acpEnabled={providerStatus.data?.acpEnabled ?? false}
+        onSave={save}
+        busy={busy}
+      />
+    </Modal>
+  );
+}
+
 // ── Wizard ───────────────────────────────────────────────────────────
 
 interface CreateAgentWizardProps {
@@ -376,7 +385,8 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
   const [name, setName] = useState('');
   const [nameTouched, setNameTouched] = useState(false);
   const [description, setDescription] = useState('');
-  const [model, setModel] = useState('claude-sonnet-4-6');
+  const providerStatus = useFetch<{ provider?: ProviderConfig; model?: string; acpEnabled?: boolean }>('/api/provider/status', 30_000);
+  const [provider, setProvider] = useState<ProviderConfig>({ type: 'claude', model: 'claude-sonnet-4-6' });
   const [template, setTemplate] = useState('');
   const [botToken, setBotToken] = useState('');
   const [createdId, setCreatedId] = useState<string | null>(null);
@@ -403,7 +413,7 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
   // Reset on close.
   function close() {
     setStep(1); setId(''); setName(''); setNameTouched(false); setDescription('');
-    setModel('claude-sonnet-4-6'); setTemplate(''); setBotToken('');
+    setProvider(providerStatus.data?.provider ?? { type: 'claude', model: 'claude-sonnet-4-6' }); setTemplate(''); setBotToken('');
     setCreatedId(null); setCreatedSummary(null); setError(null);
     onClose();
   }
@@ -427,6 +437,11 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
   // Templates list.
   const templates = useFetch<{ templates: Template[] }>('/api/agents/templates');
 
+  useEffect(() => {
+    if (!open || !providerStatus.data?.provider) return;
+    setProvider(providerStatus.data.provider);
+  }, [open, providerStatus.data?.provider?.type, providerStatus.data?.provider?.model]);
+
   // Sync auto name from id when user hasn't edited name.
   if (!nameTouched && id && !name) {
     const auto = id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
@@ -442,7 +457,7 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
     setCreating(true); setError(null);
     try {
       const res = await apiPost<any>('/api/agents/create', {
-        id, name, description, model, template, botToken,
+        id, name, description, provider, template, botToken,
       });
       setCreatedId(res.agentId);
       setCreatedSummary({ envKey: res.envKey, agentDir: res.agentDir });
@@ -576,18 +591,6 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
           </Field>
 
           <div class="grid grid-cols-2 gap-3">
-            <Field label="Model">
-              <select
-                value={model}
-                onChange={(e) => setModel((e.target as HTMLSelectElement).value)}
-                class="w-full bg-[var(--color-elevated)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-[12.5px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
-              >
-                <option value="claude-opus-4-6">Opus 4.6</option>
-                <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-                <option value="claude-sonnet-4-5">Sonnet 4.5</option>
-                <option value="claude-haiku-4-5">Haiku 4.5</option>
-              </select>
-            </Field>
             <Field label="Template">
               <select
                 value={template}
@@ -600,6 +603,15 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
                 ))}
               </select>
             </Field>
+          </div>
+
+          <div class="border border-[var(--color-border)] rounded-lg p-3 bg-[var(--color-card)]">
+            <ProviderConfigEditor
+              value={provider}
+              fallbackModel={providerStatus.data?.model}
+              acpEnabled={providerStatus.data?.acpEnabled ?? false}
+              onChange={setProvider}
+            />
           </div>
         </div>
       )}
@@ -689,4 +701,3 @@ function CopyButton({ text }: { text: string }) {
     </button>
   );
 }
-

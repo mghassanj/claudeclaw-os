@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Send, Square, Sparkles, ArrowDown } from 'lucide-preact';
+import { Send, Square, Sparkles, ArrowDown, CheckCircle2, AlertCircle, Loader2, ListChecks, Wrench } from 'lucide-preact';
 import { PageHeader } from '@/components/PageHeader';
 import { PageState } from '@/components/PageState';
 import { StatusDot } from '@/components/Pill';
@@ -12,6 +12,17 @@ import { subscribeChatStream, chatStreamConnected, resetUnread } from '@/lib/cha
 
 interface Turn { role: 'user' | 'assistant'; content: string; source?: string; created_at?: number; photoUrl?: string; photoCaption?: string; }
 interface Agent { id: string; name: string; running: boolean; }
+interface ProgressItem {
+  id: string;
+  description: string;
+  progressKind?: string;
+  status?: string;
+  kind?: string;
+  toolCallId?: string;
+  locations?: Array<{ path: string; line?: number | null }>;
+  planEntries?: Array<{ content: string; status: string; priority?: string }>;
+  timestamp: number;
+}
 
 interface AgentTokens { todayCost: number; todayTurns: number; allTimeCost: number; }
 interface Health { contextPct: number; turns: number; model: string; }
@@ -32,6 +43,7 @@ export function Chat() {
   const [sending, setSending] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [progressLabel, setProgressLabel] = useState<string | null>(null);
+  const [progressItems, setProgressItems] = useState<ProgressItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -100,7 +112,7 @@ export function Chat() {
         setTurns((prev) => [...prev, { role: 'user', content: data.content, source: data.source }]);
       } else if (eventName === 'assistant_message') {
         setTurns((prev) => [...prev, { role: 'assistant', content: data.content, source: data.source }]);
-        setProcessing(false); setProgressLabel(null);
+        setProcessing(false); setProgressLabel(null); setProgressItems([]);
         health.refresh();
         if (activeAgent !== 'all') agentTokens.refresh();
       } else if (eventName === 'assistant_photo') {
@@ -115,12 +127,28 @@ export function Chat() {
         }]);
       } else if (eventName === 'processing') {
         if (data.processing !== undefined) setProcessing(!!data.processing);
-        if (!data.processing) setProgressLabel(null);
+        if (!data.processing) {
+          setProgressLabel(null);
+          setProgressItems([]);
+        }
       } else if (eventName === 'progress') {
-        if (data.description) setProgressLabel(data.description);
+        if (data.description) {
+          setProgressLabel(data.description);
+          setProgressItems((prev) => mergeProgressItem(prev, {
+            id: progressItemId(data),
+            description: data.description,
+            progressKind: data.progressKind,
+            status: data.status,
+            kind: data.kind,
+            toolCallId: data.toolCallId,
+            locations: data.locations,
+            planEntries: data.planEntries,
+            timestamp: data.timestamp || Date.now(),
+          }));
+        }
       } else if (eventName === 'error') {
         setTurns((prev) => [...prev, { role: 'assistant', content: data.content || 'Error' }]);
-        setProcessing(false); setProgressLabel(null);
+        setProcessing(false); setProgressLabel(null); setProgressItems([]);
       }
     });
     return unsub;
@@ -129,7 +157,7 @@ export function Chat() {
   async function send(textOverride?: string) {
     const message = (textOverride ?? draft).trim();
     if (!message) return;
-    setSending(true); setError(null);
+    setSending(true); setError(null); setProgressItems([]); setProgressLabel(null);
     try {
       const res = await apiPost<{ ok?: boolean; error?: string }>('/api/chat/send', { message });
       if (!res.ok && res.error) {
@@ -196,7 +224,7 @@ export function Chat() {
             <PageState empty emptyTitle="No messages yet" emptyDescription="Type below to talk to your agent. Replies stream in via SSE." />
           )}
           {turns.map((t, i) => <Bubble key={i} turn={t} />)}
-          {processing && <ProcessingBubble label={progressLabel} />}
+          {processing && <ProcessingBubble label={progressLabel} items={progressItems} />}
         </div>
         {!atBottom && (
           <button
@@ -317,6 +345,7 @@ function Bubble({ turn }: { turn: Turn }) {
       <div
         class={[
           'max-w-[75%] rounded-lg text-[12.5px] leading-relaxed overflow-hidden',
+          'select-text',
           isPhoto ? 'p-1' : 'px-3 py-2',
           isUser
             ? 'bg-[var(--color-accent)] text-white rounded-br-sm whitespace-pre-wrap'
@@ -348,13 +377,82 @@ function Bubble({ turn }: { turn: Turn }) {
   );
 }
 
-function ProcessingBubble({ label }: { label: string | null }) {
+function progressItemId(data: any): string {
+  if (data.toolCallId) return `tool:${data.toolCallId}`;
+  if (data.progressKind === 'plan') return 'plan';
+  return `progress:${data.timestamp || Date.now()}:${data.description || ''}`;
+}
+
+function mergeProgressItem(prev: ProgressItem[], next: ProgressItem): ProgressItem[] {
+  const idx = prev.findIndex((item) => item.id === next.id);
+  const merged = idx === -1
+    ? [...prev, next]
+    : prev.map((item, itemIdx) => itemIdx === idx ? { ...item, ...next } : item);
+  return merged.slice(-8);
+}
+
+function ProcessingBubble({ label, items }: { label: string | null; items: ProgressItem[] }) {
+  const visible = items.slice(-6).reverse();
   return (
     <div class="flex justify-start">
-      <div class="bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg rounded-bl-sm px-3 py-2 text-[12px] text-[var(--color-text-muted)] inline-flex items-center gap-2">
-        <Sparkles size={12} class="animate-pulse text-[var(--color-accent)]" />
-        {label || 'Thinking…'}
+      <div class="bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg rounded-bl-sm px-3 py-2 text-[12px] text-[var(--color-text-muted)] min-w-[260px] max-w-[560px]">
+        <div class="inline-flex items-center gap-2">
+          <Sparkles size={12} class="animate-pulse text-[var(--color-accent)]" />
+          <span>{label || 'Thinking…'}</span>
+        </div>
+        {visible.length > 0 && (
+          <div class="mt-2 space-y-1.5 border-t border-[var(--color-border)] pt-2">
+            {visible.map((item) => <ProgressRow key={item.id} item={item} />)}
+          </div>
+        )}
       </div>
     </div>
   );
+}
+
+function ProgressRow({ item }: { item: ProgressItem }) {
+  const Icon = progressIcon(item);
+  const location = item.locations?.[0];
+  return (
+    <div class="grid grid-cols-[14px_1fr_auto] gap-2 items-start">
+      <Icon size={13} class={progressIconClass(item)} />
+      <div class="min-w-0">
+        <div class="text-[11.5px] text-[var(--color-text)] truncate">{item.description}</div>
+        {location && (
+          <div class="text-[10.5px] text-[var(--color-text-faint)] font-mono truncate">
+            {location.path}{location.line ? `:${location.line}` : ''}
+          </div>
+        )}
+        {item.progressKind === 'plan' && item.planEntries && item.planEntries.length > 1 && (
+          <div class="mt-1 space-y-0.5">
+            {item.planEntries.slice(0, 4).map((entry, idx) => (
+              <div key={idx} class="text-[10.5px] text-[var(--color-text-faint)] truncate">
+                {entry.status === 'completed' ? '✓' : entry.status === 'in_progress' ? '›' : '·'} {entry.content}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {item.status && (
+        <span class="text-[9.5px] uppercase text-[var(--color-text-faint)] tabular-nums">
+          {item.status.replace('_', ' ')}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function progressIcon(item: ProgressItem) {
+  if (item.status === 'completed') return CheckCircle2;
+  if (item.status === 'failed') return AlertCircle;
+  if (item.progressKind === 'plan') return ListChecks;
+  if (item.progressKind === 'tool_active') return Wrench;
+  return Loader2;
+}
+
+function progressIconClass(item: ProgressItem): string {
+  if (item.status === 'completed') return 'mt-0.5 text-[var(--color-status-done)]';
+  if (item.status === 'failed') return 'mt-0.5 text-[var(--color-status-failed)]';
+  if (item.status === 'in_progress' || item.progressKind === 'tool_active') return 'mt-0.5 text-[var(--color-accent)] animate-pulse';
+  return 'mt-0.5 text-[var(--color-text-faint)]';
 }

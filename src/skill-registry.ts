@@ -203,7 +203,10 @@ function scanDirectory(dir: string): void {
  * from this file's location via fileURLToPath() (decodes URL-encoded chars
  * so paths with spaces / parens / unicode resolve correctly).
  */
-export function initSkillRegistry(projectRootOverride?: string): void {
+export function initSkillRegistry(
+  projectRootOverride?: string,
+  globalSkillsOverride?: string,
+): void {
   skills.clear();
 
   // fileURLToPath decodes URL-encoded characters (e.g. %20 → space).
@@ -218,7 +221,8 @@ export function initSkillRegistry(projectRootOverride?: string): void {
   }
 
   const projectSkillsDir = path.join(projectRoot, 'skills');
-  const globalSkillsDir = path.join(os.homedir(), '.claude', 'skills');
+  const globalSkillsDir = globalSkillsOverride
+    ?? path.join(os.homedir(), '.claude', 'skills');
 
   // Scan project skills first (they take priority)
   scanDirectory(projectSkillsDir);

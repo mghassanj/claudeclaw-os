@@ -17,7 +17,9 @@ function getClient(): GoogleGenAI {
 
 /**
  * Generate text content via Gemini.
- * Defaults to gemini-2.0-flash for speed and cost efficiency.
+ * Defaults to gemini-2.0-flash. The 2.5 migration is tracked separately
+ * — 2.0-flash retires June 2026 and new GCP projects already see 404s,
+ * so the default bump belongs in its own PR with a changelog note.
  */
 export async function generateContent(
   prompt: string,
@@ -27,6 +29,11 @@ export async function generateContent(
   // Memory ingestion, classifier paths, and any other generateContent
   // caller all flow through here.
   requireEnabled('LLM_SPAWN_ENABLED');
+
+  // No key configured — silently return empty so callers degrade gracefully
+  // instead of crashing. Memory, consolidation, etc. simply skip.
+  if (!GOOGLE_API_KEY) return '';
+
   const ai = getClient();
   try {
     const response = await ai.models.generateContent({

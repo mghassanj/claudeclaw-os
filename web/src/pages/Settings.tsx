@@ -1,10 +1,10 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Check, Pipette, RotateCcw } from 'lucide-preact';
 import { PageHeader } from '@/components/PageHeader';
 import { PageState } from '@/components/PageState';
 import { Toggle } from '@/components/Toggle';
-import { useFetch } from '@/lib/useFetch';
-import { apiPost } from '@/lib/api';
+import { invalidateFetchCache, useFetch, type FetchState } from '@/lib/useFetch';
+import { ApiError, apiPatch, apiPost } from '@/lib/api';
 import { pushToast } from '@/lib/toasts';
 import {
   theme, themeMeta, setTheme, type ThemeName,
@@ -25,9 +25,32 @@ interface Health {
   killSwitchRefusals: Record<string, number>;
   model: string;
   contextPct: number;
+  provider?: { type: string; command?: string; args?: string[]; model?: string; runtimeMode?: RuntimeMode; thinkingMode?: ThinkingMode };
+  providerType?: string;
+  runtime?: string;
+  acpEnabled?: boolean;
 }
 
 interface SecurityStatus { [key: string]: any; }
+interface ProviderModelOption { id: string; label: string; }
+interface ProviderModelsResponse {
+  provider: string;
+  models: ProviderModelOption[];
+  defaultModel: string;
+  selectable: boolean;
+  allowCustom?: boolean;
+  note?: string;
+}
+interface ProviderRuntimeOption { id: string; label: string; current?: boolean; }
+interface ProviderRuntimeOptionsResponse {
+  provider: string;
+  modeOptions: ProviderRuntimeOption[];
+  thinkingOptions: ProviderRuntimeOption[];
+  source: 'provider' | 'fallback' | 'static';
+  error?: string;
+}
+type RuntimeMode = string;
+type ThinkingMode = string;
 
 const KILL_SWITCH_LABELS: Record<string, { label: string; description: string }> = {
   WARROOM_TEXT_ENABLED: {
@@ -123,6 +146,17 @@ export function Settings() {
             </Card>
           </Section>
 
+          {health.data?.acpEnabled ? (
+            <Section
+              title="Agent provider (beta)"
+              subtitle="Provider selection is beta. Additional CLI setup may be required for non-Claude providers. Choose a built-in provider or point ClaudeClaw at any ACP-compatible agent command."
+            >
+              <Card>
+                <ProviderConfigPanel health={health} />
+              </Card>
+            </Section>
+          ) : null}
+
           <Section
             title="Kill switches"
             subtitle="Runtime feature gates. Toggling writes the flag to .env atomically; the runtime re-reads it within 1.5s so changes take effect without a restart."
@@ -146,14 +180,9 @@ export function Settings() {
             </div>
           </Section>
 
-          <Section title="Read-only" subtitle="Settings that need an .env edit + restart to change.">
+          <Section title="Read-only" subtitle="System limits and bundled assets.">
             <Card>
-              <ReadOnlyRow label="Default model" value={health.data.model || '—'} />
-              <Divider />
               <ReadOnlyRow label="Context window" value={health.data.contextPct + '%'} />
-              <div class="text-[11px] text-[var(--color-text-faint)] pt-3 mt-1 border-t border-[var(--color-border)] leading-snug">
-                To toggle a kill switch, edit <code class="font-mono text-[var(--color-text-muted)]">.env</code> and set the relevant flag to <code class="font-mono text-[var(--color-text-muted)]">true</code> or <code class="font-mono text-[var(--color-text-muted)]">false</code>. The change takes effect within 1.5 seconds without a process restart.
-              </div>
             </Card>
           </Section>
 
@@ -319,6 +348,39 @@ function ScalePicker() {
   );
 }
 
+function SegmentedControl({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div class="inline-flex rounded-md border border-[var(--color-border)] bg-[var(--color-elevated)] p-0.5">
+      {options.map((option) => {
+        const active = value === option.value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            onClick={() => onChange(option.value)}
+            class={[
+              'px-2.5 py-1 rounded text-[12px] font-medium transition-colors',
+              active
+                ? 'bg-[var(--color-accent)] text-white'
+                : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]',
+            ].join(' ')}
+          >
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Hotkey picker ─────────────────────────────────────────────────────
 
 function HotkeyPicker() {
@@ -352,6 +414,286 @@ function HotkeyPicker() {
       })}
     </div>
   );
+}
+
+// ── Agent provider config ────────────────────────────────────────────
+
+function ProviderConfigPanel({ health }: { health: FetchState<Health> }) {
+  const current = health.data?.provider;
+  const [type, setType] = useState(current?.type ?? 'opencode');
+  const models = useFetch<ProviderModelsResponse>('/api/providers/models?provider=' + encodeURIComponent(type), 0);
+  const [model, setModel] = useState(current?.model ?? health.data?.model ?? '');
+  const [customModel, setCustomModel] = useState('');
+  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>(current?.runtimeMode ?? '');
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(current?.thinkingMode ?? '');
+  const [command, setCommand] = useState(current?.command ?? '');
+  const [args, setArgs] = useState((current?.args ?? []).join(' '));
+  const runtimeOptionsPath = type === 'acp' && !command.trim()
+    ? null
+    : '/api/providers/runtime-options?provider='
+      + encodeURIComponent(type)
+      + (type === 'acp' ? '&command=' + encodeURIComponent(command.trim()) + '&args=' + encodeURIComponent(args) : '');
+  const runtimeOptions = useFetch<ProviderRuntimeOptionsResponse>(runtimeOptionsPath, 0);
+  const [busy, setBusy] = useState(false);
+  const dirtyRef = useRef(false);
+
+  function markDirty() {
+    dirtyRef.current = true;
+  }
+
+  useEffect(() => {
+    if (dirtyRef.current) return;
+    const nextType = current?.type ?? 'opencode';
+    setType(nextType);
+    setModel(current?.model ?? health.data?.model ?? '');
+    setRuntimeMode(current?.runtimeMode ?? '');
+    setThinkingMode(current?.thinkingMode ?? '');
+    setCommand(current?.command ?? '');
+    setArgs((current?.args ?? []).join(' '));
+  }, [current?.type, current?.model, current?.runtimeMode, current?.thinkingMode, current?.command, JSON.stringify(current?.args ?? []), health.data?.model]);
+
+  useEffect(() => {
+    const defaultModel = models.data?.defaultModel;
+    if (!defaultModel) return;
+    const available = models.data?.models ?? [];
+    setModel((existing) => {
+      if (!existing) return defaultModel;
+      if (existing === '__custom__') return existing;
+      if (available.some((m) => m.id === existing)) return existing;
+      if (models.data?.allowCustom) {
+        setCustomModel(existing);
+        return '__custom__';
+      }
+      return defaultModel;
+    });
+  }, [models.data?.defaultModel, models.data?.allowCustom, JSON.stringify(models.data?.models ?? [])]);
+
+  useEffect(() => {
+    const modeOptions = runtimeOptions.data?.modeOptions ?? [];
+    const thinkingOptions = runtimeOptions.data?.thinkingOptions ?? [];
+    setRuntimeMode((existing) => {
+      if (!modeOptions.length) return '';
+      if (existing && modeOptions.some((option) => option.id === existing)) return existing;
+      return modeOptions.find((option) => option.current)?.id ?? modeOptions[0].id;
+    });
+    setThinkingMode((existing) => {
+      if (!thinkingOptions.length) return '';
+      if (existing && thinkingOptions.some((option) => option.id === existing)) return existing;
+      return thinkingOptions.find((option) => option.current)?.id ?? thinkingOptions[0].id;
+    });
+  }, [JSON.stringify(runtimeOptions.data?.modeOptions ?? []), JSON.stringify(runtimeOptions.data?.thinkingOptions ?? [])]);
+
+  function providerPayload() {
+    const selectedModel = model === '__custom__' ? customModel.trim() : model.trim();
+    const modelPayload = selectedModel && selectedModel !== 'provider-default'
+      ? { model: selectedModel }
+      : {};
+    const runtimePayload = {
+      ...(runtimeMode ? { runtimeMode } : {}),
+      ...(thinkingMode ? { thinkingMode } : {}),
+    };
+    if (type === 'claude') return { type: 'claude', ...modelPayload, ...runtimePayload };
+    if (type === 'acp') {
+      return {
+        type: 'acp',
+        ...modelPayload,
+        ...runtimePayload,
+        command: command.trim(),
+        args: splitArgs(args),
+      };
+    }
+    return { type, ...modelPayload, ...runtimePayload };
+  }
+
+  async function save() {
+    const provider = providerPayload();
+    if (provider.type === 'acp' && !(provider as any).command) {
+      pushToast({ tone: 'error', title: 'Command required', description: 'Custom ACP needs a command, for example: my-agent --acp' });
+      return;
+    }
+    setBusy(true);
+    try {
+      await apiPatch('/api/agents/main/provider', { provider });
+      invalidateFetchCache('/api/provider/status');
+      invalidateFetchCache('/api/health');
+      invalidateFetchCache('/api/agents');
+      health.refresh();
+      dirtyRef.current = false;
+      pushToast({ tone: 'success', title: 'Provider saved', description: 'Takes effect on the next message.' });
+    } catch (err: any) {
+      // Surface structured availability errors from the preflight check so the
+      // user sees install commands and setup hints instead of a generic 400.
+      if (err instanceof ApiError && err.body && typeof err.body === 'object') {
+        const body = err.body as { error?: string; installCommand?: string; setupHint?: string; docsUrl?: string };
+        const descriptionParts = [body.error || `Request failed: ${err.status}`];
+        if (body.installCommand) descriptionParts.push(`Install: ${body.installCommand}`);
+        if (body.setupHint) descriptionParts.push(body.setupHint);
+        if (body.docsUrl) descriptionParts.push(`Docs: ${body.docsUrl}`);
+        pushToast({
+          tone: 'error',
+          title: 'Provider not available',
+          description: descriptionParts.join('\n'),
+          durationMs: 12000,
+        });
+      } else {
+        pushToast({ tone: 'error', title: 'Provider save failed', description: err?.message || String(err), durationMs: 7000 });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div class="space-y-3">
+      <Row label="Current" hint="Shown in the sidebar footer too.">
+        <div class="text-right">
+          <div class="font-mono text-[12px] text-[var(--color-text)]">{health.data?.providerType || 'opencode'}</div>
+          <div class="text-[11px] text-[var(--color-text-faint)] max-w-[260px] truncate">{health.data?.runtime || 'OpenCode'}</div>
+        </div>
+      </Row>
+      <Divider />
+      <Row label="Provider" hint="Gemini uses gemini --acp. Codex uses the codex-acp adapter.">
+        <select
+          value={type}
+          onChange={(event) => {
+            setType((event.currentTarget as HTMLSelectElement).value);
+            setModel('');
+            setCustomModel('');
+            markDirty();
+          }}
+          aria-label="Provider"
+          class="h-8 w-[180px] rounded-md border border-[var(--color-border)] bg-[var(--color-elevated)] px-2 text-[12.5px] text-[var(--color-text)]"
+        >
+          <option value="opencode">OpenCode</option>
+          <option value="gemini">Gemini CLI</option>
+          <option value="codex">Codex ACP</option>
+          <option value="claude">Claude Code</option>
+          <option value="acp">Custom ACP</option>
+        </select>
+      </Row>
+      <Divider />
+      <Row
+        label="Model"
+        hint="Saved with the provider. ACP providers receive it through session/set_model when supported."
+      >
+        <div class="flex flex-col items-end gap-1.5">
+          <select
+            value={model}
+            onChange={(event) => {
+              setModel((event.currentTarget as HTMLSelectElement).value);
+              markDirty();
+            }}
+            disabled={models.loading}
+            aria-label="Model"
+            class="h-8 w-[220px] rounded-md border border-[var(--color-border)] bg-[var(--color-elevated)] px-2 text-[12.5px] text-[var(--color-text)] disabled:opacity-60"
+          >
+            {(models.data?.models ?? []).map((m) => (
+              <option key={m.id} value={m.id}>{m.label}</option>
+            ))}
+            {models.data?.allowCustom && <option value="__custom__">Custom model...</option>}
+          </select>
+          {model === '__custom__' && (
+            <input
+              type="text"
+              value={customModel}
+              onInput={(event) => {
+                setCustomModel((event.currentTarget as HTMLInputElement).value);
+                markDirty();
+              }}
+              placeholder="model-id"
+              class="bg-[var(--color-elevated)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-[12.5px] font-mono text-[var(--color-text)] outline-none focus:border-[var(--color-accent)] w-[220px]"
+            />
+          )}
+          {models.data?.note && <div class="text-[10.5px] text-[var(--color-text-faint)] max-w-[260px] text-right leading-snug">{models.data.note}</div>}
+        </div>
+      </Row>
+      <Divider />
+      {(runtimeOptions.data?.modeOptions?.length ?? 0) > 0 && (
+        <>
+          <Row label="Agent speed" hint="Shown only when the provider advertises speed-like runtime options. Access mode is handled automatically.">
+            <SegmentedControl
+              value={runtimeMode}
+              options={(runtimeOptions.data?.modeOptions ?? []).map((option) => ({ value: option.id, label: option.label }))}
+              onChange={(value) => {
+                setRuntimeMode(value as RuntimeMode);
+                markDirty();
+              }}
+            />
+          </Row>
+          <Divider />
+        </>
+      )}
+      {(runtimeOptions.data?.thinkingOptions?.length ?? 0) > 0 && (
+        <>
+          <Row label="Thinking" hint="Uses the provider's own thought-level values, for example Codex low/medium/high/extra high.">
+            <SegmentedControl
+              value={thinkingMode}
+              options={(runtimeOptions.data?.thinkingOptions ?? []).map((option) => ({ value: option.id, label: option.label }))}
+              onChange={(value) => {
+                setThinkingMode(value as ThinkingMode);
+                markDirty();
+              }}
+            />
+          </Row>
+          <Divider />
+        </>
+      )}
+      {runtimeOptions.loading && <div class="text-[11px] text-[var(--color-text-faint)] text-right">Checking provider runtime options...</div>}
+      {runtimeOptions.data?.source === 'fallback' && runtimeOptions.data.error && (
+        <div class="text-[11px] text-[var(--color-text-faint)] text-right leading-snug">
+          Using fallback options: {runtimeOptions.data.error}
+        </div>
+      )}
+      {type === 'acp' && (
+        <>
+          <Row label="Command" hint="Executable available on PATH for the service.">
+            <input
+              type="text"
+              value={command}
+              onInput={(event) => {
+                setCommand((event.currentTarget as HTMLInputElement).value);
+                markDirty();
+              }}
+              placeholder="my-acp-agent"
+              class="bg-[var(--color-elevated)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-[12.5px] font-mono text-[var(--color-text)] outline-none focus:border-[var(--color-accent)] w-[220px]"
+            />
+          </Row>
+          <Divider />
+          <Row label="Arguments" hint="Shell-style quoting is supported for simple args.">
+            <input
+              type="text"
+              value={args}
+              onInput={(event) => {
+                setArgs((event.currentTarget as HTMLInputElement).value);
+                markDirty();
+              }}
+              placeholder="--acp"
+              class="bg-[var(--color-elevated)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-[12.5px] font-mono text-[var(--color-text)] outline-none focus:border-[var(--color-accent)] w-[220px]"
+            />
+          </Row>
+        </>
+      )}
+      <div class="text-[11px] text-[var(--color-text-faint)] leading-snug pt-2 border-t border-[var(--color-border)]">
+        ClaudeClaw stores the provider and selected model. Configure provider auth in the provider itself:
+        OpenCode with <code class="font-mono">opencode auth login</code>, Gemini with <code class="font-mono">gemini</code>, and Codex with the <code class="font-mono">codex-acp</code> adapter.
+      </div>
+      <div class="flex justify-end pt-1">
+        <button
+          type="button"
+          onClick={save}
+          disabled={busy}
+          class="px-3 py-1.5 rounded-md text-[12px] font-medium bg-[var(--color-accent)] text-white hover:bg-[var(--color-accent-hover)] disabled:opacity-60"
+        >
+          {busy ? 'Saving...' : 'Save provider'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function splitArgs(input: string): string[] {
+  const matches = input.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  return matches.map((part) => part.replace(/^["']|["']$/g, ''));
 }
 
 // ── Kill switch row ──────────────────────────────────────────────────

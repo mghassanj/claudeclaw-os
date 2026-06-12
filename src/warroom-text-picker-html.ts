@@ -269,7 +269,7 @@ export function getWarRoomPickerHtml(token: string, chatId: string): string {
       <div class="tile-spec">
         <div class="row"><span class="k">Responders</span><span>1 primary + up to 2 chime-ins</span></div>
         <div class="row"><span class="k">Memory</span><span>fresh per meeting (isolated from Telegram)</span></div>
-        <div class="row"><span class="k">Stack</span><span>Claude Agent SDK (subscription)</span></div>
+        <div class="row"><span class="k">Stack</span><span>Selected agent provider</span></div>
       </div>
       <div class="tile-cta" id="tile-text-cta">Start text room →</div>
       <div class="tile-error" id="tile-text-error" role="alert" aria-live="polite"></div>

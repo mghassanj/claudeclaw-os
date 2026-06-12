@@ -161,13 +161,13 @@ export function executeEmergencyKill(): void {
       // Enumerate scheduled tasks matching com.claudeclaw.* and end each one.
       // schtasks doesn't accept wildcards in /End, so we parse /Query output.
       try {
-        const out = execSync('schtasks /Query /FO CSV /NH', { encoding: 'utf-8', timeout: 3000 });
+        const out = execSync('schtasks /Query /FO CSV /NH', { encoding: 'utf-8', timeout: 3000, windowsHide: true });
         for (const line of out.split(/\r?\n/)) {
           // CSV: "TaskName","Next Run Time","Status"
           const match = line.match(/^"(\\?com\.claudeclaw\.[^"]+)"/);
           if (match) {
             const name = match[1];
-            try { execSync(`schtasks /End /TN "${name}"`, { stdio: 'ignore', timeout: 2000 }); } catch { /* ok */ }
+            try { execSync(`schtasks /End /TN "${name}"`, { stdio: 'ignore', timeout: 2000, windowsHide: true }); } catch { /* ok */ }
           }
         }
       } catch { /* schtasks failed, still exit */ }
@@ -211,21 +211,19 @@ export function audit(entry: AuditEntry): void {
 
 // ── SDK subprocess env scrubbing ─────────────────────────────────────
 //
-// Every Claude Agent SDK call spawns a `claude` subprocess that inherits
-// our env. By default that means `DASHBOARD_TOKEN`, `DB_ENCRYPTION_KEY`,
-// `DAILY_API_KEY`, third-party API keys, etc. are visible to the model
-// and to whatever tools it runs. A prompt-injected agent can read them
-// trivially.
+// Every agent engine subprocess inherits our env unless we override it.
+// By default that means `DASHBOARD_TOKEN`, `DB_ENCRYPTION_KEY`,
+// `DAILY_API_KEY`, third-party API keys, etc. are visible to the model and
+// to whatever tools it runs. A prompt-injected agent can read them trivially.
 //
 // `getScrubbedSdkEnv` returns the env to pass to `query({ env, ... })`:
 //   - Drops nested Claude-Code-session state so the child SDK process
 //     doesn't try to attach to the parent's IPC socket (legacy bug).
 //   - Drops every secret-shaped variable the SDK doesn't actually need.
-//   - Preserves whichever of CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY
-//     the caller passed (SDK auth requires one of them; without one, the
-//     subprocess exits 1).
-//   - Resolves missing tokens from .env via readEnvFile so callers don't
-//     have to know how the secret is sourced.
+//   - Preserves CLAUDE_CODE_OAUTH_TOKEN when explicitly provided.
+//   - Drops ANTHROPIC_API_KEY by default so an invalid/stale external API
+//     key cannot override an existing Claude subscription login. Set
+//     CLAUDECLAW_USE_ANTHROPIC_API_KEY=true to force API-key auth.
 //
 // This is a blocklist (drop the dangerous), not a strict allowlist (keep
 // only the explicitly safe), to avoid breaking obscure-but-required env
@@ -269,8 +267,8 @@ const SDK_DROP_VARS_SECRETS = [
 
 // Heuristic: any env var whose name matches one of these patterns is a
 // likely secret (defense in depth for keys we haven't enumerated).
-// `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are exceptions —
-// the SDK needs them to authenticate.
+// CLAUDE_CODE_OAUTH_TOKEN is an exception because it is the explicit
+// subscription/OAuth auth override for the SDK subprocess.
 const SDK_SECRET_NAME_PATTERNS = [
   /_API_KEY$/,
   /_TOKEN$/,
@@ -279,6 +277,11 @@ const SDK_SECRET_NAME_PATTERNS = [
 ] as const;
 
 const SDK_AUTH_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'] as const;
+const SDK_ALWAYS_ALLOW_AUTH_VARS = ['CLAUDE_CODE_OAUTH_TOKEN'] as const;
+
+function wantsAnthropicApiKeyAuth(): boolean {
+  return (process.env.CLAUDECLAW_USE_ANTHROPIC_API_KEY ?? '').toLowerCase() === 'true';
+}
 
 /**
  * Return a scrubbed env dict suitable for passing to `query({ env, ... })`.
@@ -289,6 +292,7 @@ const SDK_AUTH_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'] as const;
 export function getScrubbedSdkEnv(
   authSecrets?: Partial<Record<typeof SDK_AUTH_VARS[number], string>>,
 ): Record<string, string | undefined> {
+  const processAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
   const env: Record<string, string | undefined> = { ...process.env };
 
   for (const k of SDK_DROP_VARS_NESTED_CLAUDE) delete env[k];
@@ -297,19 +301,24 @@ export function getScrubbedSdkEnv(
   // Pattern-based drop. Walk a snapshot of keys so we can mutate the
   // dict during iteration.
   for (const key of Object.keys(env)) {
-    if ((SDK_AUTH_VARS as readonly string[]).includes(key)) continue;
+    if ((SDK_ALWAYS_ALLOW_AUTH_VARS as readonly string[]).includes(key)) continue;
     if (SDK_SECRET_NAME_PATTERNS.some((re) => re.test(key))) {
       delete env[key];
     }
   }
 
-  // Re-inject auth secrets the caller explicitly opted to allow. Without
-  // at least one of these, the SDK subprocess can't authenticate.
+  // Subscription/OAuth auth can come from the user's existing Claude CLI
+  // login state, so no env token is required. Re-inject an API key only
+  // when the operator explicitly chooses API-key auth.
   if (authSecrets) {
-    for (const k of SDK_AUTH_VARS) {
-      const v = authSecrets[k];
-      if (v) env[k] = v;
-    }
+    const oauthToken = authSecrets.CLAUDE_CODE_OAUTH_TOKEN;
+    if (oauthToken) env.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
+
+    const apiKey = authSecrets.ANTHROPIC_API_KEY;
+    if (apiKey && wantsAnthropicApiKeyAuth()) env.ANTHROPIC_API_KEY = apiKey;
+  }
+  if (!env.ANTHROPIC_API_KEY && processAnthropicApiKey && wantsAnthropicApiKeyAuth()) {
+    env.ANTHROPIC_API_KEY = processAnthropicApiKey;
   }
 
   return env;

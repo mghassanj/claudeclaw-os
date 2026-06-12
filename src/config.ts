@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { readEnvFile } from './env.js';
+import type { ProviderConfig } from './provider.js';
 
 const envConfig = readEnvFile([
   'TELEGRAM_BOT_TOKEN',
@@ -28,6 +29,7 @@ const envConfig = readEnvFile([
   'SMART_ROUTING_ENABLED',
   'SMART_ROUTING_CHEAP_MODEL',
   'SHOW_COST_FOOTER',
+  'MEMORY_NOTIFY',
   'DAILY_COST_BUDGET',
   'HOURLY_TOKEN_BUDGET',
   'MEMORY_NUDGE_INTERVAL_TURNS',
@@ -37,6 +39,7 @@ const envConfig = readEnvFile([
   'WARROOM_ENABLED',
   'WARROOM_PORT',
   'STREAM_STRATEGY',
+  'ENABLE_ACP',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -46,6 +49,7 @@ export let activeBotToken =
   process.env.TELEGRAM_BOT_TOKEN || envConfig.TELEGRAM_BOT_TOKEN || '';
 export let agentCwd: string | undefined; // undefined = use PROJECT_ROOT
 export let agentDefaultModel: string | undefined; // from agent.yaml
+export let agentProvider: ProviderConfig | undefined; // from agent.yaml/main-config
 export let agentObsidianConfig: { vault: string; folders: string[]; readOnly?: string[] } | undefined;
 export let agentSystemPrompt: string | undefined; // loaded from agents/{id}/CLAUDE.md
 export let agentMcpAllowlist: string[] | undefined; // from agent.yaml mcp_servers
@@ -55,6 +59,7 @@ export function setAgentOverrides(opts: {
   botToken: string;
   cwd: string;
   model?: string;
+  provider?: ProviderConfig;
   obsidian?: { vault: string; folders: string[]; readOnly?: string[] };
   systemPrompt?: string;
   mcpServers?: string[];
@@ -63,6 +68,7 @@ export function setAgentOverrides(opts: {
   activeBotToken = opts.botToken;
   agentCwd = opts.cwd;
   agentDefaultModel = opts.model;
+  agentProvider = opts.provider;
   agentObsidianConfig = opts.obsidian;
   agentSystemPrompt = opts.systemPrompt;
   agentMcpAllowlist = opts.mcpServers;
@@ -75,6 +81,13 @@ export function setAgentOverrides(opts: {
  *  re-reads CLAUDE.md from cwd via settingSources on every turn. */
 export function updateAgentSystemPrompt(next: string | undefined): void {
   agentSystemPrompt = next;
+}
+
+/** Update just the active provider for the running process. Dashboard
+ * provider changes persist to disk separately; this keeps main hot-switches
+ * honest without rebuilding the full agent override object. */
+export function updateAgentProvider(next: ProviderConfig | undefined): void {
+  agentProvider = next;
 }
 
 export const TELEGRAM_BOT_TOKEN =
@@ -152,8 +165,11 @@ export const AGENT_MAX_TURNS = parseInt(
   10,
 );
 
-// Context window limit for the model. Opus 4.6 (1M context) = 1,000,000.
-// Override via CONTEXT_LIMIT in .env if using a different model variant.
+// Fallback context-window limit (tokens). The context gauge and warnings now
+// prefer the active model's REAL window as reported by the SDK per turn
+// (Opus 4.8 = 1M, Sonnet 4.6 = 200k). This value is only used when the engine
+// doesn't report one — e.g. ACP providers, or rows from before the upgrade.
+// Override via CONTEXT_LIMIT in .env to change that fallback.
 export const CONTEXT_LIMIT = parseInt(
   process.env.CONTEXT_LIMIT || envConfig.CONTEXT_LIMIT || '1000000',
   10,
@@ -217,11 +233,34 @@ export const SMART_ROUTING_ENABLED =
 export const SMART_ROUTING_CHEAP_MODEL =
   process.env.SMART_ROUTING_CHEAP_MODEL || envConfig.SMART_ROUTING_CHEAP_MODEL || 'claude-haiku-4-5';
 
+// ── Claude model selection ──────────────────────────────────────────
+// The /model opus|sonnet|haiku Telegram shortcuts and the fresh-install
+// default all resolve through these. Defaults track the current Claude
+// lineup; override any of them in .env so a new model release is picked
+// up on the next restart WITHOUT a code change or a new release.
+// Example: CLAUDE_MODEL_OPUS=claude-opus-4-9
+export const CLAUDE_MODEL_OPUS =
+  process.env.CLAUDE_MODEL_OPUS || envConfig.CLAUDE_MODEL_OPUS || 'claude-opus-4-8';
+export const CLAUDE_MODEL_SONNET =
+  process.env.CLAUDE_MODEL_SONNET || envConfig.CLAUDE_MODEL_SONNET || 'claude-sonnet-4-6';
+export const CLAUDE_MODEL_HAIKU =
+  process.env.CLAUDE_MODEL_HAIKU || envConfig.CLAUDE_MODEL_HAIKU || 'claude-haiku-4-5';
+// Default Claude model when no provider/agent model is configured (e.g. fresh installs).
+// Falls back to the Opus alias above so it tracks the same single source of truth.
+export const DEFAULT_CLAUDE_MODEL =
+  process.env.DEFAULT_CLAUDE_MODEL || envConfig.DEFAULT_CLAUDE_MODEL || CLAUDE_MODEL_OPUS;
+
 // Cost footer on every response.
 // compact = model only, verbose = model + tokens, cost = model + $, full = everything
 export type CostFooterMode = 'off' | 'compact' | 'verbose' | 'cost' | 'full';
 export const SHOW_COST_FOOTER: CostFooterMode =
   (process.env.SHOW_COST_FOOTER || envConfig.SHOW_COST_FOOTER || 'compact') as CostFooterMode;
+
+// Memory notifications: send Telegram message when high-importance memories are created.
+// Default: 'on'. Set to 'off', 'false', or '0' to disable.
+export const MEMORY_NOTIFY: boolean = !['off', 'false', '0'].includes(
+  (process.env.MEMORY_NOTIFY || envConfig.MEMORY_NOTIFY || 'on').toLowerCase(),
+);
 
 // Daily cost budget in USD. Warns at 80%. Set to 0 to disable (default).
 // Only useful for API/pay-per-use users. Subscription users should leave off.
@@ -253,6 +292,14 @@ export const PROTECTED_ENV_VARS = (
   'ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN,DB_ENCRYPTION_KEY,TELEGRAM_BOT_TOKEN,SLACK_USER_TOKEN,GROQ_API_KEY,ELEVENLABS_API_KEY,GOOGLE_API_KEY'
 ).split(',').map((s) => s.trim()).filter(Boolean);
 
+// ── Provider Selection (BETA) ───────────────────────────────────────
+// Gates the alternate provider (ACP / OpenCode / Gemini / Codex) UI and
+// runtime. When false, the dashboard hides the provider picker and the
+// engine forces Claude regardless of what's saved in agent.yaml or
+// main-config.json. Existing installs without this var see no change.
+export const ENABLE_ACP =
+  (process.env.ENABLE_ACP || envConfig.ENABLE_ACP || 'false').toLowerCase() === 'true';
+
 // ── War Room (voice meeting via Pipecat WebSocket) ──────────────────
 export const WARROOM_ENABLED =
   (process.env.WARROOM_ENABLED || envConfig.WARROOM_ENABLED || 'false').toLowerCase() === 'true';
@@ -260,4 +307,3 @@ export const WARROOM_PORT = parseInt(
   process.env.WARROOM_PORT || envConfig.WARROOM_PORT || '7860',
   10,
 );
-

@@ -3,7 +3,8 @@ description: YouTube scripts, LinkedIn posts, carousels, trend research, content
 
 telegram_bot_token_env: CONTENT_BOT_TOKEN
 
-model: claude-sonnet-4-6
+provider:
+  type: opencode
 
 # Optional: auto-inject your Obsidian vault into this agent's context.
 # Uncomment and point `vault:` at your real vault path. If you don't use

@@ -23,7 +23,7 @@ export function killProcess(pid: number, force = false): boolean {
   try {
     if (IS_WINDOWS) {
       const flag = force ? '/F' : '';
-      execSync(`taskkill ${flag} /PID ${pid}`, { stdio: 'ignore' });
+      execSync(`taskkill ${flag} /PID ${pid}`, { stdio: 'ignore', windowsHide: true });
       return true;
     }
     process.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
@@ -44,6 +44,7 @@ export function isProcessAlive(pid: number): boolean {
       const out = execSync(`tasklist /FI "PID eq ${pid}" /NH /FO CSV`, {
         stdio: 'pipe',
         encoding: 'utf-8',
+        windowsHide: true,
       });
       // tasklist prints "INFO: No tasks..." on stderr when missing, and an empty
       // result on stdout. A live process produces a CSV row containing the PID.
@@ -65,38 +66,22 @@ export async function findProcessesByPattern(pattern: string): Promise<number[]>
   return new Promise((resolve) => {
     try {
       if (IS_WINDOWS) {
-        // wmic is being deprecated but still ships with Windows 10/11. Fall
-        // back to PowerShell if wmic fails.
-        const p = spawn('wmic', ['process', 'where', `CommandLine like '%${pattern.replace(/'/g, "''")}%'`, 'get', 'ProcessId', '/value'], { shell: true });
-        let out = '';
-        p.stdout.on('data', (chunk) => { out += chunk.toString(); });
-        p.on('close', (code) => {
-          if (code !== 0) {
-            // Try PowerShell fallback
-            try {
-              const ps = execSync(
-                `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${pattern.replace(/'/g, "''")}*' } | Select-Object -ExpandProperty ProcessId"`,
-                { encoding: 'utf-8', stdio: 'pipe' },
-              );
-              resolve(
-                ps.split(/\r?\n/)
-                  .map((s) => parseInt(s.trim(), 10))
-                  .filter((n) => Number.isFinite(n) && n > 0),
-              );
-            } catch {
-              resolve([]);
-            }
-            return;
-          }
-          const pids = out
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter((line) => line.startsWith('ProcessId='))
-            .map((line) => parseInt(line.slice('ProcessId='.length), 10))
-            .filter((n) => Number.isFinite(n) && n > 0 && n !== process.pid);
-          resolve(pids);
-        });
-        p.on('error', () => resolve([]));
+        // wmic was removed from Windows 11 22H2+ and every failed spawn cost
+        // ~100ms before the fallback. PowerShell's Get-CimInstance ships in
+        // every supported Windows version, so use it directly.
+        try {
+          const ps = execSync(
+            `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${pattern.replace(/'/g, "''")}*' } | Select-Object -ExpandProperty ProcessId"`,
+            { encoding: 'utf-8', stdio: 'pipe', windowsHide: true },
+          );
+          resolve(
+            ps.split(/\r?\n/)
+              .map((s) => parseInt(s.trim(), 10))
+              .filter((n) => Number.isFinite(n) && n > 0 && n !== process.pid),
+          );
+        } catch {
+          resolve([]);
+        }
       } else {
         const p = spawn('pgrep', ['-f', pattern]);
         let out = '';
@@ -124,6 +109,16 @@ export function getVenvPython(venvDir: string): string {
   return IS_WINDOWS
     ? path.join(venvDir, 'Scripts', 'python.exe')
     : path.join(venvDir, 'bin', 'python');
+}
+
+/**
+ * Resolve the pip executable inside a local .venv directory.
+ * POSIX: <venvDir>/bin/pip. Windows: <venvDir>\Scripts\pip.exe.
+ */
+export function getVenvPip(venvDir: string): string {
+  return IS_WINDOWS
+    ? path.join(venvDir, 'Scripts', 'pip.exe')
+    : path.join(venvDir, 'bin', 'pip');
 }
 
 /**

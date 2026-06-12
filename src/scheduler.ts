@@ -1,6 +1,7 @@
 import { CronExpressionParser } from 'cron-parser';
 
-import { AGENT_ID, ALLOWED_CHAT_ID, agentMcpAllowlist } from './config.js';
+import { AGENT_ID, ALLOWED_CHAT_ID, agentMcpAllowlist, agentDefaultModel } from './config.js';
+import { ingestConversationTurn } from './memory-ingest.js';
 import {
   getDueTasks,
   getSession,
@@ -17,6 +18,8 @@ import { logger } from './logger.js';
 import { messageQueue } from './message-queue.js';
 import { runAgent } from './agent.js';
 import { formatForTelegram, splitMessage } from './bot.js';
+import { getSelectedProviderConfig } from './active-provider.js';
+import { evaluateAcceptance } from './acceptance.js';
 
 type Sender = (text: string) => Promise<void>;
 
@@ -94,7 +97,17 @@ async function runDueTasks(): Promise<void> {
         await sender(`Scheduled task running: "${task.prompt.slice(0, 80)}${task.prompt.length > 80 ? '...' : ''}"`);
 
         // Run as a fresh agent call (no session — scheduled tasks are autonomous)
-        const result = await runAgent(task.prompt, undefined, () => {}, undefined, undefined, abortController, undefined, agentMcpAllowlist);
+        const result = await runAgent(
+          task.prompt,
+          undefined,
+          () => {},
+          undefined,
+          agentDefaultModel,
+          abortController,
+          undefined,
+          agentMcpAllowlist,
+          getSelectedProviderConfig(),
+        );
         clearTimeout(timeout);
 
         if (result.aborted) {
@@ -105,8 +118,16 @@ async function runDueTasks(): Promise<void> {
         }
 
         const text = result.text?.trim() || 'Task completed with no output.';
+        const acceptancePassed = evaluateAcceptance(task.acceptance_check, result.text ?? '');
+        const lastStatus: 'success' | 'failed' = acceptancePassed ? 'success' : 'failed';
+        const resultText = acceptancePassed
+          ? text
+          : `Acceptance check not met: output did not contain "${task.acceptance_check}".\n\n${text}`;
         for (const chunk of splitMessage(formatForTelegram(text))) {
           await sender(chunk);
+        }
+        if (!acceptancePassed) {
+          await sender(`⚠ Acceptance check not met: expected output to contain "${task.acceptance_check}".`);
         }
 
         // Inject task output into the active chat session so user replies have context
@@ -116,7 +137,16 @@ async function runDueTasks(): Promise<void> {
           logConversationTurn(ALLOWED_CHAT_ID, 'assistant', text, activeSession ?? undefined, schedulerAgentId);
         }
 
-        updateTaskAfterRun(task.id, nextRun, text, 'success');
+        // Fire-and-forget memory extraction. Synthetic chat_id when this agent has no
+        // user-facing Telegram chat (specialists usually don't). Memory is valuable
+        // even on background tasks — they produce content worth remembering, just
+        // grouped under a per-agent synthetic thread instead of a real user chat.
+        const ingestChatId = ALLOWED_CHAT_ID || `scheduled-${schedulerAgentId}`;
+        void ingestConversationTurn(ingestChatId, `[Scheduled task]: ${task.prompt}`, text, schedulerAgentId).catch((err) => {
+          logger.error({ err, taskId: task.id }, 'Memory ingestion fire-and-forget failed (scheduled task)');
+        });
+
+        updateTaskAfterRun(task.id, nextRun, resultText, lastStatus);
 
         logger.info({ taskId: task.id, nextRun }, 'Task complete, next run scheduled');
       } catch (err) {
@@ -168,7 +198,17 @@ async function runDueMissionTasks(): Promise<void> {
     }, 5_000);
 
     try {
-      const result = await runAgent(mission.prompt, undefined, () => {}, undefined, undefined, abortController, undefined, agentMcpAllowlist);
+      const result = await runAgent(
+        mission.prompt,
+        undefined,
+        () => {},
+        undefined,
+        agentDefaultModel,
+        abortController,
+        undefined,
+        agentMcpAllowlist,
+        getSelectedProviderConfig(),
+      );
       clearTimeout(timeout);
       clearInterval(cancelPoll);
 
@@ -218,6 +258,14 @@ async function runDueMissionTasks(): Promise<void> {
           logConversationTurn(ALLOWED_CHAT_ID, 'user', '[Mission task: ' + mission.title + ']: ' + mission.prompt, activeSession ?? undefined, schedulerAgentId);
           logConversationTurn(ALLOWED_CHAT_ID, 'assistant', text, activeSession ?? undefined, schedulerAgentId);
         }
+
+        // Fire-and-forget memory extraction. Synthetic chat_id when this agent has no
+        // user-facing Telegram chat (specialists usually don't). Mission tasks produce
+        // content worth remembering, grouped under a per-agent synthetic thread.
+        const ingestChatId = ALLOWED_CHAT_ID || `mission-${schedulerAgentId}`;
+        void ingestConversationTurn(ingestChatId, '[Mission task: ' + mission.title + ']: ' + mission.prompt, text, schedulerAgentId).catch((err) => {
+          logger.error({ err, missionId: mission.id }, 'Memory ingestion fire-and-forget failed (mission task)');
+        });
       }
     } catch (err) {
       clearTimeout(timeout);

@@ -1,21 +1,111 @@
-# RFC: SDK Engine — Direct API Backend for ClaudeClaw
+# RFC: Agent Provider Engine
 
 ## Status
 
-Draft
+Implemented for current provider paths. Future direct Anthropic SDK backend remains a follow-up.
 
 ## Summary
 
-Add an alternative engine backend that calls the **Anthropic Messages API** directly
-(via `@anthropic-ai/sdk`), bypassing the `claude` CLI subprocess. Configurable via
-`ENGINE=sdk` in `.env` (default remains `ENGINE=cli`).
+ClaudeClaw now routes provider invocation through `src/agent-engine/`: one turn in,
+normalized events out. The shipped engine seam localizes the current Claude Agent SDK
+path and all ACP provider paths behind adapters:
 
-The current architecture spawns a `claude` CLI process per query through
-`@anthropic-ai/claude-agent-sdk`. The SDK Engine would call the Anthropic API in-process,
-giving ClaudeClaw direct control over the agentic loop, tool execution, token accounting,
-and streaming — at the cost of re-implementing some of the CLI's built-in capabilities.
+- `ClaudeSdkEngineAdapter` wraps `@anthropic-ai/claude-agent-sdk`.
+- `AcpEngineAdapter` wraps OpenCode, Gemini CLI, Codex via `codex-acp`, and custom ACP commands.
+- `EngineFactory` selects the adapter from `ProviderConfig`.
+- `runAgent()` and `runAgentWithRetry()` remain compatibility wrappers over the engine.
 
-Estimated scope: ~600 lines of new code across 6-8 files, delivered in 5 phases.
+The first implementation does **not** replace Claude Code's subprocess model. It creates
+the provider seam needed to add a future direct `@anthropic-ai/sdk` backend without
+touching Telegram, dashboard, scheduler, mission, war-room, voice, or memory ingestion
+callers.
+
+The older direct-SDK design notes below are retained as future-backend context.
+
+## Implemented Interface
+
+The current public engine shape lives in `src/agent-engine/types.ts`:
+
+```typescript
+export interface AgentEngine {
+  invoke(input: AgentTurnInput): AsyncIterable<AgentEngineEvent>;
+}
+
+export interface AgentTurnInput {
+  prompt: string;
+  provider: ProviderConfig;
+  sessionId?: string;
+  cwd: string;
+  model?: string;
+  runtimeMode?: string;
+  thinkingMode?: string;
+  effort?: 'low' | 'medium' | 'high' | 'max';
+  thinking?: { type: 'adaptive' } | { type: 'enabled'; budgetTokens?: number } | { type: 'disabled' };
+  maxTurns?: number;
+  permissionMode?: 'default' | 'bypassPermissions' | string;
+  allowDangerouslySkipPermissions?: boolean;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  mcpServers?: Record<string, McpStdioConfig>;
+  abortController?: AbortController;
+  env?: Record<string, string | undefined>;
+  settingSources?: string[];
+  includePartialMessages?: boolean;
+}
+
+export type AgentEngineEvent =
+  | { type: 'session'; sessionId: string }
+  | { type: 'text_delta'; delta: string; accumulatedText: string }
+  | { type: 'progress'; progress: AgentEngineProgressEvent }
+  | { type: 'usage'; usage: AgentEngineUsage }
+  | { type: 'compact'; preCompactTokens: number | null; trigger?: string }
+  | { type: 'result'; text: string | null; usage: AgentEngineUsage | null }
+  | { type: 'aborted'; text: string | null; sessionId?: string; usage: AgentEngineUsage | null }
+  | { type: 'error'; error: unknown };
+```
+
+## Implemented Provider Flow
+
+```
+runAgent / router / gate / warmup / voice bridge / memory ingestion / war-room turn
+    │
+    ▼
+EngineFactory.forProvider(provider)
+    │
+    ├── claude                 → ClaudeSdkEngineAdapter
+    └── opencode/gemini/codex/acp → AcpEngineAdapter
+    │
+    ▼
+AgentEngine.invoke(input)
+    │
+    ├── session      normalized provider session id
+    ├── text_delta   accumulated stream text
+    ├── progress     tool, plan, and task progress
+    ├── compact      Claude context compaction boundary
+    ├── usage        normalized token/cost accounting
+    ├── result       final text
+    └── aborted      cancellation result
+```
+
+ACP command resolution is centralized:
+
+- `opencode` -> `opencode acp`
+- `gemini` -> `gemini --acp`
+- `codex` -> `codex-acp`
+- `acp` -> custom `command` plus `args`
+
+The dashboard also exposes provider configuration through the engine seam:
+
+- `/api/providers/models` lists built-in model choices and accepts provider-specific custom model ids.
+- `/api/providers/runtime-options` probes ACP `session/configuration` by starting a no-prompt session and reading advertised `configOptions`.
+- Thinking levels are saved as raw provider values, for example Codex `low`, `medium`, `high`, `xhigh`.
+- Speed-like modes are shown only when they are actually speed options. ACP access/build/plan modes are not shown in Settings.
+- ACP providers are run in full-access mode when they advertise a full-access mode, matching Claude Code's non-interactive `bypassPermissions` behavior.
+- Codex defaults to `gpt-5.5` and uses the bundled `@zed-industries/codex-acp` adapter on the local `node_modules/.bin` PATH.
+
+The engine preserves provider-prefixed sessions through the existing `provider.ts`
+helpers. Legacy unprefixed Claude sessions remain valid for Claude, while switching
+providers starts fresh for the new provider namespace.
 
 ---
 
@@ -60,7 +150,7 @@ Direct API access enables features that are hard or impossible with the CLI wrap
 
 ---
 
-## Current Architecture
+## Current Implemented Architecture
 
 ```
 Telegram message
@@ -74,51 +164,52 @@ bot.ts  handleMessage()
     ▼
 agent.ts  runAgent()
     │
-    ├── readEnvFile()           → extracts CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY
-    ├── builds sdkEnv           → process.env + secrets
+    ├── loads MCP servers and scrubbed provider env
+    ├── resolves provider-prefixed session ids
+    ├── maps Claude model/effort/thinking options
+    ▼
+EngineFactory.forProvider(provider)
+    │
+    ├── ClaudeSdkEngineAdapter
+    │   └── @anthropic-ai/claude-agent-sdk query()
+    │       └── spawns `claude` CLI subprocess
+    │
+    └── AcpEngineAdapter
+        ├── opencode → `opencode acp`
+        ├── gemini   → `gemini --acp`
+        ├── codex    → `codex-acp`
+        └── acp      → custom command + args
     │
     ▼
-@anthropic-ai/claude-agent-sdk  query()
-    │
-    ├── spawns `claude` CLI subprocess
-    ├── passes: prompt, cwd, resume, settingSources, permissionMode, env, model
-    │
-    ▼
-claude CLI subprocess
-    ├── loads CLAUDE.md from cwd (settingSources: ['project', 'user'])
-    ├── loads ~/.claude/skills/
-    ├── loads MCP servers from settings
-    ├── manages conversation session (resume: sessionId)
-    ├── handles all tools internally (Bash, Read, Write, Edit, Glob, Grep, etc.)
-    ├── handles context compaction automatically
-    │
-    ▼
-Events stream back to agent.ts:
-    ├── system/init          → session_id
-    ├── system/compact       → context was compacted
-    ├── assistant            → per-call token usage
-    ├── tool_progress        → tool execution status
-    ├── system/task_started  → sub-agent started
-    ├── system/task_notification → sub-agent finished
-    └── result               → final text + cumulative usage + cost
+Normalized AgentEngineEvent stream:
+    ├── session
+    ├── text_delta
+    ├── progress
+    ├── usage
+    ├── compact
+    ├── result
+    └── aborted
 ```
 
 ### Key observations
 
-1. **Session management is opaque**: The CLI manages session files internally.
-   ClaudeClaw only stores the `session_id` string in SQLite (`sessions` table)
-   and passes it back via `resume`.
+1. **Provider session management is opaque**: Claude Code and ACP providers manage
+   their own session state. ClaudeClaw stores the provider session id string in
+   SQLite and prefixes it with the provider type before persistence so switching
+   providers starts/resumes the correct provider namespace.
 
-2. **Tool execution is invisible**: ClaudeClaw sees `tool_progress` events with
-   tool names but never the tool inputs/outputs. The CLI handles the full
-   tool-use loop (tool_use block → execute → tool_result → next API call).
+2. **Tool execution remains provider-owned**: ClaudeClaw receives normalized
+   progress events but does not execute provider tools itself. Claude Code and
+   ACP providers own their tool loops, permissions, and low-level event formats.
 
-3. **Auth is delegated**: The CLI reads OAuth from `~/.claude/` or uses
-   `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` from the environment.
+3. **Auth is delegated**: Claude Code reads OAuth from `~/.claude/` or uses
+   explicit Claude credentials. ACP providers read their own auth/config files.
+   ClaudeClaw does not store OpenCode, Gemini, Codex, or custom ACP API keys.
 
-4. **System prompt is implicit**: CLAUDE.md is loaded by the CLI from `cwd`.
-   ClaudeClaw's `agentSystemPrompt` is prepended to the user message, not
-   passed as a system prompt parameter.
+4. **System prompt loading varies by provider**: Claude Code loads CLAUDE.md,
+   skills, and MCP settings through the Agent SDK `settingSources` path. ACP
+   providers receive cwd, MCP settings, model, thinking, and session config through
+   ACP where supported.
 
 ---
 

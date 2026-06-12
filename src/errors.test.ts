@@ -108,6 +108,23 @@ describe('classifyError', () => {
     expect(classified.recovery.shouldRetry).toBe(true);
   });
 
+  it('classifies Codex ACP missing command with Codex-specific guidance', () => {
+    const err = new Error('Failed to start ACP provider command "codex-acp": spawn codex-acp ENOENT.');
+    const classified = classifyError(err);
+    expect(classified.category).toBe('subprocess_crash');
+    expect(classified.recovery.shouldRetry).toBe(false);
+    expect(classified.recovery.userMessage).toContain('Codex ACP');
+    expect(classified.recovery.userMessage).toContain('signed-in Codex CLI');
+  });
+
+  it('classifies custom ACP missing command without blaming OpenCode', () => {
+    const err = new Error('Failed to start ACP provider command "my-agent": spawn my-agent ENOENT.');
+    const classified = classifyError(err);
+    expect(classified.category).toBe('subprocess_crash');
+    expect(classified.recovery.userMessage).toContain('my-agent');
+    expect(classified.recovery.userMessage).not.toContain('OpenCode');
+  });
+
   // ── Unknown errors ──────────────────────────────────────────────────
 
   it('classifies unknown errors as unknown', () => {

@@ -4,6 +4,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { getMainProviderConfig, getProviderDisplay } from '../src/provider.js';
 
 // ── ANSI helpers ────────────────────────────────────────────────────────────
 const c = {
@@ -31,6 +32,16 @@ function warn(msg: string) {
 }
 function fail(msg: string) {
   console.log(`  ${c.red}✗${c.reset}  ${msg}`);
+}
+
+function commandExists(command: string): boolean {
+  const check = process.platform === 'win32' ? `where ${command}` : `which ${command}`;
+  try {
+    execSync(check, { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function parseEnvFile(filePath: string): Record<string, string> {
@@ -73,26 +84,41 @@ async function main() {
     fail(`Node ${nodeVersion} (20+ required)`);
   }
 
-  // Claude CLI
-  const claudeCmd = process.platform === 'win32' ? 'where claude' : 'which claude';
-  try {
-    execSync(claudeCmd, { stdio: 'pipe' });
-    let claudeVersion = '';
-    try {
-      claudeVersion = execSync('claude --version', { stdio: 'pipe' })
-        .toString()
-        .trim();
-    } catch {
-      // version check failed
-    }
-    ok(`Claude CLI ${claudeVersion}`);
-  } catch {
-    fail('Claude CLI not found');
-  }
-
   // .env
   const envPath = path.join(PROJECT_ROOT, '.env');
   const env = parseEnvFile(envPath);
+
+  // Agent provider
+  const provider = getMainProviderConfig();
+  const providerLabel = getProviderDisplay(provider);
+  if (provider.type === 'claude') {
+    if (commandExists('claude')) {
+      let claudeVersion = '';
+      try {
+        claudeVersion = execSync('claude --version', { stdio: 'pipe' })
+          .toString()
+          .trim();
+      } catch {
+        // version check failed
+      }
+      ok(`Agent provider: ${providerLabel}${claudeVersion ? ` (${claudeVersion})` : ''}`);
+    } else {
+      fail('Agent provider: Claude CLI not found');
+    }
+  } else if (provider.type === 'opencode') {
+    if (commandExists('opencode')) ok(`Agent provider: ${providerLabel}`);
+    else fail('Agent provider: OpenCode CLI not found');
+  } else if (provider.type === 'gemini') {
+    if (commandExists('gemini')) ok(`Agent provider: ${providerLabel}`);
+    else fail('Agent provider: Gemini CLI not found');
+  } else if (provider.type === 'codex') {
+    if (commandExists('codex-acp')) ok(`Agent provider: ${providerLabel}`);
+    else fail('Agent provider: codex-acp adapter not found');
+  } else if (provider.command && commandExists(provider.command)) {
+    ok(`Agent provider: ${providerLabel}`);
+  } else {
+    fail(`Agent provider: ${providerLabel} not found`);
+  }
 
   // Bot token
   if (env.TELEGRAM_BOT_TOKEN) {
@@ -211,16 +237,17 @@ async function main() {
 
   // Determine overall status
   const hasToken = !!env.TELEGRAM_BOT_TOKEN;
-  const hasClaude = (() => {
-    try {
-      execSync('which claude', { stdio: 'pipe' });
-      return true;
-    } catch {
-      return false;
-    }
-  })();
+  const hasProvider = provider.type === 'claude'
+    ? commandExists('claude')
+    : provider.type === 'opencode'
+      ? commandExists('opencode')
+      : provider.type === 'gemini'
+        ? commandExists('gemini')
+        : provider.type === 'codex'
+          ? commandExists('codex-acp')
+          : !!provider.command && commandExists(provider.command);
 
-  if (hasToken && hasClaude && nodeMajor >= 20) {
+  if (hasToken && hasProvider && nodeMajor >= 20) {
     console.log(`  ${c.green}${c.bold}All systems go.${c.reset}`);
   } else {
     console.log(

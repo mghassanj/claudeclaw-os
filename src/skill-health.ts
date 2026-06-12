@@ -116,7 +116,7 @@ function execWithTimeout(command: string, timeoutMs: number): Promise<ExecResult
     const doResolve = (v: ExecResult) => { if (!settled) { settled = true; resolve(v); } };
     const doReject = (e: Error) => { if (!settled) { settled = true; reject(e); } };
 
-    const child = exec(command, { timeout: timeoutMs }, (error, stdout, stderr) => {
+    const child = exec(command, { timeout: timeoutMs, windowsHide: true }, (error, stdout, stderr) => {
       if (error && error.killed) {
         doReject(new TimeoutError());
         return;

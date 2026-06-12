@@ -13,6 +13,8 @@ ACTION=$1
 AGENT_ID=$2
 PROJECT_DIR=$(pwd)
 NODE_PATH=$(which node)
+NODE_BIN_DIR=$(dirname "$NODE_PATH")
+SERVICE_PATH="${NODE_BIN_DIR}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 if [ -z "$ACTION" ] || [ -z "$AGENT_ID" ]; then
   echo "Usage: agent-service.sh <install|uninstall> <agent-id>"
@@ -45,6 +47,13 @@ if [ "$(uname)" = "Darwin" ]; then
   </array>
   <key>WorkingDirectory</key>
   <string>${PROJECT_DIR}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${SERVICE_PATH}</string>
+    <key>HOME</key>
+    <string>${HOME}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -87,6 +96,7 @@ After=network.target
 Type=simple
 ExecStart=${NODE_PATH} ${PROJECT_DIR}/dist/index.js --agent ${AGENT_ID}
 WorkingDirectory=${PROJECT_DIR}
+Environment=PATH=${SERVICE_PATH}
 Restart=always
 RestartSec=10
 

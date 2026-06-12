@@ -110,9 +110,36 @@ const CONTEXT_PATTERNS = [
   'token limit',
 ];
 
+const COMMAND_NOT_FOUND_PATTERNS = [
+  'enoent',
+  'command not found',
+  'failed to start acp provider command',
+];
+
 function matchesAny(text: string, patterns: string[]): boolean {
   const lower = text.toLowerCase();
   return patterns.some((p) => lower.includes(p));
+}
+
+function commandFromStartError(text: string): string | null {
+  const match = text.match(/Failed to start ACP provider command "([^"]+)"/i);
+  return match?.[1] ?? null;
+}
+
+function providerStartMessage(command: string | null): string {
+  if (command === 'opencode') {
+    return 'OpenCode could not be started. Make sure `opencode` is installed and available on PATH for the ClaudeClaw service.';
+  }
+  if (command === 'gemini') {
+    return 'Gemini CLI could not be started. Make sure `gemini` is installed, authenticated, and available on PATH for the ClaudeClaw service.';
+  }
+  if (command === 'codex-acp') {
+    return 'Codex ACP could not be started. ClaudeClaw uses `codex-acp` to connect to your existing signed-in Codex CLI account. Run `codex` once to confirm you are signed in, then reinstall dependencies and restart ClaudeClaw if the adapter is missing.';
+  }
+  if (command) {
+    return `ACP provider command \`${command}\` could not be started. Make sure it is installed and available on PATH for the ClaudeClaw service.`;
+  }
+  return 'ACP provider could not be started. Make sure the selected provider command is installed and available on PATH for the ClaudeClaw service.';
 }
 
 // ── Classification ──────────────────────────────────────────────────
@@ -158,6 +185,16 @@ export function classifyError(err: unknown, contextTokens?: number): AgentError 
       shouldSwitchModel: false,
       retryAfterMs: 2000,
       userMessage: 'Claude Code subprocess exited unexpectedly. Retrying...',
+    }, raw);
+  }
+
+  if (matchesAny(text, COMMAND_NOT_FOUND_PATTERNS)) {
+    return new AgentError('subprocess_crash', {
+      shouldRetry: false,
+      shouldNewChat: false,
+      shouldSwitchModel: false,
+      retryAfterMs: 0,
+      userMessage: providerStartMessage(commandFromStartError(text)),
     }, raw);
   }
 

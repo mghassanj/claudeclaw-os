@@ -9,7 +9,7 @@ import { VoicesPane } from '@/pages/Voices';
 import { StandupConfigPane } from '@/pages/StandupConfig';
 import { useFetch } from '@/lib/useFetch';
 import { apiPost, dashboardToken, chatId, legacyUrl } from '@/lib/api';
-import { formatRelativeTime } from '@/lib/format';
+import { formatRelativeTime, resolveAgentName } from '@/lib/format';
 
 // 'voices' is the embedded voice configuration tab — used to be its own
 // page at /voices, now folded under War Room since it conceptually
@@ -255,7 +255,7 @@ function VoicePane() {
               <span class="text-[var(--color-text-muted)] tabular-nums">{formatRelativeTime(m.started_at)}</span>
               <span class="text-[var(--color-text-faint)]">·</span>
               <span class="text-[var(--color-text-muted)]">{m.mode}</span>
-              {m.pinned_agent && (<><span class="text-[var(--color-text-faint)]">·</span><span class="text-[var(--color-text)]">@{m.pinned_agent}</span></>)}
+              {m.pinned_agent && (<><span class="text-[var(--color-text-faint)]">·</span><span class="text-[var(--color-text)]">@{resolveAgentName(m.pinned_agent)}</span></>)}
               <span class="text-[var(--color-text-faint)]">·</span>
               <span class="text-[var(--color-text-muted)] tabular-nums">{m.entry_count} turns</span>
               {m.duration_s !== null && (<><span class="text-[var(--color-text-faint)]">·</span><span class="text-[var(--color-text-muted)] tabular-nums">{Math.round(m.duration_s / 60)}m</span></>)}
@@ -328,7 +328,7 @@ function TextPane() {
           {list.map((m) => (
             <a
               key={m.id}
-              href={legacyUrl(`/warroom/text?token=${encodeURIComponent(dashboardToken)}&meetingId=${encodeURIComponent(m.id)}&chatId=${encodeURIComponent(chatId)}`)}
+              href={legacyUrl(`/warroom/text?token=${encodeURIComponent(dashboardToken)}&meetingId=${encodeURIComponent(m.id)}&chatId=${encodeURIComponent(chatId)}${m.ended_at !== null ? '&archive=1' : ''}`)}
               class="block bg-[var(--color-card)] border border-[var(--color-border)] hover:border-[var(--color-border-strong)] rounded-lg p-3 transition-colors"
             >
               <div class="flex items-center gap-2 mb-1">

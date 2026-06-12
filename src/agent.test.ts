@@ -14,6 +14,12 @@ vi.mock('./config.js', () => ({
   AGENT_MAX_TURNS: 30,
   PROJECT_ROOT: '/tmp/test',
   agentCwd: undefined,
+  agentSystemPrompt: undefined,
+  ENABLE_ACP: true,
+  DEFAULT_CLAUDE_MODEL: 'claude-opus-4-8',
+  CLAUDE_MODEL_OPUS: 'claude-opus-4-8',
+  CLAUDE_MODEL_SONNET: 'claude-sonnet-4-6',
+  CLAUDE_MODEL_HAIKU: 'claude-haiku-4-5',
 }));
 
 vi.mock('./logger.js', () => ({
@@ -30,6 +36,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockQuery = query as any;
 const noop = () => {};
+const claudeProvider = { type: 'claude' as const };
 
 /**
  * Create a mock async iterable that yields events then closes.
@@ -64,7 +71,7 @@ describe('runAgentWithRetry', () => {
       resultEvent('Hello!'),
     ])() as any);
 
-    const result = await runAgentWithRetry('hi', undefined, noop);
+    const result = await runAgentWithRetry('hi', undefined, noop, undefined, undefined, undefined, undefined, undefined, undefined, undefined, claudeProvider);
     expect(result.text).toBe('Hello!');
     expect(mockQuery).toHaveBeenCalledTimes(1);
   });
@@ -90,7 +97,7 @@ describe('runAgentWithRetry', () => {
 
     const onRetry = vi.fn();
     const result = await runAgentWithRetry(
-      'hi', undefined, noop, undefined, undefined, undefined, undefined, onRetry,
+      'hi', undefined, noop, undefined, undefined, undefined, undefined, onRetry, undefined, undefined, claudeProvider,
     );
 
     expect(result.text).toBe('Recovered!');
@@ -110,7 +117,7 @@ describe('runAgentWithRetry', () => {
 
     mockQuery.mockImplementation(() => { throw authError; });
 
-    await expect(runAgentWithRetry('hi', undefined, noop)).rejects.toThrow(AgentError);
+    await expect(runAgentWithRetry('hi', undefined, noop, undefined, undefined, undefined, undefined, undefined, undefined, undefined, claudeProvider)).rejects.toThrow(AgentError);
     expect(mockQuery).toHaveBeenCalledTimes(1);
   });
 
@@ -127,7 +134,7 @@ describe('runAgentWithRetry', () => {
 
     const onRetry = vi.fn();
     await expect(
-      runAgentWithRetry('hi', undefined, noop, undefined, undefined, undefined, undefined, onRetry),
+      runAgentWithRetry('hi', undefined, noop, undefined, undefined, undefined, undefined, onRetry, undefined, undefined, claudeProvider),
     ).rejects.toThrow(AgentError);
 
     // 1 initial + 2 retries = 3 total calls
@@ -152,7 +159,7 @@ describe('runAgentWithRetry', () => {
     });
 
     const result = await runAgentWithRetry(
-      'hi', undefined, noop, undefined, undefined, abortCtrl,
+      'hi', undefined, noop, undefined, undefined, abortCtrl, undefined, undefined, undefined, undefined, claudeProvider,
     );
     expect(result.aborted).toBe(true);
     expect(mockQuery).toHaveBeenCalledTimes(1);
@@ -163,7 +170,7 @@ describe('runAgentWithRetry', () => {
     mockQuery.mockImplementation(() => { throw new TypeError('unexpected'); });
 
     await expect(
-      runAgentWithRetry('hi', undefined, noop),
+      runAgentWithRetry('hi', undefined, noop, undefined, undefined, undefined, undefined, undefined, undefined, undefined, claudeProvider),
     ).rejects.toThrow(AgentError);
     // classifyError wraps TypeError into AgentError('unknown') which is not retryable
     expect(mockQuery).toHaveBeenCalledTimes(1);
@@ -194,7 +201,7 @@ describe('runAgentWithRetry', () => {
     const result = await runAgentWithRetry(
       'hi', undefined, noop, undefined,
       'claude-opus-4-6', undefined, undefined, undefined,
-      ['claude-sonnet-4-6', 'claude-haiku-4-5'],
+      ['claude-sonnet-4-6', 'claude-haiku-4-5'], undefined, claudeProvider,
     );
 
     expect(result.text).toBe('Fallback worked');

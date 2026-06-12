@@ -13,22 +13,60 @@
 // Env vars are set by `src/test-env-setup.ts` (vitest setupFiles) so they
 // land BEFORE config.ts evaluates at import time.
 
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import yaml from 'js-yaml';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+
+// Provider preflight (src/provider.ts) shells out to `where`/`which` to test
+// PATH presence. Contract tests assert HTTP response shape and must not depend
+// on which CLIs happen to be installed on the CI host, so stub spawnSync to
+// claim every command exists. Other child_process exports pass through so we
+// don't break unrelated modules (bot.ts execFile, voice.ts execFile, etc.).
+// dashboard.ts uses spawnSync only for `opencode models`; an empty stdout
+// there is already a handled real-world case, so the stub is safe.
+vi.mock('child_process', async () => {
+  const actual = await vi.importActual<typeof import('child_process')>('child_process');
+  return {
+    ...actual,
+    spawnSync: vi.fn((_lookup: string, args: string[] = []) => ({
+      status: args[0] === 'missing-tool' ? 1 : 0,
+      stdout: '',
+      stderr: '',
+    })),
+  };
+});
+
 import { _initTestDatabase } from './db.js';
 import { buildDashboardApp } from './dashboard.js';
+import { STORE_DIR, CLAUDECLAW_CONFIG } from './config.js';
 import type { Hono } from 'hono';
 
 const TOKEN = 'test-contract-token';
 const Q = '?token=' + TOKEN;
 
 let app: Hono;
+const mainConfigPath = path.join(STORE_DIR, 'main-config.json');
+let originalMainConfig: string | null = null;
 
 beforeAll(() => {
+  originalMainConfig = fs.existsSync(mainConfigPath)
+    ? fs.readFileSync(mainConfigPath, 'utf-8')
+    : null;
   app = buildDashboardApp(undefined) as unknown as Hono;
 });
 
 beforeEach(() => {
   _initTestDatabase();
+});
+
+afterEach(() => {
+  if (originalMainConfig === null) {
+    try { fs.unlinkSync(mainConfigPath); } catch { /* absent */ }
+  } else {
+    fs.mkdirSync(path.dirname(mainConfigPath), { recursive: true });
+    fs.writeFileSync(mainConfigPath, originalMainConfig, 'utf-8');
+  }
 });
 
 async function get(path: string) {
@@ -400,9 +438,11 @@ describe('GET /api/security/status', () => {
 });
 
 describe('GET /api/chat/history', () => {
-  it('rejects missing chatId with 400', async () => {
+  it('defaults missing chatId to the configured dashboard chat', async () => {
     const res = await get('/api/chat/history');
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    expect(body).toMatchObject({ turns: expect.any(Array) });
   });
 
   it('returns { turns: [] } with chatId', async () => {
@@ -445,6 +485,114 @@ describe('PATCH /api/agents/:id/model', () => {
       agent: 'main',
       model: 'claude-sonnet-4-6',
       restartRequired: false,
+    });
+  });
+});
+
+describe('provider selection endpoints', () => {
+  it('reports selectable Gemini and Codex model providers', async () => {
+    const geminiRes = await get('/api/providers/models?provider=gemini');
+    expect(geminiRes.status).toBe(200);
+    expect(await jsonOf(geminiRes)).toMatchObject({
+      provider: 'gemini',
+      defaultModel: expect.any(String),
+      selectable: true,
+      allowCustom: true,
+    });
+
+    const codexRes = await get('/api/providers/models?provider=codex');
+    expect(codexRes.status).toBe(200);
+    expect(await jsonOf(codexRes)).toMatchObject({
+      provider: 'codex',
+      defaultModel: expect.any(String),
+      selectable: true,
+      allowCustom: true,
+    });
+  });
+
+  it('updates main to a built-in ACP provider without restart', async () => {
+    const res = await app.request('/api/agents/main/provider' + Q, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: { type: 'gemini' } }),
+    });
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({
+      ok: true,
+      agent: 'main',
+      provider: { type: 'gemini' },
+      restartRequired: false,
+    });
+  });
+
+  it('updates main provider with a selected model without restart', async () => {
+    const res = await app.request('/api/agents/main/provider' + Q, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: { type: 'codex', model: 'gpt-5.3-codex' } }),
+    });
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({
+      ok: true,
+      agent: 'main',
+      provider: { type: 'codex', model: 'gpt-5.3-codex' },
+      restartRequired: false,
+    });
+  });
+
+  it('reports provider-specific runtime options', async () => {
+    const claudeRes = await get('/api/providers/runtime-options?provider=claude');
+    expect(claudeRes.status).toBe(200);
+    expect(await jsonOf(claudeRes)).toMatchObject({
+      provider: 'claude',
+      source: 'static',
+      modeOptions: expect.arrayContaining([expect.objectContaining({ id: 'max' })]),
+      thinkingOptions: expect.arrayContaining([expect.objectContaining({ id: 'auto' })]),
+    });
+  });
+
+  it('rejects custom ACP without a command', async () => {
+    const res = await app.request('/api/agents/main/provider' + Q, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: { type: 'acp' } }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.stringMatching(/command/i) });
+  });
+
+  it('validates provider config during agent creation before writing config', async () => {
+    const res = await app.request('/api/agents/create' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'provider-create',
+        name: 'Provider Create',
+        description: 'test agent',
+        botToken: '123:fake',
+        provider: { type: 'acp' },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.stringMatching(/command/i) });
+  });
+
+  it('preflights provider availability during agent creation', async () => {
+    const res = await app.request('/api/agents/create' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'provider-missing',
+        name: 'Provider Missing',
+        description: 'test agent',
+        botToken: '123:fake',
+        provider: { type: 'acp', command: 'missing-tool' },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({
+      error: expect.stringContaining('missing-tool'),
+      setupHint: expect.any(String),
     });
   });
 });
@@ -555,6 +703,45 @@ describe('GET /api/warroom/agents', () => {
       name: expect.any(String),
       description: expect.any(String),
     });
+  });
+});
+
+describe('display name resolution', () => {
+  // Write a main agent.yaml with name: Felix into the sandboxed
+  // CLAUDECLAW_CONFIG so the dashboard resolves main's display name
+  // from config instead of falling back to the hardcoded 'Main'.
+  const mainAgentDir = path.join(CLAUDECLAW_CONFIG, 'agents', 'main');
+  const mainAgentYaml = path.join(mainAgentDir, 'agent.yaml');
+
+  beforeAll(() => {
+    fs.mkdirSync(mainAgentDir, { recursive: true });
+    fs.writeFileSync(
+      mainAgentYaml,
+      yaml.dump({ name: 'Felix', description: 'Test hub agent' }),
+      'utf-8',
+    );
+  });
+
+  afterAll(() => {
+    try { fs.rmSync(mainAgentDir, { recursive: true, force: true }); } catch { /* ok */ }
+  });
+
+  it('GET /api/agents returns the configured name for main', async () => {
+    const res = await get('/api/agents');
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    const main = body.agents.find((a: { id: string }) => a.id === 'main');
+    expect(main).toBeDefined();
+    expect(main.name).toBe('Felix');
+  });
+
+  it('GET /api/warroom/agents returns the configured name for main', async () => {
+    const res = await get('/api/warroom/agents');
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    const main = body.agents.find((a: { id: string }) => a.id === 'main');
+    expect(main).toBeDefined();
+    expect(main.name).toBe('Felix');
   });
 });
 

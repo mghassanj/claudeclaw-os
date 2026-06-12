@@ -1,5 +1,18 @@
 import { describe, it, expect } from 'vitest';
-import { splitMessage, extractFileMarkers } from './bot.js';
+import { splitMessage, extractFileMarkers, modelStatusLine } from './bot.js';
+
+describe('modelStatusLine', () => {
+  it('reports Codex model instead of the OpenCode fallback text', () => {
+    expect(modelStatusLine({ type: 'codex', model: 'gpt-5.5' }, 'chat-1')).toBe('Model: gpt-5.5');
+  });
+
+  it('reports provider-specific defaults for non-Claude providers', () => {
+    expect(modelStatusLine({ type: 'codex' }, 'chat-1')).toBe('Model: Codex default');
+    expect(modelStatusLine({ type: 'gemini' }, 'chat-1')).toBe('Model: Gemini CLI default');
+    expect(modelStatusLine({ type: 'opencode' }, 'chat-1')).toBe('Model: OpenCode default');
+    expect(modelStatusLine({ type: 'acp', command: 'my-agent' }, 'chat-1')).toBe('Model: Provider default');
+  });
+});
 
 describe('splitMessage', () => {
   it('returns single-element array for short messages', () => {

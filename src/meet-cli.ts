@@ -28,10 +28,10 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
-import { getVenvPython, killProcess } from './platform.js';
+import { getVenvPython, IS_WINDOWS, killProcess } from './platform.js';
 
 import {
   initDatabase,
@@ -63,6 +63,13 @@ const PIKA_SCRIPT = path.join(
   'pikastreaming_videomeeting.py',
 );
 const WARROOM_VENV_PY = getVenvPython(path.join(PROJECT_ROOT, 'warroom', '.venv'));
+let _uvAvailable: boolean | null = null;
+function hasUv(): boolean {
+  if (_uvAvailable === null) {
+    try { _uvAvailable = spawnSync('uv', ['--version'], { stdio: 'pipe', windowsHide: true }).status === 0; } catch { _uvAvailable = false; }
+  }
+  return _uvAvailable;
+}
 const VOICE_BRIDGE_JS = path.join(PROJECT_ROOT, 'dist', 'agent-voice-bridge.js');
 const DAILY_AGENT_PY = path.join(PROJECT_ROOT, 'warroom', 'daily_agent.py');
 const DAILY_AGENT_LOG_DIR = os.tmpdir();
@@ -176,7 +183,11 @@ async function runPikaScript(args: string[], timeoutSec = 90): Promise<{
   if (!fs.existsSync(WARROOM_VENV_PY)) {
     throw new Error(
       `Warroom venv python not found at ${WARROOM_VENV_PY}. Create it with: ` +
-      `python3 -m venv warroom/.venv && warroom/.venv/bin/pip install -r warroom/requirements.txt`,
+      (hasUv()
+        ? `uv venv warroom/.venv && uv pip install --python warroom/.venv -r warroom/requirements.txt`
+        : IS_WINDOWS
+          ? `python -m venv warroom\\.venv && warroom\\.venv\\Scripts\\pip install -r warroom\\requirements.txt`
+          : `python3 -m venv warroom/.venv && warroom/.venv/bin/pip install -r warroom/requirements.txt`),
     );
   }
 
@@ -206,6 +217,7 @@ async function runPikaScript(args: string[], timeoutSec = 90): Promise<{
       cwd: PROJECT_ROOT,
       env: env as NodeJS.ProcessEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     let stdout = '';
@@ -262,7 +274,7 @@ async function synthesizeBrief(params: {
   contextHint?: string;
   briefId: string;
 }): Promise<{ path: string; fallback: boolean; content: string }> {
-  const briefPath = `/tmp/meeting_brief_${params.briefId}.txt`;
+  const briefPath = path.join(os.tmpdir(), `meeting_brief_${params.briefId}.txt`);
 
   if (!fs.existsSync(VOICE_BRIDGE_JS)) {
     const fallback = buildMinimalBrief(params);
@@ -301,6 +313,7 @@ async function synthesizeBrief(params: {
         cwd: PROJECT_ROOT,
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
       let stdout = '';
       let stderr = '';
@@ -536,7 +549,11 @@ async function cmdJoinDaily(): Promise<void> {
   if (!fs.existsSync(WARROOM_VENV_PY)) {
     die(
       `warroom venv python not found at ${WARROOM_VENV_PY}. Create it with: ` +
-      `python3 -m venv warroom/.venv && warroom/.venv/bin/pip install -r warroom/requirements.txt`,
+      (hasUv()
+        ? `uv venv warroom/.venv && uv pip install --python warroom/.venv -r warroom/requirements.txt`
+        : IS_WINDOWS
+          ? `python -m venv warroom\\.venv && warroom\\.venv\\Scripts\\pip install -r warroom\\requirements.txt`
+          : `python3 -m venv warroom/.venv && warroom/.venv/bin/pip install -r warroom/requirements.txt`),
     );
   }
 
@@ -650,6 +667,7 @@ async function cmdJoinDaily(): Promise<void> {
     env: subEnv as NodeJS.ProcessEnv,
     detached: true,
     stdio: ['ignore', 'pipe', logFd ?? 'ignore'],
+    windowsHide: true,
   });
 
   process.stderr.write(`[meet-cli] Spawned daily_agent pid=${child.pid}, log=${logPath}\n`);
@@ -855,7 +873,7 @@ Commands:
               [--room-name <slug>] [--ttl-sec <seconds>]
               (Requires DAILY_API_KEY and GOOGLE_API_KEY in .env)
   brief       Pre-flight research pipeline. Writes a system prompt file
-              to /tmp/meeting_brief_*.txt using the agent's full stack.
+              to <tmpdir>/meeting_brief_*.txt using the agent's full stack.
               --agent <id> --meet-url <url> [--context <hint>]
   leave       --session-id <id>
   list        [--active]
