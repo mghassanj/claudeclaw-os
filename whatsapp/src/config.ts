@@ -1,6 +1,7 @@
 export interface Config {
   enabled: boolean;
   selfReply: boolean;
+  selfChatEnabled: boolean;
   allowedGroups: string[];
   tiersEnabled: Set<string>;
   qrPort: number;
@@ -11,6 +12,7 @@ export interface Config {
 export function loadConfig(): Config {
   const enabled = (process.env.WHATSAPP_ENABLED ?? "false").toLowerCase() === "true";
   const selfReply = (process.env.WHATSAPP_SELF_REPLY ?? "false").toLowerCase() === "true";
+  const selfChatEnabled = (process.env.WHATSAPP_SELF_CHAT ?? "false").toLowerCase() === "true";
   const allowedGroups = (process.env.WHATSAPP_ALLOWED_GROUPS ?? "")
     .split(",").map(s => s.trim()).filter(Boolean);
   const tiersEnabled = new Set(
@@ -19,7 +21,7 @@ export function loadConfig(): Config {
   );
   const qrPort = parseInt(process.env.WHATSAPP_QR_PORT ?? "9334", 10);
   return {
-    enabled, selfReply, allowedGroups, tiersEnabled, qrPort,
+    enabled, selfReply, selfChatEnabled, allowedGroups, tiersEnabled, qrPort,
     isGroupAllowed: (g) => allowedGroups.includes(g),
     isTierEnabled: (t) => tiersEnabled.has(t),
   };

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import { buildClient } from "./client.js";
 import { startHealthServer } from "./healthcheck.js";
 import { currentConfig, reloadConfig } from "./config.js";
+import { wasSentByBot } from "./sent-registry.js";
 import { detectLang } from "./lang.js";
 import { composeReply } from "./reply-composer.js";
 import {
@@ -40,16 +41,31 @@ state.client.on("message_create", async (msg) => {
   try {
     console.log("[wa] msg event fired");
     const cfg = currentConfig();
-    // Loop prevention: skip the bot's own outbound replies
+    // Loop prevention: skip the bot's own outbound replies. The 🤖 text
+    // prefix covers text + captioned media; the sent-id registry also covers
+    // voice notes and uncaptioned media (which have no body to prefix).
     if (msg.fromMe && (msg.body ?? "").startsWith("\u{1F916}")) return;
-    // Self-reply gate: only process Mohamed's own messages if explicitly enabled
-    if (msg.fromMe && !cfg.selfReply) return;
+    if (msg.fromMe && wasSentByBot(msg.id._serialized)) return;
+
     const chat = await msg.getChat();
-    console.log("[wa] chat:", chat.isGroup ? "group" : "dm", "name=", (chat as any).name ?? "?");
-    if (!chat.isGroup) return;
     chatId = chat.id._serialized;
-    const groupName = (chat as any).name ?? "";
-    if (!cfg.isGroupAllowed(groupName)) return;
+    const selfId = (state.client.info as any)?.wid?._serialized as string | undefined;
+    const isSelfChat = !chat.isGroup && (
+      (!!selfId && chatId === selfId) || msg.from === msg.to
+    );
+    console.log("[wa] chat:", chat.isGroup ? "group" : isSelfChat ? "self" : "dm", "name=", (chat as any).name ?? "?");
+
+    if (isSelfChat) {
+      // Self-chat ("Message Yourself") — Mohamed's private assistant channel.
+      // Gated by WHATSAPP_SELF_CHAT so it can be toggled without a code change.
+      if (!cfg.selfChatEnabled) return;
+    } else {
+      // Group pilot flow: only process Mohamed's own messages if selfReply on.
+      if (msg.fromMe && !cfg.selfReply) return;
+      if (!chat.isGroup) return;
+      if (!cfg.isGroupAllowed((chat as any).name ?? "")) return;
+    }
+    const groupName = isSelfChat ? "Self Chat" : ((chat as any).name ?? "");
     console.log("[wa] group allowed");
 
     if (await alreadyReplied(chatId, msg.id._serialized)) return;
