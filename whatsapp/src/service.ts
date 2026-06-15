@@ -50,8 +50,24 @@ state.client.on("message_create", async (msg) => {
     const chat = await msg.getChat();
     chatId = chat.id._serialized;
     const selfId = (state.client.info as any)?.wid?._serialized as string | undefined;
+    const selfUser = (state.client.info as any)?.wid?.user as string | undefined;
+    const chatUser = (chat.id as any)?.user as string | undefined;
+    // The self-chat ("Message Yourself") uses WhatsApp's @lid namespace, whose
+    // id is unrelated to the phone number, so id/number comparisons fail.
+    // contact.isMe is the account-independent signal; WHATSAPP_SELF_LIDS is an
+    // explicit fallback (comma list of lid user-parts known to be self).
+    const selfLids = (process.env.WHATSAPP_SELF_LIDS ?? "")
+      .split(",").map((x) => x.trim()).filter(Boolean);
+    let contactIsMe = false;
+    if (!chat.isGroup) {
+      try { contactIsMe = !!((await chat.getContact()) as any)?.isMe; } catch { /* ignore */ }
+    }
     const isSelfChat = !chat.isGroup && (
-      (!!selfId && chatId === selfId) || msg.from === msg.to
+      contactIsMe ||
+      (!!selfId && chatId === selfId) ||
+      (!!selfUser && !!chatUser && selfUser === chatUser) ||
+      (!!chatUser && selfLids.includes(chatUser)) ||
+      (!!msg.from && msg.from === msg.to)
     );
     console.log("[wa] chat:", chat.isGroup ? "group" : isSelfChat ? "self" : "dm", "name=", (chat as any).name ?? "?");
 
