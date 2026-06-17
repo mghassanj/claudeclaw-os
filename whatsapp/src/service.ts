@@ -42,17 +42,31 @@ state.client.on("message_create", async (msg) => {
     const cfg = currentConfig();
     // Loop prevention: skip the bot's own outbound replies
     if (msg.fromMe && (msg.body ?? "").startsWith("\u{1F916}")) return;
-    // Self-reply gate: only process Mohamed's own messages if explicitly enabled
-    if (msg.fromMe && !cfg.selfReply) return;
+    // Self-reply gate: only process the bot account's own messages if explicitly enabled.
+    // This is the most common "I tested it myself and got no reply" cause: messages sent
+    // from the same WhatsApp account the bot runs on are fromMe and dropped by default.
+    if (msg.fromMe && !cfg.selfReply) {
+      console.log("[wa] skip: message is fromMe and WHATSAPP_SELF_REPLY is off — test from another number or set WHATSAPP_SELF_REPLY=true");
+      return;
+    }
     const chat = await msg.getChat();
     console.log("[wa] chat:", chat.isGroup ? "group" : "dm", "name=", (chat as any).name ?? "?");
-    if (!chat.isGroup) return;
+    if (!chat.isGroup) {
+      console.log("[wa] skip: not a group chat");
+      return;
+    }
     chatId = chat.id._serialized;
     const groupName = (chat as any).name ?? "";
-    if (!cfg.isGroupAllowed(groupName)) return;
+    if (!cfg.isGroupAllowed(groupName)) {
+      console.log(`[wa] skip: group not in WHATSAPP_ALLOWED_GROUPS — got "${groupName}", allowed=[${cfg.allowedGroups.join(", ")}]`);
+      return;
+    }
     console.log("[wa] group allowed");
 
-    if (await alreadyReplied(chatId, msg.id._serialized)) return;
+    if (await alreadyReplied(chatId, msg.id._serialized)) {
+      console.log("[wa] skip: already replied to this message");
+      return;
+    }
     console.log("[wa] not replied yet, processing");
 
     let inboundText = msg.body ?? "";
@@ -148,12 +162,18 @@ state.client.on("message_create", async (msg) => {
     let replyMediaUrl: string | null = null;
 
     if (!result.replyText) {
+      if (result.error) {
+        console.warn("[wa] no reply — agent run failed:", result.error);
+      } else {
+        console.log("[wa] no reply — agent stayed quiet (no error)");
+      }
       await recordReply({
         groupId: chatId, messageId: msg.id._serialized,
         chosenTier: result.chosenTier, toolsCalled: result.toolsCalled,
         sourcesCited: result.sourcesCited, replyText: null, replyMediaUrl: null,
         replyAt: new Date(), replyMsgId: null,
-        durationMs: result.durationMs, costEstimate: result.costEstimate, error: null,
+        durationMs: result.durationMs, costEstimate: result.costEstimate,
+        error: result.error,
       });
       return;
     }
