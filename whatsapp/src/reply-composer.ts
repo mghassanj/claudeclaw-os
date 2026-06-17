@@ -19,6 +19,13 @@ export interface ComposeResult {
   sourcesCited: string[];
   durationMs: number;
   costEstimate: number;
+  /**
+   * Set when the SDK run did NOT produce a usable reply: a non-success result
+   * subtype (error_max_turns / error_during_execution) or a thrown error.
+   * null on a clean success. Lets the caller distinguish "the agent failed"
+   * from "the agent deliberately stayed quiet" — both yield replyText === null.
+   */
+  error: string | null;
 }
 
 // NOTE: keep in sync — SYSTEM_PROMPT Rule 5b is the source-of-truth version; the canonical
@@ -312,11 +319,13 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
   let replyText = "";
   let chosenTier = "1";
   let costEstimate = 0;
+  let runError: string | null = null;
 
   // Generate a session ID for the SDKUserMessage wrapper (only used for image path)
   const sessionId = `wa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const prompt = buildPrompt(userPrompt, input.inlineImage, sessionId);
 
+  try {
   for await (const msg of query({
     prompt,
     options: {
@@ -420,11 +429,28 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
         }
       }
     }
-    if (msg.type === "result" && msg.subtype === "success") {
-      const r = msg as SDKResultSuccess;
-      replyText = r.result;
-      costEstimate = r.total_cost_usd;
+    if (msg.type === "result") {
+      const r = msg as any;
+      if (r.subtype === "success") {
+        replyText = (r as SDKResultSuccess).result;
+        costEstimate = r.total_cost_usd ?? 0;
+      } else {
+        // error_max_turns / error_during_execution etc. — the SDK ran but
+        // produced no usable answer. Record it so the caller doesn't mistake
+        // this for a deliberate no-reply.
+        runError = `sdk_result_${r.subtype}`;
+        costEstimate = r.total_cost_usd ?? costEstimate;
+        console.warn("[wa] composeReply non-success result:", r.subtype);
+      }
     }
+  }
+  } catch (e) {
+    // query() can throw before any result message (e.g. an MCP server failed to
+    // spawn, codewiki HTTP auth rejected, network down). Without this, the throw
+    // would unwind to the service handler and the customer would get silence
+    // with no recorded reason. Capture it so the failure is diagnosable.
+    runError = String((e as any)?.message ?? e).slice(0, 500);
+    console.error("[wa] composeReply query threw:", e);
   }
 
   const srcRegex = /Source:\s*(https?:\/\/\S+)/gi;
@@ -440,5 +466,6 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
     sourcesCited,
     durationMs: Date.now() - t0,
     costEstimate,
+    error: replyText ? null : runError,
   };
 }

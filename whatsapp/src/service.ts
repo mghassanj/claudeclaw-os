@@ -148,12 +148,18 @@ state.client.on("message_create", async (msg) => {
     let replyMediaUrl: string | null = null;
 
     if (!result.replyText) {
+      if (result.error) {
+        console.warn("[wa] no reply — agent run failed:", result.error);
+      } else {
+        console.log("[wa] no reply — agent stayed quiet (no error)");
+      }
       await recordReply({
         groupId: chatId, messageId: msg.id._serialized,
         chosenTier: result.chosenTier, toolsCalled: result.toolsCalled,
         sourcesCited: result.sourcesCited, replyText: null, replyMediaUrl: null,
         replyAt: new Date(), replyMsgId: null,
-        durationMs: result.durationMs, costEstimate: result.costEstimate, error: null,
+        durationMs: result.durationMs, costEstimate: result.costEstimate,
+        error: result.error,
       });
       return;
     }
