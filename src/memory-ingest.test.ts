@@ -1,9 +1,21 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('./gemini.js', () => ({
+// memory-ingest imports its fallback extractor from ./anthropic.js (the old
+// ./gemini.js mock no longer intercepted anything).
+vi.mock('./anthropic.js', () => ({
   generateContent: vi.fn(),
   parseJsonResponse: vi.fn(),
 }));
+
+vi.mock('./pa-intake.js', async () => {
+  const actual = await vi.importActual<typeof import('./pa-intake.js')>('./pa-intake.js');
+  return {
+    normalizeKind: actual.normalizeKind,
+    pinPreferenceMemory: vi.fn(),
+    recordCommitmentFromIntake: vi.fn(() => 7),
+    upsertPersonFromIntake: vi.fn(() => 3),
+  };
+});
 
 // Mock the Claude SDK so the new Anthropic-Haiku ingestion path doesn't
 // actually try to spawn a subprocess in tests. We force it to throw so
@@ -56,7 +68,8 @@ vi.mock('./logger.js', () => ({
 }));
 
 import { ingestConversationTurn } from './memory-ingest.js';
-import { generateContent, parseJsonResponse } from './gemini.js';
+import { generateContent, parseJsonResponse } from './anthropic.js';
+import { pinPreferenceMemory, recordCommitmentFromIntake, upsertPersonFromIntake } from './pa-intake.js';
 import { saveStructuredMemoryAtomic } from './db.js';
 
 const mockGenerateContent = vi.mocked(generateContent);
@@ -340,5 +353,80 @@ describe('ingestConversationTurn', () => {
     // The prompt should contain the truncated message, not the full 5000 chars
     expect(promptArg).not.toContain('x'.repeat(3000));
     expect(promptArg).toContain('x'.repeat(2000));
+  });
+});
+
+describe('typed intake', () => {
+  const mockPin = vi.mocked(pinPreferenceMemory);
+  const mockCommit = vi.mocked(recordCommitmentFromIntake);
+  const mockPerson = vi.mocked(upsertPersonFromIntake);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function extract(obj: Record<string, unknown>): void {
+    mockGenerateContent.mockResolvedValue(JSON.stringify(obj));
+    mockParseJson.mockReturnValue(obj);
+  }
+
+  it('prompt asks for a kind', async () => {
+    extract({ skip: true });
+    await ingestConversationTurn('chat1', 'a message long enough to process', 'ok');
+    const prompt = mockGenerateContent.mock.calls[0][0] as string;
+    expect(prompt).toContain('"kind": "fact" | "preference" | "person" | "commitment"');
+    expect(prompt).toContain('COMMITMENTS');
+  });
+
+  it('no kind = fact: saved exactly as before, no side effects', async () => {
+    extract({ skip: false, summary: 'Standing rule X', entities: [], topics: [], importance: 0.7 });
+    expect(await ingestConversationTurn('chat1', 'from now on always do X please', 'ok')).toBe(true);
+    expect(mockSave).toHaveBeenCalledTimes(1);
+    expect(mockPin).not.toHaveBeenCalled();
+    expect(mockCommit).not.toHaveBeenCalled();
+    expect(mockPerson).not.toHaveBeenCalled();
+  });
+
+  it('preference is saved and pinned', async () => {
+    extract({ kind: 'preference', summary: 'Reply in Najdi Arabic', entities: [], topics: [], importance: 0.9 });
+    expect(await ingestConversationTurn('chat1', 'always answer me in Najdi when I write Arabic', 'ok')).toBe(true);
+    expect(mockSave).toHaveBeenCalledTimes(1);
+    expect(mockPin).toHaveBeenCalledWith(1);
+  });
+
+  it('person upserts a contact and still saves the memory row', async () => {
+    const person = { name: 'Nora', relationship: 'client HR lead', language_pref: 'ar-najdi' };
+    extract({ kind: 'person', summary: 'Nora is the client HR lead', entities: ['Nora'], topics: [], importance: 0.7, person });
+    expect(await ingestConversationTurn('chat1', 'Nora is the HR lead at the client, talk to her in Najdi', 'noted')).toBe(true);
+    expect(mockPerson).toHaveBeenCalledWith(person);
+    expect(mockSave).toHaveBeenCalledTimes(1);
+  });
+
+  it('commitment becomes an unconfirmed open loop, not a memory row (even below 0.5)', async () => {
+    const commitment = { summary: 'Follow up with Nora on Thursday', due: '1d', contact_name: 'Nora' };
+    extract({ kind: 'commitment', summary: 'Follow up with Nora', entities: [], topics: [], importance: 0.3, commitment });
+    expect(await ingestConversationTurn('chat1', 'remind me to follow up with Nora tomorrow', 'will do')).toBe(true);
+    expect(mockCommit).toHaveBeenCalledWith(commitment, 'Follow up with Nora', 'main');
+    expect(mockSave).not.toHaveBeenCalled();
+  });
+
+  it('no contact/loop side effects for scheduled, mission or loop-fired turns, or other agents', async () => {
+    extract({ kind: 'commitment', summary: 'x', entities: [], topics: [], importance: 0.8, commitment: { summary: 'x' } });
+    expect(await ingestConversationTurn('chat1', '[Scheduled task]: remind Mohamed about rent', 'ok')).toBe(false);
+    expect(await ingestConversationTurn('chat1', '[Open loop #4 fired] new message from Nora', 'ok')).toBe(false);
+    expect(await ingestConversationTurn('chat1', 'I will follow up with the vendor tomorrow', 'ok', 'comms')).toBe(false);
+    expect(mockCommit).not.toHaveBeenCalled();
+
+    extract({ kind: 'person', summary: 'Omar is a vendor', entities: [], topics: [], importance: 0.6, person: { name: 'Omar' } });
+    await ingestConversationTurn('chat1', 'Omar is our vendor contact for printing', 'ok', 'comms');
+    expect(mockPerson).not.toHaveBeenCalled();
+    expect(mockSave).toHaveBeenCalledTimes(1);
+  });
+
+  it('a side-effect failure never loses the memory row', async () => {
+    mockPin.mockImplementationOnce(() => { throw new Error('db locked'); });
+    extract({ kind: 'preference', summary: 'Short answers', entities: [], topics: [], importance: 0.8 });
+    expect(await ingestConversationTurn('chat1', 'keep your answers short from now on', 'ok')).toBe(true);
+    expect(mockSave).toHaveBeenCalledTimes(1);
   });
 });

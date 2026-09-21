@@ -11,6 +11,7 @@ import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_U
 import { runMainTurnQueued } from './main-turn.js';
 import { credHealthSnapshot } from './cred-monitor.js';
 import { registerOutboundRoutes } from './outbound-routes.js';
+import { registerLoopRoutes, LOOP_ROUTES_READONLY_EXEMPT } from './loops-routes.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -535,6 +536,8 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   const mutationReadonlyExempt = new Set<string>([
     // self-chat -> main bridge must keep working even in read-only mode.
     '/api/agent/main-turn',
+    // WhatsApp service -> open-loop triggers (see loops-routes.ts).
+    ...LOOP_ROUTES_READONLY_EXEMPT,
   ]);
   app.use('*', async (c, next) => {
     const method = c.req.method;
@@ -831,6 +834,8 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       return c.json({ error: err?.message ?? 'main-turn failed' }, 500);
     }
   });
+
+  registerLoopRoutes(app);
 
   app.post('/api/warroom/start', async (c) => {
     if (!WARROOM_ENABLED) {

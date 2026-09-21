@@ -47,6 +47,7 @@ import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, Provid
 import { engineSupportsSystemPrompt } from './agent-engine/index.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
+import { registerLoopsCommand } from './loops-telegram.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
 import {
@@ -998,6 +999,7 @@ export function createBot(): Bot {
     { command: 'delegate', description: 'Delegate task to agent' },
     { command: 'lock', description: 'Lock session (requires PIN to unlock)' },
     { command: 'status', description: 'Show security status' },
+    ...(AGENT_ID === 'main' ? [{ command: 'loops', description: 'Open loops (follow-ups, reminders)' }] : []),
   ];
   const skillCommands = discoverSkillCommands();
   const allCommands = [...builtInCommands, ...skillCommands].slice(0, 100); // Telegram limit: 100 commands
@@ -1395,6 +1397,11 @@ export function createBot(): Bot {
     await ctx.reply(lines.join('\n'));
   });
 
+  // /loops — open loops (durable follow-ups) with close buttons; main only.
+  if (AGENT_ID === 'main') {
+    registerLoopsCommand(bot, async (ctx) => !!ctx.chat && !(await replyIfLocked(ctx)));
+  }
+
   // /delegate — delegate task to an agent (handled via handleMessage delegation detection)
   // This command is intercepted by handleMessage's parseDelegation(),
   // but we register it so grammY doesn't pass it to the text handler.
@@ -1415,7 +1422,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status', ...(AGENT_ID === 'main' ? ['/loops'] : [])]);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();

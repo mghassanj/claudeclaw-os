@@ -456,10 +456,73 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_outbound_dedupe ON outbound_actions(dedupe_hash, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_outbound_code ON outbound_actions(approval_code, status);
   `);
+
+  // ── PA: open loops + contacts (feat/open-loops-contacts) ──────────────
+  // Durable follow-ups ("track her reply", "remind me", "I'll follow up")
+  // and a people directory. CRUD lives in src/open-loops.ts and
+  // src/contacts.ts; this block only guarantees the tables exist.
+  // Times are unix seconds. See docs/pa-loops-contacts.md.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS open_loops (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind               TEXT NOT NULL CHECK (kind IN ('await_reply','promise','reminder')),
+      contact_id         INTEGER,
+      channel            TEXT NOT NULL DEFAULT 'whatsapp',
+      chat_ref           TEXT,
+      summary            TEXT NOT NULL,
+      intent_prompt      TEXT NOT NULL DEFAULT '',
+      origin             TEXT NOT NULL DEFAULT 'telegram',
+      due_at             INTEGER,
+      expires_at         INTEGER NOT NULL,
+      next_check_at      INTEGER,
+      status             TEXT NOT NULL DEFAULT 'open'
+                         CHECK (status IN ('open','waiting','fired','done','dropped','expired')),
+      fired_count        INTEGER NOT NULL DEFAULT 0,
+      max_fires          INTEGER NOT NULL DEFAULT 1,
+      resolution         TEXT,
+      needs_confirmation INTEGER NOT NULL DEFAULT 0,
+      pending_trigger    TEXT,
+      last_trigger_ref   TEXT,
+      created_by_agent   TEXT NOT NULL DEFAULT 'main',
+      created_at         INTEGER NOT NULL,
+      updated_at         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_open_loops_status ON open_loops(status, next_check_at);
+    CREATE INDEX IF NOT EXISTS idx_open_loops_chat ON open_loops(chat_ref, status);
+
+    CREATE TABLE IF NOT EXISTS contacts (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      display_name        TEXT NOT NULL,
+      aliases             TEXT NOT NULL DEFAULT '[]',
+      wa_chat_id          TEXT,
+      phone               TEXT,
+      telegram_id         TEXT,
+      email               TEXT,
+      relationship        TEXT,
+      org                 TEXT,
+      language_pref       TEXT,
+      notes               TEXT,
+      last_interaction_at INTEGER,
+      pinned              INTEGER NOT NULL DEFAULT 0,
+      created_at          INTEGER NOT NULL,
+      updated_at          INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_contacts_wa ON contacts(wa_chat_id);
+  `);
 }
 
 /** Raw handle for self-contained modules that own their own tables (outbound.ts). */
 export function getOutboundDb(): Database.Database {
+  return db;
+}
+
+/**
+ * Raw handle for self-contained modules that own their own tables
+ * (src/open-loops.ts, src/contacts.ts). Throws before initDatabase() /
+ * _initTestDatabase() has run.
+ */
+export function getDatabaseHandle(): Database.Database {
+  if (!db) throw new Error('database not initialised');
   return db;
 }
 
@@ -1080,14 +1143,14 @@ export function getRecentHighImportanceMemories(
     return db
       .prepare(
         `SELECT * FROM memories WHERE chat_id = ? AND agent_id = ? AND importance >= 0.5
-         ORDER BY accessed_at DESC LIMIT ?`,
+         ORDER BY importance * salience DESC, accessed_at DESC LIMIT ?`,
       )
       .all(chatId, agentId, limit) as Memory[];
   }
   return db
     .prepare(
       `SELECT * FROM memories WHERE chat_id = ? AND importance >= 0.5
-       ORDER BY accessed_at DESC LIMIT ?`,
+       ORDER BY importance * salience DESC, accessed_at DESC LIMIT ?`,
     )
     .all(chatId, limit) as Memory[];
 }
@@ -1142,7 +1205,9 @@ export function batchUpdateMemoryRelevance(
  * - importance < 0.5:   5% per day (retains ~90 days)
  */
 export function decayMemories(): void {
-  const oneDayAgo = Math.floor(Date.now() / 1000) - 86400;
+  // Rows younger than 30 days never decay: with roughly one durable row a
+  // week, a 1-day grace let fresh preferences sink before they were reused.
+  const graceCutoff = Math.floor(Date.now() / 1000) - 30 * 86400;
   db.prepare(`
     UPDATE memories SET salience = salience * CASE
       WHEN importance >= 0.8 THEN 0.99
@@ -1150,7 +1215,7 @@ export function decayMemories(): void {
       ELSE 0.95
     END
     WHERE created_at < ? AND pinned = 0
-  `).run(oneDayAgo);
+  `).run(graceCutoff);
   // Clear superseded_by references pointing to memories we're about to delete,
   // otherwise the FOREIGN KEY constraint on superseded_by -> memories(id) fails.
   db.prepare(`
@@ -1161,7 +1226,9 @@ export function decayMemories(): void {
 }
 
 export function pinMemory(memoryId: number): void {
-  db.prepare('UPDATE memories SET pinned = 1 WHERE id = ?').run(memoryId);
+  // Reset salience: rows pinned after decaying (seen live at 0.05) would
+  // otherwise stay at the bottom of every salience-ordered layer.
+  db.prepare('UPDATE memories SET pinned = 1, salience = 1.0 WHERE id = ?').run(memoryId);
 }
 
 export function unpinMemory(memoryId: number): void {
