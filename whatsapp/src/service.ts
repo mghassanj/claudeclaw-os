@@ -183,18 +183,33 @@ state.client.on("message_create", async (msg) => {
 
     if (isSelfChat) {
       console.log("[wa] self-chat -> main agent bridge");
+      const bridgeStart = Date.now();
       let bridged: string;
       try {
         bridged = await runMainBridge(inboundText);
       } catch (e) {
         console.error("[wa] main-bridge failed:", e);
-        await sendText(state.client, chatId, "Couldn\u2019t reach the main agent right now \u2014 try again in a moment.", msg.id._serialized);
+        const fallbackId = await sendText(state.client, chatId, "Couldn\u2019t reach the main agent right now \u2014 try again in a moment.", msg.id._serialized);
+        await recordReply({
+          groupId: chatId, messageId: msg.id._serialized,
+          chosenTier: "self", toolsCalled: [], sourcesCited: [],
+          replyText: null, replyMediaUrl: null, replyAt: new Date(), replyMsgId: fallbackId,
+          durationMs: Date.now() - bridgeStart, costEstimate: 0,
+          error: ("main-bridge: " + String(e)).slice(0, 500),
+        });
         return;
       }
       // Outside the try: a send error must not trigger the "couldn't reach"
       // fallback, because the reply may already have been delivered.
       const sentId = await sendText(state.client, chatId, bridged, msg.id._serialized);
       console.log("[wa] self-chat reply sent:", sentId);
+      // Mark it replied (reply_at) so a re-fired message_create can't answer twice.
+      await recordReply({
+        groupId: chatId, messageId: msg.id._serialized,
+        chosenTier: "self", toolsCalled: [], sourcesCited: [],
+        replyText: bridged, replyMediaUrl: null, replyAt: new Date(), replyMsgId: sentId,
+        durationMs: Date.now() - bridgeStart, costEstimate: 0, error: null,
+      });
       return;
     }
     console.log("[wa] calling composeReply...");
@@ -312,4 +327,19 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-state.client.initialize();
+// Startup watchdog: whatsapp-web.js can miss WA Web's "synced" signal and sit
+// in INITIALIZING forever (seen 2026-09-21: page logged in, "ready" never fired).
+// Exit non-zero so systemd (Restart=on-failure) restarts us. QR_REQUIRED is
+// left alone: that state waits for a human scan, and a restart wouldn't help.
+const READY_TIMEOUT_MS = Number(process.env.WA_READY_TIMEOUT_MS ?? 300_000);
+setTimeout(() => {
+  if (state.state === "INITIALIZING") {
+    console.error(`[wa] not READY after ${Math.round(READY_TIMEOUT_MS / 1000)}s (state=${state.state}); exiting so systemd restarts us`);
+    process.exit(1);
+  }
+}, READY_TIMEOUT_MS).unref();
+
+state.client.initialize().catch((e) => {
+  console.error("[wa] client.initialize() failed; exiting so systemd restarts us:", e);
+  process.exit(1);
+});
