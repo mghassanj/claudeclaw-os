@@ -114,6 +114,10 @@ except ModuleNotFoundError as e:
 
 from config import PROJECT_ROOT, AGENT_VOICES, DEFAULT_AGENT
 
+# Loopback by default: the dashboard proxies /ws/warroom to 127.0.0.1, and
+# this server has no auth of its own (it can delegate to tool-using agents).
+WARROOM_HOST = os.environ.get("WARROOM_HOST", "127.0.0.1")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,7 +158,7 @@ def make_transport(port: int, audio_in_sr: int = 16000, audio_out_sr: int = 2400
     # supported"). Output stays at 24 kHz — Gemini Live emits 24 kHz audio
     # and Pipecat passes it through unchanged.
     return WebsocketServerTransport(
-        host="0.0.0.0",
+        host=WARROOM_HOST,
         port=port,
         params=WebsocketServerParams(
             audio_in_enabled=True,
@@ -866,8 +870,8 @@ async def run_live_mode():
     print_ready(port, "live")
     runner = PipelineRunner(handle_sigterm=True)
     logger.info(
-        "War Room LIVE mode on ws://0.0.0.0:%d (agent=%s mode=%s voice=%s model=%s tools=%d speech_timeout=%.2fs)",
-        port, active_agent, active_mode, voice, model or "pipecat-default", len(standard_tools), speech_timeout,
+        "War Room LIVE mode on ws://%s:%d (agent=%s mode=%s voice=%s model=%s tools=%d speech_timeout=%.2fs)",
+        WARROOM_HOST, port, active_agent, active_mode, voice, model or "pipecat-default", len(standard_tools), speech_timeout,
     )
     await runner.run(task)
     logger.info("War Room session ended.")
@@ -1145,8 +1149,8 @@ async def run_realtime_mode():
     print_ready(port, "realtime")
     runner = PipelineRunner(handle_sigterm=True)
     logger.info(
-        "War Room REALTIME mode on ws://0.0.0.0:%d (agent=%s mode=%s voice=%s model=%s tools=%d speech_timeout=%.2fs)",
-        port, active_agent, active_mode, voice, model or "pipecat-default", len(standard_tools), speech_timeout,
+        "War Room REALTIME mode on ws://%s:%d (agent=%s mode=%s voice=%s model=%s tools=%d speech_timeout=%.2fs)",
+        WARROOM_HOST, port, active_agent, active_mode, voice, model or "pipecat-default", len(standard_tools), speech_timeout,
     )
     await runner.run(task)
     logger.info("War Room session ended.")
@@ -1206,7 +1210,7 @@ async def run_legacy_mode():
 
     print_ready(port, "legacy")
     runner = PipelineRunner(handle_sigterm=True)
-    logger.info("War Room LEGACY mode on ws://0.0.0.0:%d", port)
+    logger.info("War Room LEGACY mode on ws://%s:%d", WARROOM_HOST, port)
     await runner.run(task)
     logger.info("War Room session ended.")
 
