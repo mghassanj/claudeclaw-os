@@ -1,6 +1,7 @@
 import "dotenv/config";
 import fs from "node:fs/promises";
 import { buildClient } from "./client.js";
+import type { Message as WAMessage } from "whatsapp-web.js";
 import { startHealthServer } from "./healthcheck.js";
 import { currentConfig, reloadConfig } from "./config.js";
 import { wasSentByBot } from "./sent-registry.js";
@@ -37,7 +38,7 @@ if (!cfg0.enabled) {
 const state = buildClient();
 startHealthServer(state, cfg0.qrPort);
 
-state.client.on("message_create", async (msg) => {
+const onMessage = async (msg: WAMessage): Promise<void> => {
   let chatId = "";
   try {
     console.log("[wa] msg event fired");
@@ -314,6 +315,43 @@ state.client.on("message_create", async (msg) => {
       } catch { /* swallow */ }
     }
   }
+};
+state.client.on("message_create", onMessage);
+
+// Catch-up after a restart/outage: whatsapp-web.js only emits messages that
+// arrive while we're connected, so anything sent to an allowed group during
+// downtime was silently dropped (2026-09-21 10:05:37, during a restart).
+// On the first "ready", replay recent unanswered messages through onMessage,
+// which still applies every normal rule (group allow-list, selfReply, and the
+// alreadyReplied dedup). Only messages that are:
+//   - within WA_CATCHUP_MINUTES (default 30; 0 disables),
+//   - older than this READY (newer ones go through the live handler),
+//   - newer than the bot's last reply in that chat.
+let catchUpStarted = false;
+async function catchUpMissed(): Promise<void> {
+  if (catchUpStarted) return;
+  catchUpStarted = true;
+  await state.patched;
+  const minutes = Number(process.env.WA_CATCHUP_MINUTES ?? 30);
+  if (!(minutes > 0)) return;
+  const readyAt = Date.now() / 1000;
+  const cutoff = readyAt - minutes * 60;
+  const cfg = currentConfig();
+  const isBotMsg = (m: WAMessage) =>
+    m.fromMe && ((m.body ?? "").startsWith("\u{1F916}") || wasSentByBot(m.id._serialized));
+  const chats = await state.client.getChats();
+  for (const chat of chats) {
+    if (!chat.isGroup || !cfg.isGroupAllowed((chat as any).name ?? "")) continue;
+    const recent = await chat.fetchMessages({ limit: 30 });
+    const lastBotTs = recent.filter(isBotMsg).reduce((t, m) => Math.max(t, m.timestamp), 0);
+    const missed = recent.filter((m) =>
+      m.timestamp >= cutoff && m.timestamp < readyAt && m.timestamp > lastBotTs && !isBotMsg(m));
+    console.log(`[wa] catch-up: "${(chat as any).name}": ${missed.length} unanswered in last ${minutes} min`);
+    for (const m of missed) await onMessage(m);
+  }
+}
+state.client.on("ready", () => {
+  catchUpMissed().catch((e) => console.error("[wa] catch-up failed:", e));
 });
 
 process.on("SIGHUP", () => {
