@@ -37,7 +37,12 @@ type WaSender = (chatId: string, text: string) => Promise<void>;
 let telegramSender: TextSender | null = null;
 let turnRunner: TurnRunner = async (prompt) => {
   const { runMainTurnQueued } = await import('./main-turn.js');
-  return runMainTurnQueued(prompt);
+  // runMainTurn returns the final answer with [SEND_FILE]/[SEND_PHOTO]
+  // markers already extracted; loop delivery is text-only, so name any files
+  // rather than dropping them silently.
+  const reply = await runMainTurnQueued(prompt);
+  const fileLines = reply.files.map((f) => `(file: ${f.filePath}${f.caption ? ` | ${f.caption}` : ''})`);
+  return [reply.text, ...fileLines].filter(Boolean).join('\n') || 'Done.';
 };
 let waSender: WaSender = postWhatsAppSend;
 
