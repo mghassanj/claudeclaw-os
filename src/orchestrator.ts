@@ -9,6 +9,7 @@ import { logToHiveMind, createInterAgentTask, completeInterAgentTask } from './d
 import { logger } from './logger.js';
 import { buildMemoryContext } from './memory.js';
 import { getSelectedProviderConfig } from './active-provider.js';
+import { formatAbortedReply, formatTimeoutLabel } from './turn-outcome.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -18,6 +19,9 @@ export interface DelegationResult {
   usage: UsageInfo | null;
   taskId: string;
   durationMs: number;
+  /** True when the delegated run was cut off by the timeout. `text` is then
+   *  the labelled partial ("⏱ Timed out after …"), never a silent success. */
+  aborted?: boolean;
 }
 
 export interface AgentInfo {
@@ -224,6 +228,30 @@ export async function delegateToAgent(
       clearTimeout(timer);
 
       const durationMs = Date.now() - start;
+
+      if (result.aborted) {
+        // The only abort source here is our own timeout watchdog. Record it
+        // as a timeout (with any partial output) instead of 'completed'.
+        const reason = `Timed out after ${formatTimeoutLabel(timeoutMs)}`;
+        const partial = (result.text ?? '').trim();
+        completeInterAgentTask(taskId, 'timeout', partial ? `${reason}. Partial: ${partial}` : reason);
+        logToHiveMind(
+          agentId,
+          chatId,
+          'delegate_timeout',
+          `Delegation from ${fromAgent} ${reason.toLowerCase()}${partial ? ' (partial output kept)' : ''}`,
+        );
+        onProgress?.(`${agent.name} timed out (${Math.round(durationMs / 1000)}s)`);
+        return {
+          agentId,
+          text: formatAbortedReply(result.text, { timedOut: true, timeoutMs }),
+          usage: result.usage,
+          taskId,
+          durationMs,
+          aborted: true,
+        };
+      }
+
       completeInterAgentTask(taskId, 'completed', result.text);
       logToHiveMind(
         agentId,

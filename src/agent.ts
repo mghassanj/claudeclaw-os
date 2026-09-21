@@ -254,6 +254,10 @@ export async function runAgent(
   let preCompactTokens: number | null = null;
   let lastCallCacheRead = 0;
   let lastCallInputTokens = 0;
+  // Tool calls started in this attempt (from the engine's tool_active progress
+  // events). Attached to a thrown AgentError so the retry wrapper never re-runs
+  // an attempt that may already have caused side effects.
+  let toolUses = 0;
 
   // Refresh typing indicator on an interval while Claude works.
   // Telegram's "typing..." action expires after ~5s.
@@ -309,6 +313,7 @@ export async function runAgent(
       }
 
       if (event.type === 'progress') {
+        if (event.progress.type === 'tool_active') toolUses++;
         onProgress?.(event.progress);
       }
 
@@ -363,8 +368,9 @@ export async function runAgent(
     // Classify the error and attach context-aware metadata
     const contextTokens = lastCallInputTokens || lastCallCacheRead || 0;
     const classified = classifyError(err, contextTokens || undefined);
+    classified.toolUsesBeforeFailure = toolUses;
     logger.error(
-      { category: classified.category, recovery: classified.recovery, originalMsg: (err as Error)?.message },
+      { category: classified.category, recovery: classified.recovery, originalMsg: (err as Error)?.message, toolUses },
       'Agent query failed (classified)',
     );
     throw classified;
@@ -445,6 +451,17 @@ export async function runAgentWithRetry(
 
       // Don't retry non-retryable errors or if aborted
       if (!err.recovery.shouldRetry || abortController?.signal.aborted) {
+        throw err;
+      }
+
+      // Never retry an attempt that already ran tools: a retry would repeat
+      // its side effects (a second WhatsApp send, a duplicate email, ...).
+      // Surface the error instead and let the user decide.
+      if (err.toolUsesBeforeFailure > 0) {
+        logger.warn(
+          { attempt: attempt + 1, category: err.category, toolUses: err.toolUsesBeforeFailure },
+          'Not retrying agent query: failed attempt already ran tools',
+        );
         throw err;
       }
 
