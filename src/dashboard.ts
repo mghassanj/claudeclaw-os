@@ -8,6 +8,7 @@ import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, ENABLE_ACP, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG, updateAgentProvider } from './config.js';
+import { runMainTurn } from './main-turn.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -522,7 +523,8 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // diagnose. This MUST run before route handlers so the per-route checks
   // I scattered earlier (now removed) can't be the only line of defense.
   const mutationReadonlyExempt = new Set<string>([
-    // Add safe-recovery POST endpoints here if needed; none today.
+    // self-chat -> main bridge must keep working even in read-only mode.
+    '/api/agent/main-turn',
   ]);
   app.use('*', async (c, next) => {
     const method = c.req.method;
@@ -801,6 +803,22 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // in src/warroom-html.ts always has a `window.location.hostname`
   // fallback, so just returning {ok:true} lets the browser build the
   // right WS url on its own.
+  // Bridge: run the MAIN agent on the canonical Telegram-main session so other
+  // channels (WhatsApp self-chat) share one conversation + memory. Token-gated
+  // by the global /api/ middleware; exempt from the mutation kill-switch above.
+  app.post('/api/agent/main-turn', async (c) => {
+    let body: any = {};
+    try { body = await c.req.json(); } catch { /* empty body */ }
+    const text = typeof body?.text === 'string' ? body.text.trim() : '';
+    if (!text) return c.json({ error: 'text required' }, 400);
+    try {
+      const reply = await runMainTurn(text);
+      return c.json({ text: reply });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? 'main-turn failed' }, 500);
+    }
+  });
+
   app.post('/api/warroom/start', async (c) => {
     if (!WARROOM_ENABLED) {
       return c.json({ error: 'War Room not enabled. Set WARROOM_ENABLED=true in .env with GOOGLE_API_KEY (for live mode) or DEEPGRAM_API_KEY + CARTESIA_API_KEY (for legacy mode).' }, 400);

@@ -4,6 +4,7 @@ import { buildClient } from "./client.js";
 import { startHealthServer } from "./healthcheck.js";
 import { currentConfig, reloadConfig } from "./config.js";
 import { wasSentByBot } from "./sent-registry.js";
+import { runMainBridge } from "./main-bridge.js";
 import { detectLang } from "./lang.js";
 import { composeReply } from "./reply-composer.js";
 import {
@@ -163,6 +164,18 @@ state.client.on("message_create", async (msg) => {
     })));
     console.log("[wa] thread context size:", threadContext.length);
 
+    if (isSelfChat) {
+      console.log("[wa] self-chat -> main agent bridge");
+      try {
+        const bridged = await runMainBridge(inboundText);
+        const sentId = await sendText(state.client, chatId, bridged, msg.id._serialized);
+        console.log("[wa] self-chat reply sent:", sentId);
+      } catch (e) {
+        console.error("[wa] main-bridge failed:", e);
+        await sendText(state.client, chatId, "Couldn\u2019t reach the main agent right now \u2014 try again in a moment.", msg.id._serialized);
+      }
+      return;
+    }
     console.log("[wa] calling composeReply...");
     const result = await composeReply({
       inboundText,
