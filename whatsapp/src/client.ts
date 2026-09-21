@@ -40,6 +40,11 @@ export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState
     } catch (e) {
       console.warn("[wa] getMessagesById patch failed:", e);
     }
+    try {
+      await patchMessageIdSerialized(client);
+    } catch (e) {
+      console.warn("[wa] message id patch failed:", e);
+    }
   });
   client.on("disconnected", (reason) => {
     state.state = "DISCONNECTED";
@@ -75,6 +80,30 @@ async function patchGetMessagesById(client: WAClient): Promise<void> {
     Msg.__ccPatched = true;
   });
   console.log("[wa] patched Msg.getMessagesById (DataError -> not found)");
+}
+
+// WA Web 2.3000.x renamed the MsgKey's serialized-id field from `_serialized`
+// to a minified `$1`, so whatsapp-web.js messages arrive with
+// msg.id._serialized === undefined. That broke recordInbound (NOT NULL
+// message_id), reply quoting and dedup. Restore it from MsgKey.toString(),
+// which still yields "<fromMe>_<remote>_<id>[_<participant>]". The function
+// is re-injected on SPA reloads, so the flag lives on the function itself.
+async function patchMessageIdSerialized(client: WAClient): Promise<void> {
+  await client.pupPage?.evaluate(() => {
+    const W = (globalThis as any).WWebJS;
+    if (W.getMessageModel.__ccPatched) return;
+    const orig = W.getMessageModel;
+    const patched = (msg: any, ...rest: unknown[]) => {
+      const model = orig(msg, ...rest);
+      if (model?.id && !model.id._serialized && msg?.id?.toString) {
+        model.id._serialized = msg.id.toString();
+      }
+      return model;
+    };
+    (patched as any).__ccPatched = true;
+    W.getMessageModel = patched;
+  });
+  console.log("[wa] patched WWebJS.getMessageModel (restore id._serialized)");
 }
 
 export { MessageMedia };
