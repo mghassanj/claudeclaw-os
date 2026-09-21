@@ -41,6 +41,11 @@ export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState
       console.warn("[wa] getMessagesById patch failed:", e);
     }
     try {
+      await patchMsgKeySerialized(client);
+    } catch (e) {
+      console.warn("[wa] MsgKey patch failed:", e);
+    }
+    try {
       await patchMessageIdSerialized(client);
     } catch (e) {
       console.warn("[wa] message id patch failed:", e);
@@ -80,6 +85,26 @@ async function patchGetMessagesById(client: WAClient): Promise<void> {
     Msg.__ccPatched = true;
   });
   console.log("[wa] patched Msg.getMessagesById (DataError -> not found)");
+}
+
+// Page-side half of the MsgKey rename below: whatsapp-web.js reads
+// `<MsgKey>._serialized` inside the page (e.g. sendMessage returns
+// Msg.get(newMsgKey._serialized)), so sends "failed" with an undefined result
+// even though the message went out. Restore `_serialized` on the MsgKey
+// prototype as an alias of the minified `$1` field.
+async function patchMsgKeySerialized(client: WAClient): Promise<void> {
+  await client.pupPage?.evaluate(() => {
+    const MsgKey = (globalThis as any).require("WAWebMsgKey");
+    const proto = MsgKey?.prototype;
+    if (!proto || Object.prototype.hasOwnProperty.call(proto, "_serialized")) return;
+    Object.defineProperty(proto, "_serialized", {
+      configurable: true,
+      get() {
+        return this.$1 ?? this.toString();
+      },
+    });
+  });
+  console.log("[wa] patched MsgKey.prototype._serialized");
 }
 
 // WA Web 2.3000.x renamed the MsgKey's serialized-id field from `_serialized`
