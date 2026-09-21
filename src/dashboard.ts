@@ -9,6 +9,7 @@ import path from 'path';
 import { spawnSync } from 'child_process';
 import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, ENABLE_ACP, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG, updateAgentProvider } from './config.js';
 import { runMainTurnQueued } from './main-turn.js';
+import { credHealthSnapshot } from './cred-monitor.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -2055,6 +2056,17 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const sortBy = (c.req.query('sort') || 'importance') as 'importance' | 'salience' | 'recent';
     const result = getDashboardMemoriesList(chatId, limit, offset, sortBy);
     return c.json(result);
+  });
+
+  // Credential health (read-only). Token-gated by the /api/* middleware.
+  // Rows come from src/cred-monitor.ts; details never contain secrets.
+  app.get('/api/cred-health', (c) => {
+    try {
+      return c.json(credHealthSnapshot());
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : err }, 'cred-health read failed');
+      return c.json({ error: 'cred-health unavailable' }, 500);
+    }
   });
 
   // System health

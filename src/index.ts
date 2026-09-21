@@ -14,6 +14,7 @@ import { runConsolidation } from './memory-consolidate.js';
 import { runDecaySweep } from './memory.js';
 import { runWarroomAvatarMigration } from './avatars.js';
 import { initOAuthHealthCheck } from './oauth-health.js';
+import { initCredMonitor } from './cred-monitor.js';
 import { initOrchestrator } from './orchestrator.js';
 import { initScheduler } from './scheduler.js';
 import { getMainProviderConfig } from './provider.js';
@@ -397,6 +398,20 @@ async function main(): Promise<void> {
       });
     } else {
       logger.info('OAuth health check disabled (set OAUTH_HEALTH_ENABLED=true in .env to enable)');
+    }
+
+    // Credential health monitor (Telegram/Claude/Jira/Codewiki/Railway/
+    // OpenAI/Google/Voyage/WhatsApp/Gmail). Main process only; alerts once
+    // per ok<->fail transition. See src/cred-monitor.ts.
+    if (AGENT_ID === 'main') {
+      initCredMonitor(async (text) => {
+        const { splitMessage } = await import('./bot.js');
+        for (const chunk of splitMessage(text)) {
+          await bot.api.sendMessage(ALLOWED_CHAT_ID, chunk, { parse_mode: 'HTML' }).catch((err) =>
+            logger.error({ err }, 'Credential health alert failed'),
+          );
+        }
+      });
     }
   } else {
     logger.warn('ALLOWED_CHAT_ID not set — scheduler disabled (no destination for results)');

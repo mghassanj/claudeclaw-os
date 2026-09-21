@@ -377,6 +377,17 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_compaction_session ON compaction_events(session_id, created_at DESC);
 
+    -- Credential health monitor (src/cred-monitor.ts). One row per probe.
+    -- status: ok | fail | skip. detail never contains secret values.
+    CREATE TABLE IF NOT EXISTS cred_health (
+      name            TEXT PRIMARY KEY,
+      status          TEXT NOT NULL,
+      detail          TEXT NOT NULL DEFAULT '',
+      checked_at      INTEGER NOT NULL,
+      last_ok_at      INTEGER,
+      last_change_at  INTEGER NOT NULL
+    );
+
     -- Phase 4.2: Skill health checks
     CREATE TABLE IF NOT EXISTS skill_health (
       skill_id    TEXT PRIMARY KEY,
@@ -1468,6 +1479,46 @@ export function pruneSlackMessages(retentionDays = 3): number {
     'DELETE FROM slack_messages WHERE created_at < ?',
   ).run(cutoff);
   return result.changes;
+}
+
+// ── Credential health (cred-monitor.ts) ────────────────────────────────
+
+export interface CredHealthRow {
+  name: string;
+  status: 'ok' | 'fail' | 'skip';
+  detail: string;
+  checked_at: number;
+  last_ok_at: number | null;
+  last_change_at: number;
+}
+
+export function getCredHealth(): CredHealthRow[] {
+  return db.prepare('SELECT * FROM cred_health ORDER BY name').all() as CredHealthRow[];
+}
+
+/**
+ * Record one probe result. Returns the previous status (null = first time
+ * this probe was seen) so the caller can detect transitions.
+ */
+export function recordCredHealth(
+  name: string,
+  status: CredHealthRow['status'],
+  detail: string,
+  nowSec = Math.floor(Date.now() / 1000),
+): CredHealthRow['status'] | null {
+  const prev = db.prepare('SELECT status FROM cred_health WHERE name = ?').get(name) as { status: CredHealthRow['status'] } | undefined;
+  const changed = !prev || prev.status !== status;
+  db.prepare(`
+    INSERT INTO cred_health (name, status, detail, checked_at, last_ok_at, last_change_at)
+    VALUES (@name, @status, @detail, @now, CASE WHEN @status = 'ok' THEN @now END, @now)
+    ON CONFLICT(name) DO UPDATE SET
+      status = excluded.status,
+      detail = excluded.detail,
+      checked_at = excluded.checked_at,
+      last_ok_at = CASE WHEN excluded.status = 'ok' THEN excluded.checked_at ELSE cred_health.last_ok_at END,
+      last_change_at = CASE WHEN @changed = 1 THEN excluded.checked_at ELSE cred_health.last_change_at END
+  `).run({ name, status, detail, now: nowSec, changed: changed ? 1 : 0 });
+  return prev ? prev.status : null;
 }
 
 // ── Conversation Log ──────────────────────────────────────────────────
