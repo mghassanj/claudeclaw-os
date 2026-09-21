@@ -31,10 +31,25 @@ export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState
     state.lastQrPng = await qrcode.toBuffer(qr, { type: "png", scale: 8 });
     console.log("[wa] QR_REQUIRED — scan via http://localhost:9334/qr");
   });
-  client.on("ready", () => {
+  client.on("ready", async () => {
     state.state = "READY";
     state.lastQrPng = null;
     console.log("[wa] READY");
+    try {
+      await patchGetMessagesById(client);
+    } catch (e) {
+      console.warn("[wa] getMessagesById patch failed:", e);
+    }
+    try {
+      await patchMsgKeySerialized(client);
+    } catch (e) {
+      console.warn("[wa] MsgKey patch failed:", e);
+    }
+    try {
+      await patchMessageIdSerialized(client);
+    } catch (e) {
+      console.warn("[wa] message id patch failed:", e);
+    }
   });
   client.on("disconnected", (reason) => {
     state.state = "DISCONNECTED";
@@ -46,6 +61,74 @@ export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState
   });
 
   return state;
+}
+
+// WA Web 2.3000.x: Msg.getMessagesById throws an IndexedDB DataError ("No key
+// or key range specified") for ids that aren't cached in memory. whatsapp-web.js
+// calls it from getChatModel to fill chat.lastMessage, so msg.getChat() failed
+// (minified "r: r") for any chat whose last message was evicted - including the
+// pilot group. Treat that DataError as "not found"; every library call site
+// already reads the result as `?.messages?.[0]`. Idempotent per page load.
+async function patchGetMessagesById(client: WAClient): Promise<void> {
+  await client.pupPage?.evaluate(() => {
+    const Msg = (globalThis as any).require("WAWebCollections").Msg;
+    if (Msg.__ccPatched) return;
+    const orig = Msg.getMessagesById.bind(Msg);
+    Msg.getMessagesById = async (...args: unknown[]) => {
+      try {
+        return await orig(...args);
+      } catch (e: any) {
+        if (e?.name === "DataError") return { messages: [] };
+        throw e;
+      }
+    };
+    Msg.__ccPatched = true;
+  });
+  console.log("[wa] patched Msg.getMessagesById (DataError -> not found)");
+}
+
+// Page-side half of the MsgKey rename below: whatsapp-web.js reads
+// `<MsgKey>._serialized` inside the page (e.g. sendMessage returns
+// Msg.get(newMsgKey._serialized)), so sends "failed" with an undefined result
+// even though the message went out. Restore `_serialized` on the MsgKey
+// prototype as an alias of the minified `$1` field.
+async function patchMsgKeySerialized(client: WAClient): Promise<void> {
+  await client.pupPage?.evaluate(() => {
+    const MsgKey = (globalThis as any).require("WAWebMsgKey");
+    const proto = MsgKey?.prototype;
+    if (!proto || Object.prototype.hasOwnProperty.call(proto, "_serialized")) return;
+    Object.defineProperty(proto, "_serialized", {
+      configurable: true,
+      get() {
+        return this.$1 ?? this.toString();
+      },
+    });
+  });
+  console.log("[wa] patched MsgKey.prototype._serialized");
+}
+
+// WA Web 2.3000.x renamed the MsgKey's serialized-id field from `_serialized`
+// to a minified `$1`, so whatsapp-web.js messages arrive with
+// msg.id._serialized === undefined. That broke recordInbound (NOT NULL
+// message_id), reply quoting and dedup. Restore it from MsgKey.toString(),
+// which still yields "<fromMe>_<remote>_<id>[_<participant>]". The function
+// is re-injected on SPA reloads, so the flag lives on the function itself.
+async function patchMessageIdSerialized(client: WAClient): Promise<void> {
+  await client.pupPage?.evaluate(() => {
+    const W = (globalThis as any).WWebJS;
+    if (W.getMessageModel.__ccPatched) return;
+    const orig = W.getMessageModel;
+    const patched = (msg: any, ...rest: unknown[]) => {
+      const model = orig(msg, ...rest);
+      if (model?.id && !model.id._serialized && msg?.id?.toString) {
+        model.id._serialized = msg.id.toString();
+      }
+      return model;
+    };
+    (patched as any).__ccPatched = true;
+    W.getMessageModel = patched;
+  });
+  console.log("[wa] patched WWebJS.getMessageModel (restore id._serialized)");
 }
 
 export { MessageMedia };
