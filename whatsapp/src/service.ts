@@ -183,14 +183,18 @@ state.client.on("message_create", async (msg) => {
 
     if (isSelfChat) {
       console.log("[wa] self-chat -> main agent bridge");
+      let bridged: string;
       try {
-        const bridged = await runMainBridge(inboundText);
-        const sentId = await sendText(state.client, chatId, bridged, msg.id._serialized);
-        console.log("[wa] self-chat reply sent:", sentId);
+        bridged = await runMainBridge(inboundText);
       } catch (e) {
         console.error("[wa] main-bridge failed:", e);
         await sendText(state.client, chatId, "Couldn\u2019t reach the main agent right now \u2014 try again in a moment.", msg.id._serialized);
+        return;
       }
+      // Outside the try: a send error must not trigger the "couldn't reach"
+      // fallback, because the reply may already have been delivered.
+      const sentId = await sendText(state.client, chatId, bridged, msg.id._serialized);
+      console.log("[wa] self-chat reply sent:", sentId);
       return;
     }
     console.log("[wa] calling composeReply...");
