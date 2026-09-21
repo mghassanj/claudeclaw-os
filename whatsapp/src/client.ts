@@ -8,6 +8,8 @@ export interface ClientState {
   client: WAClient;
   state: "INITIALIZING" | "QR_REQUIRED" | "READY" | "DISCONNECTED";
   lastQrPng: Buffer | null;
+  /** Resolves after the first "ready" has applied the WA Web page patches. */
+  patched: Promise<void>;
 }
 
 export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState {
@@ -24,7 +26,9 @@ export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState
       ],
     },
   });
-  const state: ClientState = { client, state: "INITIALIZING", lastQrPng: null };
+  let markPatched: () => void = () => {};
+  const patched = new Promise<void>((resolve) => { markPatched = resolve; });
+  const state: ClientState = { client, state: "INITIALIZING", lastQrPng: null, patched };
 
   client.on("qr", async (qr) => {
     state.state = "QR_REQUIRED";
@@ -50,6 +54,7 @@ export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState
     } catch (e) {
       console.warn("[wa] message id patch failed:", e);
     }
+    markPatched();
   });
   client.on("disconnected", (reason) => {
     state.state = "DISCONNECTED";
