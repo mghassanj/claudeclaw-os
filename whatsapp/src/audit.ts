@@ -67,6 +67,22 @@ export async function alreadyReplied(groupId: string, messageId: string): Promis
   return r.rows.length > 0 && r.rows[0].done === true;
 }
 
+/**
+ * Where a message stands in the exchange log: 'none' (never seen — e.g. sent
+ * while we were down), 'inbound' (recorded, handling started, no reply yet —
+ * interrupted mid-turn), or 'replied'.
+ */
+export async function exchangeState(
+  groupId: string, messageId: string,
+): Promise<"none" | "inbound" | "replied"> {
+  const r = await pool().query(
+    "SELECT reply_at IS NOT NULL AS done FROM whatsapp_exchanges WHERE group_id=$1 AND message_id=$2",
+    [groupId, messageId],
+  );
+  if (r.rows.length === 0) return "none";
+  return r.rows[0].done === true ? "replied" : "inbound";
+}
+
 export async function close(): Promise<void> {
   if (_pool) { await _pool.end(); _pool = null; }
 }

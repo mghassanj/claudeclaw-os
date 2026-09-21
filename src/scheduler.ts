@@ -8,10 +8,10 @@ import {
   logConversationTurn,
   markTaskRunning,
   updateTaskAfterRun,
-  resetStuckTasks,
+  recoverInterruptedTasks,
   claimNextMissionTask,
   completeMissionTask,
-  resetStuckMissionTasks,
+  recoverInterruptedMissions,
   getMissionTask,
 } from './db.js';
 import { logger } from './logger.js';
@@ -20,6 +20,13 @@ import { runAgent } from './agent.js';
 import { formatForTelegram, splitMessage } from './bot.js';
 import { getSelectedProviderConfig } from './active-provider.js';
 import { evaluateAcceptance } from './acceptance.js';
+import {
+  escapeHtml,
+  parseTaskStatus,
+  resolveScheduledStatus,
+  shouldAlertStatusChange,
+  wrapScheduledPrompt,
+} from './turn-outcome.js';
 
 type Sender = (text: string) => Promise<void>;
 
@@ -42,6 +49,20 @@ const runningTaskIds = new Set<string>();
  */
 let schedulerAgentId = 'main';
 
+/**
+ * Queue key for scheduled tasks and missions. A dedicated lane per agent
+ * (not ALLOWED_CHAT_ID) so a 30-minute scheduled run never blocks the user's
+ * own Telegram / WhatsApp self-chat turns. Safe because scheduled tasks and
+ * missions run on a fresh session (no shared session to race on).
+ */
+export function schedulerLane(agentId: string): string {
+  return `sched:${agentId}`;
+}
+
+function snippet(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
 export function initScheduler(send: Sender, agentId = 'main'): void {
   if (!ALLOWED_CHAT_ID) {
     logger.warn('ALLOWED_CHAT_ID not set — scheduler will not send results');
@@ -49,14 +70,32 @@ export function initScheduler(send: Sender, agentId = 'main'): void {
   sender = send;
   schedulerAgentId = agentId;
 
-  // Recover tasks stuck in 'running' from a previous crash
-  const recovered = resetStuckTasks(agentId);
-  if (recovered > 0) {
-    logger.warn({ recovered, agentId }, 'Reset stuck tasks from previous crash');
+  // Recover tasks/missions stuck in 'running' from a previous crash/restart.
+  // They are recorded as interrupted (not silently reset) and the user is
+  // told once, here at startup.
+  const interruptedTasks = recoverInterruptedTasks(agentId);
+  const interruptedMissions = recoverInterruptedMissions(agentId);
+  if (interruptedTasks.length > 0) {
+    logger.warn({ recovered: interruptedTasks.length, agentId }, 'Recorded scheduled tasks interrupted by restart');
   }
-  const recoveredMission = resetStuckMissionTasks(agentId);
-  if (recoveredMission > 0) {
-    logger.warn({ recovered: recoveredMission, agentId }, 'Reset stuck mission tasks from previous crash');
+  if (interruptedMissions.length > 0) {
+    logger.warn({ recovered: interruptedMissions.length, agentId }, 'Recorded mission tasks interrupted by restart');
+  }
+  const lines: string[] = [];
+  for (const t of interruptedTasks) {
+    lines.push(`• Scheduled task "${escapeHtml(snippet(t.prompt, 60))}" did not finish; not re-run (next run follows its schedule).`);
+  }
+  for (const m of interruptedMissions) {
+    lines.push(
+      m.action === 'requeued'
+        ? `• Mission "${escapeHtml(snippet(m.title, 60))}" (attempt ${m.attempts}) re-queued; it runs again within a minute. Cancel it in Mission Control if not wanted.`
+        : `• Mission "${escapeHtml(snippet(m.title, 60))}" failed: interrupted again on attempt ${m.attempts}; not re-run.`,
+    );
+  }
+  if (lines.length > 0 && ALLOWED_CHAT_ID) {
+    void sender(`⚠ Interrupted by a restart:\n${lines.join('\n')}`).catch((err) => {
+      logger.warn({ err }, 'Failed to send interrupted-task notice');
+    });
   }
 
   setInterval(() => void runDueTasks(), 60_000);
@@ -85,11 +124,10 @@ async function runDueTasks(): Promise<void> {
 
     logger.info({ taskId: task.id, prompt: task.prompt.slice(0, 60) }, 'Firing task');
 
-    // Route through the message queue so scheduled tasks wait for any
-    // in-flight user message to finish before running. This prevents
-    // two Claude processes from hitting the same session simultaneously.
-    const chatId = ALLOWED_CHAT_ID || 'scheduler';
-    messageQueue.enqueue(chatId, async () => {
+    // Serialize scheduled work on its own lane (sched:<agent>), NOT the
+    // user's chat key: scheduled tasks run on a fresh session, so they don't
+    // race the main session, and must never make the user's turns wait.
+    messageQueue.enqueue(schedulerLane(schedulerAgentId), async () => {
       const abortController = new AbortController();
       const timeout = setTimeout(() => abortController.abort(), TASK_TIMEOUT_MS);
 
@@ -98,7 +136,7 @@ async function runDueTasks(): Promise<void> {
 
         // Run as a fresh agent call (no session — scheduled tasks are autonomous)
         const result = await runAgent(
-          task.prompt,
+          wrapScheduledPrompt(task.prompt),
           undefined,
           () => {},
           undefined,
@@ -119,7 +157,10 @@ async function runDueTasks(): Promise<void> {
 
         const text = result.text?.trim() || 'Task completed with no output.';
         const acceptancePassed = evaluateAcceptance(task.acceptance_check, result.text ?? '');
-        const lastStatus: 'success' | 'failed' = acceptancePassed ? 'success' : 'failed';
+        // Honor the task's own machine-readable `STATUS: ok|blocked|failed`
+        // line; absent it, fall back to the acceptance check as before.
+        const reported = parseTaskStatus(result.text);
+        const lastStatus = resolveScheduledStatus(reported, acceptancePassed);
         const resultText = acceptancePassed
           ? text
           : `Acceptance check not met: output did not contain "${task.acceptance_check}".\n\n${text}`;
@@ -128,6 +169,16 @@ async function runDueTasks(): Promise<void> {
         }
         if (!acceptancePassed) {
           await sender(`⚠ Acceptance check not met: expected output to contain "${task.acceptance_check}".`);
+        }
+        // Alert once when the task ENTERS blocked/failed; stay quiet on
+        // repeat runs while it remains in that state.
+        if (shouldAlertStatusChange(task.last_status, lastStatus)) {
+          const why = reported && reported.status !== 'ok' && reported.reason
+            ? reported.reason
+            : !acceptancePassed ? 'acceptance check not met' : 'no reason given';
+          await sender(
+            `${lastStatus === 'blocked' ? '🚧 Scheduled task blocked' : '❌ Scheduled task failed'}: "${escapeHtml(snippet(task.prompt, 60))}" — ${escapeHtml(snippet(why, 200))}`,
+          );
         }
 
         // Inject task output into the active chat session so user replies have context
@@ -180,8 +231,7 @@ async function runDueMissionTasks(): Promise<void> {
 
   logger.info({ missionId: mission.id, title: mission.title }, 'Running mission task');
 
-  const chatId = ALLOWED_CHAT_ID || 'mission';
-  messageQueue.enqueue(chatId, async () => {
+  messageQueue.enqueue(schedulerLane(schedulerAgentId), async () => {
     const abortController = new AbortController();
     const timeout = setTimeout(() => abortController.abort(), TASK_TIMEOUT_MS);
 

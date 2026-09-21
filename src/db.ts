@@ -701,6 +701,11 @@ function runMigrations(database: Database.Database): void {
     logger.info('Migration: made mission_tasks.assigned_agent nullable');
   }
 
+  // Mission Control: attempts counter so a mission interrupted by a restart
+  // is re-queued at most once (with a notification) instead of silently
+  // re-running forever. Incremented on claim.
+  addColumnIfMissing(database, 'mission_tasks', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
+
   // Live Meetings: add provider column so we can track which platform
   // each session used (pika avatar vs recall voice-only). Default 'pika'
   // for existing rows so historical data keeps the right label.
@@ -1243,7 +1248,7 @@ export interface ScheduledTask {
   created_at: number;
   agent_id: string;
   started_at: number | null;
-  last_status: 'success' | 'failed' | 'timeout' | null;
+  last_status: 'success' | 'failed' | 'timeout' | 'blocked' | 'interrupted' | null;
   acceptance_check: string | null;
 }
 
@@ -1305,7 +1310,7 @@ export function updateTaskAfterRun(
   id: string,
   nextRun: number,
   result: string,
-  lastStatus: 'success' | 'failed' | 'timeout' = 'success',
+  lastStatus: 'success' | 'failed' | 'timeout' | 'blocked' | 'interrupted' = 'success',
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
@@ -1313,11 +1318,38 @@ export function updateTaskAfterRun(
   ).run(now, nextRun, result.slice(0, 4000), lastStatus, id);
 }
 
+export const INTERRUPTED_TASK_NOTE =
+  'Interrupted by a restart while running; this run did not finish and was not re-run. The next run follows the schedule.';
+
+/**
+ * Startup recovery for scheduled tasks left 'running' by a crash/restart.
+ * Returns them to 'active' but RECORDS the interruption (last_status =
+ * 'interrupted', last_result note, last_run = when it started) instead of
+ * silently wiping it. next_run was already advanced by markTaskRunning, so
+ * the interrupted run is not repeated. Returns the affected tasks so the
+ * caller can notify once.
+ */
+export function recoverInterruptedTasks(
+  agentId: string,
+): Array<{ id: string; prompt: string; started_at: number | null }> {
+  const txn = db.transaction(() => {
+    const rows = db
+      .prepare(`SELECT id, prompt, started_at FROM scheduled_tasks WHERE status = 'running' AND agent_id = ?`)
+      .all(agentId) as Array<{ id: string; prompt: string; started_at: number | null }>;
+    const upd = db.prepare(
+      `UPDATE scheduled_tasks
+          SET status = 'active', last_status = 'interrupted', last_result = ?,
+              last_run = COALESCE(started_at, last_run), started_at = NULL
+        WHERE id = ?`,
+    );
+    for (const r of rows) upd.run(INTERRUPTED_TASK_NOTE, r.id);
+    return rows;
+  });
+  return txn();
+}
+
 export function resetStuckTasks(agentId: string): number {
-  const result = db.prepare(
-    `UPDATE scheduled_tasks SET status = 'active', started_at = NULL WHERE status = 'running' AND agent_id = ?`,
-  ).run(agentId);
-  return result.changes;
+  return recoverInterruptedTasks(agentId).length;
 }
 
 export function deleteScheduledTask(id: string): void {
@@ -2135,7 +2167,7 @@ export function createInterAgentTask(
 
 export function completeInterAgentTask(
   id: string,
-  status: 'completed' | 'failed',
+  status: 'completed' | 'failed' | 'timeout',
   result: string | null,
 ): void {
   db.prepare(
@@ -2176,6 +2208,8 @@ export interface MissionTask {
   created_at: number;
   started_at: number | null;
   completed_at: number | null;
+  /** Times this mission has been claimed to run (incremented on claim). */
+  attempts?: number;
 }
 
 export function createMissionTask(
@@ -2348,9 +2382,14 @@ export function claimNextMissionTask(agentId: string): MissionTask | null {
       .get(agentId) as MissionTask | undefined;
     if (!task) return null;
     db.prepare(
-      `UPDATE mission_tasks SET status = 'running', started_at = ? WHERE id = ?`,
+      `UPDATE mission_tasks SET status = 'running', started_at = ?, attempts = COALESCE(attempts, 0) + 1 WHERE id = ?`,
     ).run(Math.floor(Date.now() / 1000), task.id);
-    return { ...task, status: 'running' as const, started_at: Math.floor(Date.now() / 1000) };
+    return {
+      ...task,
+      status: 'running' as const,
+      started_at: Math.floor(Date.now() / 1000),
+      attempts: (task.attempts ?? 0) + 1,
+    };
   });
   return txn();
 }
@@ -2447,11 +2486,55 @@ export function getMissionTaskHistory(limit = 30, offset = 0): { tasks: MissionT
   return { tasks, total };
 }
 
+/** A mission interrupted this many times is failed instead of re-queued. */
+export const MAX_MISSION_ATTEMPTS = 2;
+
+export interface InterruptedMission {
+  id: string;
+  title: string;
+  attempts: number;
+  action: 'requeued' | 'failed';
+}
+
+/**
+ * Startup recovery for missions left 'running' by a crash/restart. A mission
+ * interrupted before its MAX_MISSION_ATTEMPTS-th attempt is re-queued (with
+ * the interruption recorded in `error`); after that it is marked failed so it
+ * cannot loop through restarts repeating side effects. Returns what happened
+ * so the caller can notify once — nothing is re-queued silently.
+ */
+export function recoverInterruptedMissions(agentId: string): InterruptedMission[] {
+  const txn = db.transaction(() => {
+    const rows = db
+      .prepare(`SELECT id, title, attempts FROM mission_tasks WHERE status = 'running' AND assigned_agent = ?`)
+      .all(agentId) as Array<{ id: string; title: string; attempts: number | null }>;
+    const now = Math.floor(Date.now() / 1000);
+    const out: InterruptedMission[] = [];
+    for (const r of rows) {
+      const attempts = r.attempts ?? 0;
+      if (attempts >= MAX_MISSION_ATTEMPTS) {
+        db.prepare(
+          `UPDATE mission_tasks SET status = 'failed', error = ?, completed_at = ? WHERE id = ?`,
+        ).run(
+          `Interrupted by a restart on attempt ${attempts}; not re-run automatically. Re-queue it if still wanted.`,
+          now,
+          r.id,
+        );
+        out.push({ id: r.id, title: r.title, attempts, action: 'failed' });
+      } else {
+        db.prepare(
+          `UPDATE mission_tasks SET status = 'queued', started_at = NULL, error = ? WHERE id = ?`,
+        ).run(`Interrupted by a restart on attempt ${attempts}; re-queued.`, r.id);
+        out.push({ id: r.id, title: r.title, attempts, action: 'requeued' });
+      }
+    }
+    return out;
+  });
+  return txn();
+}
+
 export function resetStuckMissionTasks(agentId: string): number {
-  const result = db.prepare(
-    `UPDATE mission_tasks SET status = 'queued', started_at = NULL WHERE status = 'running' AND assigned_agent = ?`,
-  ).run(agentId);
-  return result.changes;
+  return recoverInterruptedMissions(agentId).length;
 }
 
 // ── Meet Sessions (Pika video meeting skill) ────────────────────────
