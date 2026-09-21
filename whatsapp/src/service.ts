@@ -4,7 +4,8 @@ import { buildClient } from "./client.js";
 import type { Message as WAMessage } from "whatsapp-web.js";
 import { startHealthServer } from "./healthcheck.js";
 import { currentConfig, reloadConfig } from "./config.js";
-import { wasSentByBot } from "./sent-registry.js";
+import { wasSentByBot, consumeExpectedOutgoing } from "./sent-registry.js";
+import { parseApprovalReply, forwardApprovalDecision } from "./outbound-approval.js";
 import { runMainBridge } from "./main-bridge.js";
 import { detectLang } from "./lang.js";
 import { composeReply } from "./reply-composer.js";
@@ -49,6 +50,8 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
     // voice notes and uncaptioned media (which have no body to prefix).
     if (msg.fromMe && (msg.body ?? "").startsWith("\u{1F916}")) return;
     if (msg.fromMe && wasSentByBot(msg.id._serialized)) return;
+    // Outbound gateway sends as Mohamed (no 🤖 prefix): skip our own echo.
+    if (msg.fromMe && consumeExpectedOutgoing(msg.to, msg.body)) return;
 
     let chat: Awaited<ReturnType<typeof msg.getChat>>;
     try {
@@ -184,6 +187,29 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
     console.log("[wa] thread context size:", threadContext.length);
 
     if (isSelfChat) {
+      // "YES AB12" / "NO AB12": outbound-gateway approval, not a prompt.
+      const approval = parseApprovalReply(inboundText);
+      if (approval) {
+        const t0 = Date.now();
+        let note: string | null = null;
+        try {
+          const r = await forwardApprovalDecision(approval);
+          if (r.handled) note = r.message;
+        } catch (e) {
+          note = `Couldn\u2019t apply ${approval.decision === "approve" ? "YES" : "NO"} ${approval.code}: ${String(e).slice(0, 150)}`;
+        }
+        if (note) {
+          const noteId = await sendText(state.client, chatId, note, msg.id._serialized);
+          await recordReply({
+            groupId: chatId, messageId: msg.id._serialized,
+            chosenTier: "self", toolsCalled: ["outbound-approval"], sourcesCited: [],
+            replyText: note, replyMediaUrl: null, replyAt: new Date(), replyMsgId: noteId,
+            durationMs: Date.now() - t0, costEstimate: 0, error: null,
+          });
+          return;
+        }
+        // Unknown code: treat it as a normal message for the agent.
+      }
       console.log("[wa] self-chat -> main agent bridge");
       const bridgeStart = Date.now();
       // Long turns (or turns queued behind another one) used to look like

@@ -2,6 +2,16 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 
 import { logger } from '../logger.js';
 import type { AgentEngine, AgentEngineEvent, AgentTurnInput } from './types.js';
+import { outboundGuardHooks } from '../outbound-guard.js';
+
+/** Merge caller hooks with the always-on outbound guard (guard first). */
+export function withOutboundGuard(extra: AgentTurnInput['hooks']): NonNullable<AgentTurnInput['hooks']> {
+  const merged: NonNullable<AgentTurnInput['hooks']> = { ...outboundGuardHooks() };
+  for (const [event, matchers] of Object.entries(extra ?? {})) {
+    merged[event] = [...(merged[event] ?? []), ...matchers];
+  }
+  return merged;
+}
 
 const TOOL_LABELS: Record<string, string> = {
   Read: 'Reading file',
@@ -113,6 +123,10 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
           ...(input.allowedTools ? { allowedTools: input.allowedTools } : {}),
           ...(input.disallowedTools ? { disallowedTools: input.disallowedTools } : {}),
           ...(input.abortController ? { abortController: input.abortController } : {}),
+          // Outbound guard on every turn (main, sub-agents, war room, voice):
+          // denies scripting WhatsApp Web / the WA send routes even under
+          // bypassPermissions. See src/outbound-guard.ts.
+          hooks: withOutboundGuard(input.hooks),
         } as any,
       })) {
       const ev = event as Record<string, unknown>;

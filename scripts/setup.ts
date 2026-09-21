@@ -605,10 +605,10 @@ async function main() {
     info('ClaudeClaw uses whatsapp-web.js to connect to your existing WhatsApp');
     info('account via the Linked Devices feature (same as WhatsApp Web).');
     console.log();
-    info('A separate process (wa-daemon) runs in the background:');
-    bullet('Keeps a Puppeteer browser session alive');
-    bullet('Stores incoming messages to SQLite');
-    bullet('Exposes an HTTP API on port 4242');
+    info('A separate process (the whatsapp/ service) runs in the background:');
+    bullet('Keeps a Puppeteer browser session alive (DevTools over a pipe, no port)');
+    bullet('Bridges your self-chat to the main agent');
+    bullet('Exposes a token-gated local API on 127.0.0.1:9334 (WA_API_TOKEN)');
     console.log();
     info('First run: a QR code prints to your terminal. Scan it from');
     info('WhatsApp → Settings → Linked Devices. Session saves after that.');
@@ -1335,14 +1335,14 @@ async function main() {
   // ── 14. WhatsApp daemon reminder ─────────────────────────────────────────
   if (wantWhatsApp) {
     section('WhatsApp — next steps');
-    info('To start the WhatsApp daemon:');
+    info('To start the WhatsApp service:');
     console.log();
-    console.log(`  ${c.cyan}npx tsx scripts/wa-daemon.ts${c.reset}`);
+    console.log(`  ${c.cyan}cd whatsapp && npm ci && npm run build && npm start${c.reset}`);
     console.log();
-    info('A QR code will appear. Scan it from:');
+    info('Then open http://127.0.0.1:9334/qr and scan it from:');
     info('  WhatsApp → Settings → Linked Devices → Link a Device');
     console.log();
-    info('The session saves to store/waweb/ and persists across restarts.');
+    info('The session persists across restarts. Set WA_API_TOKEN in .env to enable its API.');
     info('Then use /wa in Telegram to access your chats.');
     console.log();
     ok('Message bodies are encrypted at rest and auto-deleted after 3 days.');
@@ -1554,7 +1554,7 @@ async function main() {
   wantVoiceOut && env.ELEVENLABS_API_KEY ? ok('Voice output: ElevenLabs ✓') : wantVoiceOut ? warn('Voice output: ElevenLabs keys not set') : info('Voice output: not enabled');
   wantVideo && env.GOOGLE_API_KEY ? ok('Video analysis: Gemini ✓') : wantVideo ? warn('Video analysis: GOOGLE_API_KEY not set') : info('Video analysis: not enabled');
   (wantWarRoom && warRoomReady && env.GOOGLE_API_KEY) ? ok('War Room: enabled ✓') : wantWarRoom && !warRoomReady ? warn('War Room: Python deps not installed (disabled)') : wantWarRoom ? warn('War Room: GOOGLE_API_KEY not set') : info('War Room: not enabled');
-  wantWhatsApp ? ok('WhatsApp: run npx tsx scripts/wa-daemon.ts to connect') : info('WhatsApp: not enabled');
+  wantWhatsApp ? ok('WhatsApp: start the whatsapp/ service (cd whatsapp && npm start) to connect') : info('WhatsApp: not enabled');
 
   console.log();
   info('Edit CLAUDE.md any time to change personality, add context, or update skills.');
