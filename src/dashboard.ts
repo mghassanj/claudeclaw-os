@@ -8,7 +8,7 @@ import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, ENABLE_ACP, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG, updateAgentProvider } from './config.js';
-import { runMainTurn } from './main-turn.js';
+import { runMainTurnQueued } from './main-turn.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -812,7 +812,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const text = typeof body?.text === 'string' ? body.text.trim() : '';
     if (!text) return c.json({ error: 'text required' }, 400);
     try {
-      const reply = await runMainTurn(text);
+      const reply = await runMainTurnQueued(text);
       return c.json({ text: reply });
     } catch (err: any) {
       return c.json({ error: err?.message ?? 'main-turn failed' }, 500);
