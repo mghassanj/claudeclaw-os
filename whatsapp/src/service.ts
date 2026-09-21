@@ -9,7 +9,7 @@ import { runMainBridge } from "./main-bridge.js";
 import { detectLang } from "./lang.js";
 import { composeReply } from "./reply-composer.js";
 import {
-  recordInbound, recordReply, alreadyReplied,
+  recordInbound, recordReply, alreadyReplied, exchangeState,
 } from "./audit.js";
 import {
   sendText, sendMediaFromPath,
@@ -17,6 +17,7 @@ import {
 import { checkVoiceArtifact, isVoiceOrAvatarArtifact } from "./tools/voice-qa.js";
 import { transcribeVoice } from "./tools/transcribe.js";
 import { extractDocument } from "./tools/extract_document.js";
+import { selectMissed, isSelfChatCandidate } from "./catchup.js";
 
 async function safeContactName(msg: any): Promise<string> {
   try {
@@ -335,6 +336,9 @@ state.client.on("message_create", onMessage);
 //   - within WA_CATCHUP_MINUTES (default 30; 0 disables),
 //   - older than this READY (newer ones go through the live handler),
 //   - newer than the bot's last reply in that chat.
+// The self-chat (Mohamed's assistant channel) gets the same treatment when
+// WHATSAPP_SELF_CHAT is on; it is replayed after the groups because each
+// self-chat message is a full main-agent turn.
 let catchUpStarted = false;
 async function catchUpMissed(): Promise<void> {
   if (catchUpStarted) return;
@@ -348,14 +352,81 @@ async function catchUpMissed(): Promise<void> {
   const isBotMsg = (m: WAMessage) =>
     m.fromMe && ((m.body ?? "").startsWith("\u{1F916}") || wasSentByBot(m.id._serialized));
   const chats = await state.client.getChats();
+  const selfChats: typeof chats = [];
+  const selfId = (state.client.info as any)?.wid?._serialized as string | undefined;
+  const selfUser = (state.client.info as any)?.wid?.user as string | undefined;
+  const selfLids = (process.env.WHATSAPP_SELF_LIDS ?? "")
+    .split(",").map((x) => x.trim()).filter(Boolean);
   for (const chat of chats) {
-    if (!chat.isGroup || !cfg.isGroupAllowed((chat as any).name ?? "")) continue;
+    if (!chat.isGroup) {
+      if (!cfg.selfChatEnabled) continue;
+      let contactIsMe = false;
+      // contact.isMe is only needed when no explicit self lid is configured;
+      // skip the per-DM lookup otherwise (getChats can return hundreds).
+      if (selfLids.length === 0) {
+        try { contactIsMe = !!((await chat.getContact()) as any)?.isMe; } catch { /* ignore */ }
+      }
+      if (isSelfChatCandidate(chat as any, { selfId, selfUser, selfLids, contactIsMe })) selfChats.push(chat);
+      continue;
+    }
+    if (!cfg.isGroupAllowed((chat as any).name ?? "")) continue;
     const recent = await chat.fetchMessages({ limit: 30 });
-    const lastBotTs = recent.filter(isBotMsg).reduce((t, m) => Math.max(t, m.timestamp), 0);
-    const missed = recent.filter((m) =>
-      m.timestamp >= cutoff && m.timestamp < readyAt && m.timestamp > lastBotTs && !isBotMsg(m));
+    const missed = selectMissed(recent, { cutoff, readyAt, isBotMsg });
     console.log(`[wa] catch-up: "${(chat as any).name}": ${missed.length} unanswered in last ${minutes} min`);
     for (const m of missed) await onMessage(m);
+  }
+  // In the self-chat the "Still working on it…" interim note is bot output but
+  // NOT a reply, so it must not hide the message it was about.
+  const isSelfReply = (m: WAMessage) => isBotMsg(m) && !isInterimNote(m.body ?? "");
+  for (const chat of selfChats) {
+    const selfChatId = chat.id._serialized;
+    const recent = await chat.fetchMessages({ limit: 30 });
+    const candidates = selectMissed(recent, { cutoff, readyAt, isBotMsg: isSelfReply })
+      .filter((m) => !isBotMsg(m));
+    const missed: WAMessage[] = [];
+    const interrupted: WAMessage[] = [];
+    for (const m of candidates) {
+      const st = await exchangeState(selfChatId, m.id._serialized);
+      if (st === "none") missed.push(m);
+      // Handling had started (maybe tools already ran) when we went down:
+      // never silently re-run it — tell Mohamed instead (below).
+      else if (st === "inbound") interrupted.push(m);
+    }
+    console.log(`[wa] catch-up: self-chat: ${missed.length} unanswered, ${interrupted.length} interrupted, in last ${minutes} min`);
+    // Passive mode (enabled=false) records inbound without replying, so an
+    // unreplied row there is not an interruption.
+    if (interrupted.length > 0 && cfg.enabled) await reportInterruptedSelfChat(selfChatId, interrupted);
+    // onMessage re-applies the self-chat gate and the alreadyReplied dedup.
+    for (const m of missed) await onMessage(m);
+  }
+}
+
+// Must match the interim note text sent by the live self-chat handler above.
+const INTERIM_NOTE = "Still working on it\u2026";
+function isInterimNote(body: string): boolean {
+  return body.replace(/^\u{1F916}\s*/u, "").startsWith(INTERIM_NOTE);
+}
+
+/** One self-chat note for turns cut off by a restart; marks them handled so
+ *  the note is not repeated on the next restart. */
+async function reportInterruptedSelfChat(chatId: string, msgs: WAMessage[]): Promise<void> {
+  const list = msgs
+    .map((m) => `\u2022 "${(m.body ?? "[media]").replace(/\s+/g, " ").slice(0, 80)}"`)
+    .join("\n");
+  const note = `I was restarted while working on:\n${list}\nIt may be partly done. I did not re-run it \u2014 resend if you still want it.`;
+  let noteId: string | null = null;
+  try {
+    noteId = await sendText(state.client, chatId, note, msgs[msgs.length - 1].id._serialized);
+  } catch (e) {
+    console.warn("[wa] interrupted-turn note failed:", e);
+  }
+  for (const m of msgs) {
+    await recordReply({
+      groupId: chatId, messageId: m.id._serialized,
+      chosenTier: "self", toolsCalled: [], sourcesCited: [],
+      replyText: null, replyMediaUrl: null, replyAt: new Date(), replyMsgId: noteId,
+      durationMs: 0, costEstimate: 0, error: "interrupted-by-restart",
+    }).catch((e) => console.warn("[wa] recordReply (interrupted) failed:", e));
   }
 }
 state.client.on("ready", () => {

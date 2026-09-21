@@ -6,6 +6,8 @@ import { buildMemoryContext } from './memory.js';
 import { ingestConversationTurn } from './memory-ingest.js';
 import { logger } from './logger.js';
 import { messageQueue } from './message-queue.js';
+import { setActiveAbort } from './state.js';
+import { formatAbortedReply } from './turn-outcome.js';
 
 /**
  * Run one turn of the MAIN agent on the canonical Telegram-main session
@@ -23,7 +25,13 @@ export async function runMainTurn(text: string): Promise<string> {
   const provider = getSelectedProviderConfig();
 
   const abortCtrl = new AbortController();
-  const timer = setTimeout(() => abortCtrl.abort(), AGENT_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; abortCtrl.abort(); }, AGENT_TIMEOUT_MS);
+  // Register under the main chat id so Telegram /stop (and the dashboard
+  // abort) can cancel a bridged turn exactly like a Telegram-native one.
+  // Safe because turns on this chat are serialized by messageQueue.
+  const abortKey = String(chatId);
+  setActiveAbort(abortKey, abortCtrl);
   try {
     logger.info({ chatId, hasSession: !!sessionId, len: text.length }, 'main-turn bridge: starting');
     const result = await runAgentWithRetry(
@@ -41,12 +49,17 @@ export async function runMainTurn(text: string): Promise<string> {
       undefined,
     );
     if (result.newSessionId) setSession(chatId, result.newSessionId, 'main');
-    const reply = (result.text ?? '').trim() || 'Done.';
+    // Never report an aborted turn as a plain success: label timeout vs /stop
+    // and keep any partial text.
+    const reply = result.aborted
+      ? formatAbortedReply(result.text, { timedOut, timeoutMs: AGENT_TIMEOUT_MS })
+      : (result.text ?? '').trim() || 'Done.';
     void ingestConversationTurn(chatId, text, reply).catch(() => {});
-    logger.info({ chatId, replyLen: reply.length }, 'main-turn bridge: done');
+    logger.info({ chatId, replyLen: reply.length, aborted: !!result.aborted, timedOut }, 'main-turn bridge: done');
     return reply;
   } finally {
     clearTimeout(timer);
+    setActiveAbort(abortKey, null);
   }
 }
 

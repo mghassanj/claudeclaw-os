@@ -29,6 +29,9 @@ export class AgentError extends Error {
   category: ErrorCategory;
   recovery: ErrorRecovery;
   originalError: Error | undefined;
+  /** Tool calls the failed attempt had already started. runAgentWithRetry
+   *  refuses to retry when > 0 so side effects are never repeated. */
+  toolUsesBeforeFailure = 0;
 
   constructor(category: ErrorCategory, recovery: ErrorRecovery, originalError?: Error) {
     super(recovery.userMessage);

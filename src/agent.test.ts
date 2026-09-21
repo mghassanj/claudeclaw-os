@@ -209,3 +209,62 @@ describe('runAgentWithRetry', () => {
     expect(capturedModels[1]).toBe('claude-sonnet-4-6');
   }, 15000);
 });
+
+describe('runAgentWithRetry: never repeat side effects', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const transient = () => new AgentError('subprocess_crash', {
+    shouldRetry: true,
+    shouldNewChat: false,
+    shouldSwitchModel: false,
+    retryAfterMs: 100,
+    userMessage: 'Subprocess crashed',
+  });
+
+  it('surfaces a transient error without retrying when the attempt already ran a tool', async () => {
+    mockQuery.mockImplementation(() => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Bash', input: {} }] },
+      };
+      throw transient();
+    })());
+
+    const onRetry = vi.fn();
+    const err = await runAgentWithRetry(
+      'send it', undefined, noop, undefined, undefined, undefined, undefined, onRetry, undefined, undefined, claudeProvider,
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(AgentError);
+    expect((err as AgentError).toolUsesBeforeFailure).toBe(1);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it('still retries a transient error when the failed attempt ran no tools', async () => {
+    let calls = 0;
+    mockQuery.mockImplementation(() => {
+      calls++;
+      if (calls === 1) {
+        return (async function* () {
+          yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+          throw transient();
+        })();
+      }
+      return mockQueryEvents([
+        { type: 'system', subtype: 'init', session_id: 'sess-2' },
+        resultEvent('ok'),
+      ])();
+    });
+
+    const result = await runAgentWithRetry(
+      'hi', undefined, noop, undefined, undefined, undefined, undefined, undefined, undefined, undefined, claudeProvider,
+    );
+    expect(result.text).toBe('ok');
+    expect(calls).toBe(2);
+  }, 15000);
+});

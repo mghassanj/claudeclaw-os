@@ -40,10 +40,10 @@ vi.mock('./db.js', () => ({
   logConversationTurn: vi.fn(),
   markTaskRunning: vi.fn(),
   updateTaskAfterRun: vi.fn(),
-  resetStuckTasks: vi.fn(() => 0),
+  recoverInterruptedTasks: vi.fn(() => []),
   claimNextMissionTask: vi.fn(() => null),
   completeMissionTask: vi.fn(),
-  resetStuckMissionTasks: vi.fn(() => 0),
+  recoverInterruptedMissions: vi.fn(() => []),
   getMissionTask: vi.fn(() => null),
 }));
 
