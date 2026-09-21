@@ -20,6 +20,7 @@ import { buildMemoryContext } from './memory.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { requireEnabled, KillSwitchDisabledError } from './kill-switches.js';
 import { loadMcpServers } from './agent.js';
+import { mcpAllowlistFromYaml } from './mcp-allowlist.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { EngineFactory } from './agent-engine/index.js';
@@ -107,8 +108,7 @@ async function main() {
       const yamlPath = path.join(agentDir, 'agent.yaml');
       if (fs.existsSync(yamlPath)) {
         const raw = yaml.load(fs.readFileSync(yamlPath, 'utf-8')) as Record<string, unknown> | undefined;
-        const list = raw?.['mcp_servers'];
-        if (Array.isArray(list)) mcpAllowlist = list.filter((x): x is string => typeof x === 'string');
+        mcpAllowlist = mcpAllowlistFromYaml(raw);
       }
     } catch (err) {
       // Non-fatal: fall through with undefined allowlist (loads all MCPs)
