@@ -1,0 +1,40 @@
+name: heartbeat-watch
+
+# Out-of-band monitor for the ClaudeClaw EC2 host. scripts/heartbeat.sh (run by
+# the host's healthcheck timer every 15 min) writes ts/status to a secret gist.
+# This job runs on GitHub, outside AWS, and fails when the heartbeat is stale
+# (host down, DNS/network outage, timer stopped) or not OK. GitHub emails the
+# owner on failed scheduled runs, so the alert does not depend on Telegram.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check ClaudeClaw heartbeat
+        env:
+          GIST_ID: ${{ secrets.HEARTBEAT_GIST_ID }}
+          MAX_AGE_MIN: "45"
+        run: |
+          set -euo pipefail
+          if [ -z "$GIST_ID" ]; then echo "::error::HEARTBEAT_GIST_ID secret not set"; exit 1; fi
+          body=$(curl -fsS --retry 3 "https://api.github.com/gists/$GIST_ID" | jq -r '.files["heartbeat.txt"].content')
+          ts=$(printf '%s\n' "$body" | sed -n 's/^ts=//p')
+          status=$(printf '%s\n' "$body" | sed -n 's/^status=//p')
+          problems=$(printf '%s\n' "$body" | sed -n 's/^problems=//p')
+          age=$(( ( $(date +%s) - ${ts:-0} ) / 60 ))
+          echo "status=$status age_min=$age problems=$problems"
+          if [ "$age" -gt "$MAX_AGE_MIN" ]; then
+            echo "::error::ClaudeClaw heartbeat is ${age} min old (host down, DNS/network outage, or healthcheck timer stopped)"
+            exit 1
+          fi
+          if [ "$status" != "OK" ]; then
+            echo "::error::ClaudeClaw reports $status: $problems"
+            exit 1
+          fi
