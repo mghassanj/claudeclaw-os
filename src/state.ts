@@ -33,7 +33,7 @@ export interface ChatEvent {
   chatId: string;
   agentId?: string;
   content?: string;
-  source?: 'telegram' | 'dashboard';
+  source?: 'telegram' | 'dashboard' | 'whatsapp';
   description?: string;
   progressKind?: string;
   status?: string;

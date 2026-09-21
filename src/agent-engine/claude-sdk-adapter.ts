@@ -87,6 +87,10 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
     // top-level text blocks reconstructs the full response. Subagent text is
     // excluded (parent_tool_use_id != null) so it never leaks into the reply.
     const turnTextBlocks: string[] = [];
+    // Text written after the most recent top-level tool call. A tool_use
+    // resets it, so at the end of the turn it holds only the final answer
+    // (narration like "Let me check the calendar…" precedes a tool call).
+    let finalSegmentBlocks: string[] = [];
 
     // SDK 0.3.x requires `allowDangerouslySkipPermissions: true` whenever
     // `permissionMode` is 'bypassPermissions'. Resolve the mode first, then default
@@ -158,6 +162,9 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
             for (const block of content) {
               if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
                 turnTextBlocks.push(block.text);
+                finalSegmentBlocks.push(block.text);
+              } else if (block.type === 'tool_use') {
+                finalSegmentBlocks = [];
               }
             }
           }
@@ -248,9 +255,11 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
         // `ev.result` when no top-level text was captured.
         const assembledText = turnTextBlocks.join('\n\n').trim();
         const sdkResult = (ev.result as string | null | undefined) ?? null;
+        const finalText = finalSegmentBlocks.join('\n\n').trim() || null;
         yield {
           type: 'result',
           text: assembledText || sdkResult,
+          finalText,
           usage,
           stopReason: typeof ev.subtype === 'string' ? ev.subtype : undefined,
           raw: ev,

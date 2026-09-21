@@ -115,6 +115,36 @@ describe('Agent Provider Engine', () => {
     expect(resultEvent).toMatchObject({ text: 'Here is the full answer.\n\nLogged to hive mind.' });
   });
 
+  it('reports finalText = text after the last tool call (narration excluded)', async () => {
+    const adapter = new ClaudeSdkEngineAdapter();
+    const events = await collect(adapter, [
+      { type: 'assistant', parent_tool_use_id: null, message: { content: [
+        { type: 'text', text: 'Let me check your calendar…' },
+        { type: 'tool_use', id: 'tool-1', name: 'Bash' },
+      ] } },
+      { type: 'assistant', parent_tool_use_id: 'tool-1', message: { content: [{ type: 'text', text: 'subagent chatter' }] } },
+      { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'text', text: 'Now the email.' }, { type: 'tool_use', id: 'tool-2', name: 'Bash' }] } },
+      { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'text', text: 'You are free at 3pm.' }] } },
+      { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'text', text: 'Want me to book it?' }] } },
+      { type: 'result', subtype: 'success', result: 'Want me to book it?', usage: {}, total_cost_usd: 0 },
+    ]);
+    const resultEvent = events.find((ev) => ev.type === 'result');
+    expect(resultEvent).toMatchObject({
+      text: 'Let me check your calendar…\n\nNow the email.\n\nYou are free at 3pm.\n\nWant me to book it?',
+      finalText: 'You are free at 3pm.\n\nWant me to book it?',
+    });
+  });
+
+  it('reports finalText null when the turn ends on a tool call', async () => {
+    const adapter = new ClaudeSdkEngineAdapter();
+    const events = await collect(adapter, [
+      { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'text', text: 'Working.' }, { type: 'tool_use', id: 't', name: 'Bash' }] } },
+      { type: 'result', subtype: 'error_max_turns', result: null, usage: {}, total_cost_usd: 0 },
+    ]);
+    const resultEvent = events.find((ev) => ev.type === 'result');
+    expect(resultEvent).toMatchObject({ text: 'Working.', finalText: null });
+  });
+
   it('excludes subagent text (parent_tool_use_id set) from the assembled result', async () => {
     const adapter = new ClaudeSdkEngineAdapter();
     const events = await collect(adapter, [

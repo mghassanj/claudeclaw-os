@@ -2,6 +2,7 @@ import type { WAClient } from "../client.js";
 import { MessageMedia } from "../client.js";
 import fs from "node:fs/promises";
 import { markSent } from "../sent-registry.js";
+import { formatForWhatsApp, prepareWhatsAppMessages } from "./format.js";
 
 const PREFIX = "🤖";
 const THROTTLE_MS = 3000;
@@ -24,14 +25,27 @@ function recordSent(sent: { id?: { _serialized?: string } } | undefined | null):
   return id;
 }
 
+/**
+ * Send a bot reply. The text is converted from Markdown to WhatsApp syntax
+ * (tools/format.ts) and, when long, split at paragraph boundaries into several
+ * consecutive messages. Every part carries the 🤖 prefix (loop prevention);
+ * only the first part quotes the inbound message. Returns the first part's id.
+ */
 export async function sendText(
   client: WAClient, chatId: string, text: string, replyToMsgId?: string,
 ): Promise<string | null> {
-  await throttle();
-  const sent = await client.sendMessage(chatId, `${PREFIX} ${text}`, {
-    quotedMessageId: replyToMsgId,
-  });
-  return recordSent(sent);
+  const parts = prepareWhatsAppMessages(text);
+  if (parts.length === 0) parts.push(text.trim() || "…");
+  let firstId: string | null = null;
+  for (let i = 0; i < parts.length; i++) {
+    await throttle();
+    const sent = await client.sendMessage(chatId, `${PREFIX} ${parts[i]}`, {
+      quotedMessageId: i === 0 ? replyToMsgId : undefined,
+    });
+    const id = recordSent(sent);
+    if (i === 0) firstId = id;
+  }
+  return firstId;
 }
 
 export async function sendInterim(
@@ -50,7 +64,7 @@ export async function sendMediaFromPath(
   await throttle();
   const media = MessageMedia.fromFilePath(filePath);
   const sent = await client.sendMessage(chatId, media, {
-    caption: caption ? `${PREFIX} ${caption}` : undefined,
+    caption: caption ? `${PREFIX} ${formatForWhatsApp(caption)}` : undefined,
     quotedMessageId: replyToMsgId,
   });
   return recordSent(sent);
@@ -62,7 +76,7 @@ export async function sendMediaFromUrl(
   await throttle();
   const media = await MessageMedia.fromUrl(url, { unsafeMime: true });
   const sent = await client.sendMessage(chatId, media, {
-    caption: caption ? `${PREFIX} ${caption}` : undefined,
+    caption: caption ? `${PREFIX} ${formatForWhatsApp(caption)}` : undefined,
     quotedMessageId: replyToMsgId,
   });
   return recordSent(sent);

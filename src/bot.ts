@@ -41,6 +41,8 @@ import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessa
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
 import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
+import { extractFileMarkers } from './file-markers.js';
+import { clearPendingHandoff, markHandoffPending, runWithTurnContext, takePendingHandoff } from './session-handoff.js';
 import { trackUsage, getRateStatus } from './rate-tracker.js';
 import { buildCostFooter } from './cost-footer.js';
 import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, ProviderConfig } from './provider.js';
@@ -324,60 +326,9 @@ export function splitMessage(text: string): string[] {
   return parts;
 }
 
-// ── File marker types ─────────────────────────────────────────────────
-export interface FileMarker {
-  type: 'document' | 'photo';
-  filePath: string;
-  caption?: string;
-}
-
-export interface ExtractResult {
-  text: string;
-  files: FileMarker[];
-}
-
-/**
- * Extract [SEND_FILE:path] and [SEND_PHOTO:path] markers from Claude's response.
- * Supports optional captions via pipe: [SEND_FILE:/path/to/file.pdf|Here's your report]
- *
- * Tolerant of common malformed variants observed in the wild:
- *   - Pipe used as the primary separator instead of colon
- *     ([SEND_PHOTO|https://...] or SEND_PHOTO|https://...)
- *   - Missing surrounding brackets entirely
- *   - http(s) URLs in addition to filesystem paths
- *
- * Returns the cleaned text (markers stripped) and an array of file descriptors.
- */
-export function extractFileMarkers(text: string): ExtractResult {
-  const files: FileMarker[] = [];
-
-  // Canonical bracketed form: [SEND_FILE:/abs/path|caption]
-  // Tolerant variants: pipe instead of colon, optional brackets, URL paths.
-  // The bracketed form is preferred (it's documented in CLAUDE.md), but the
-  // bare/pipe forms are recognized so a malformed agent reply still gets
-  // its image rendered instead of leaking the raw command string into chat.
-  const patterns: RegExp[] = [
-    /\[SEND_(FILE|PHOTO)[:|]\s*([^\]|]+?)(?:\s*\|\s*([^\]]*))?\]/g,
-    /(?:^|\s)SEND_(FILE|PHOTO)\s*[:|]\s*((?:https?:\/\/|\/)[^\s|\]]+)(?:\s*\|\s*([^\n]+))?/g,
-  ];
-
-  let cleaned = text;
-  for (const pattern of patterns) {
-    cleaned = cleaned.replace(pattern, (_match: string, kind: string, filePath: string, caption?: string) => {
-      files.push({
-        type: kind === 'PHOTO' ? 'photo' : 'document',
-        filePath: filePath.trim(),
-        caption: caption?.trim() || undefined,
-      });
-      return '';
-    });
-  }
-
-  // Collapse extra blank lines left by stripped markers
-  const trimmed = cleaned.replace(/\n{3,}/g, '\n\n').trim();
-
-  return { text: trimmed, files };
-}
+// File markers live in file-markers.ts (shared with the WhatsApp bridge).
+export { extractFileMarkers } from './file-markers.js';
+export type { FileMarker, ExtractResult } from './file-markers.js';
 
 /**
  * Send a Telegram typing action. Silently ignores errors (e.g. bot was blocked).
@@ -555,6 +506,15 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   // prompt (ACP). On the Claude SDK path it's already pinned there every turn, so
   // injecting again would just duplicate it on the first turn.
   if (agentSystemPrompt && !sessionId && !engineSupportsSystemPrompt(agentProvider)) parts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
+  // First turn after /newchat: hand the fresh session the recent conversation.
+  // /respin (skipLog) carries its own history, so it only clears the mark.
+  if (!sessionId) {
+    if (skipLog) clearPendingHandoff(chatIdStr, AGENT_ID);
+    else {
+      const handoff = takePendingHandoff(chatIdStr, AGENT_ID);
+      if (handoff) parts.push(handoff);
+    }
+  }
   if (memCtx) parts.push(memCtx);
 
   // Inject recent scheduled task outputs so the user can reply to them naturally.
@@ -573,7 +533,8 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     parts.push(MEMORY_NUDGE_TEXT);
   }
 
-  parts.push(message);
+  // Channel tag, matching the WhatsApp bridge's "[Channel: WhatsApp self-chat | …]".
+  parts.push(`[Channel: Telegram]\n${message}`);
   const fullMessage = parts.join('\n\n');
 
   // Smart model routing: use cheap model for simple acknowledgments
@@ -679,7 +640,8 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       }
     } : undefined;
 
-    const result = await runAgentWithRetry(
+    // Turn context lets runAgent's stale-session self-heal build a handoff.
+    const result = await runWithTurnContext({ chatId: chatIdStr, agentId: AGENT_ID }, () => runAgentWithRetry(
       fullMessage,
       sessionId,
       () => void sendTyping(ctx.api, chatId),
@@ -694,7 +656,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       agentMcpAllowlist,
       provider,
       chatToolPolicyFor(provider),
-    );
+    ));
 
     clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
@@ -1104,6 +1066,9 @@ export function createBot(): Bot {
 
     clearSession(chatIdStr, AGENT_ID);
     sessionBaseline.delete(chatIdStr);
+    // The next turn (Telegram or WhatsApp self-chat) opens with a short
+    // handoff of recent turns + this session's summary (session-handoff.ts).
+    if (oldSessionId) markHandoffPending(chatIdStr, AGENT_ID);
     await ctx.reply('Session cleared. Starting fresh.');
     logger.info({ chatId: ctx.chat!.id }, 'Session cleared by user');
   });
