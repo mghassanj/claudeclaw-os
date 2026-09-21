@@ -7,6 +7,14 @@ import { readEnvFile } from './env.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { EngineFactory } from './agent-engine/index.js';
 import { defaultModelForProvider, getSelectedProviderConfig } from './active-provider.js';
+import {
+  normalizeKind,
+  pinPreferenceMemory,
+  recordCommitmentFromIntake,
+  upsertPersonFromIntake,
+  type ExtractedCommitment,
+  type ExtractedPerson,
+} from './pa-intake.js';
 
 // Callback for notifying when a high-importance memory is created.
 // Set by bot.ts to send a Telegram notification.
@@ -92,6 +100,10 @@ interface ExtractionResult {
   entities: string[];
   topics: string[];
   importance: number;
+  /** Typed intake. Missing/unknown -> 'fact' (pre-typed behaviour). */
+  kind?: string;
+  person?: ExtractedPerson;
+  commitment?: ExtractedCommitment;
 }
 
 const EXTRACTION_PROMPT = `You are a memory extraction agent. Given a conversation exchange between a user and their AI assistant, decide if it contains information worth remembering LONG-TERM (weeks/months from now).
@@ -121,15 +133,26 @@ EXTRACT only if the exchange reveals:
 - Business rules or workflows that are STANDING RULES
 - Recurring patterns or routines
 - Technical preferences or architectural decisions
+- COMMITMENTS (exception to the ephemeral rules above): the assistant or user commits to a FUTURE action that someone must remember to do or check ("I'll follow up with X tomorrow", "remind me Sunday to…", "track her reply and respond", "I'll send the report after the meeting"). Extract these as kind "commitment".
+
+Classify what you extract as exactly one "kind":
+- "fact": durable fact, decision, rule, workflow (the default)
+- "preference": how the user wants things done from now on (tone, language, format, habits)
+- "person": who a specific person is and how the user relates to them (role, relationship, language, how to address them)
+- "commitment": a future action that must be tracked (see above)
 
 If extracting, return JSON:
 {
   "skip": false,
+  "kind": "fact" | "preference" | "person" | "commitment",
   "summary": "1-2 sentence summary focused on the LASTING FACT, not the conversation. Write as a rule or fact, not a narrative.",
   "entities": ["entity1", "entity2"],
   "topics": ["topic1", "topic2"],
-  "importance": 0.0-1.0
+  "importance": 0.0-1.0,
+  "person": {"name": "...", "aliases": ["..."], "relationship": "...", "org": "...", "language_pref": "e.g. ar-najdi | en", "notes": "..."},
+  "commitment": {"summary": "who does what", "due": "ISO time with offset or relative like 2h/1d, omit if none", "contact_name": "..."}
 }
+Include "person" only for kind "person" and "commitment" only for kind "commitment". Never put phone numbers or emails in "notes".
 
 Importance guide:
 - 0.8-1.0: Core identity, strong preferences, critical business rules, relationship dynamics
@@ -185,6 +208,27 @@ export async function ingestConversationTurn(
       return false;
     }
 
+    // Typed intake. Side effects (contacts, open loops) only for the main
+    // agent's own conversation: scheduled/mission/loop-fired turns would
+    // otherwise re-capture their own prompts as new commitments.
+    const kind = normalizeKind(result.kind);
+    const typedSideEffects = agentId === 'main' && !/\[(Scheduled task|Mission task|Open loop)/.test(userMessage.slice(0, 300));
+    if (kind === 'commitment') {
+      // Commitments are tracked as (unconfirmed) open loops, not memory rows.
+      if (!typedSideEffects) return false;
+      try {
+        return recordCommitmentFromIntake(result.commitment, result.summary, agentId) !== null;
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'typed intake: commitment failed');
+        return false;
+      }
+    }
+    if (kind === 'person' && typedSideEffects) {
+      try { upsertPersonFromIntake(result.person); } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'typed intake: person upsert failed');
+      }
+    }
+
     // Hard filter: only save memories with meaningful importance.
     // 0.5 threshold ensures only genuinely useful context gets through.
     // The 0.3-0.4 tier was almost entirely noise (task logs, form steps).
@@ -229,13 +273,20 @@ export async function ingestConversationTurn(
       agentId,
     );
 
+    // Preferences are standing instructions: pin so they never decay.
+    if (kind === 'preference') {
+      try { pinPreferenceMemory(memoryId); } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'typed intake: pin failed');
+      }
+    }
+
     // Notify on high-importance memories so the user can pin them
-    if (importance >= 0.8 && onHighImportanceMemory) {
+    if (importance >= 0.8 && kind !== 'preference' && onHighImportanceMemory) {
       try { onHighImportanceMemory(memoryId, result.summary, importance); } catch { /* non-fatal */ }
     }
 
     logger.info(
-      { chatId, importance, memoryId, topics: result.topics, summary: result.summary.slice(0, 80) },
+      { chatId, importance, memoryId, kind, topics: result.topics, summary: result.summary.slice(0, 80) },
       'Memory ingested',
     );
     return true;

@@ -8,6 +8,7 @@ import {
   getRecentConsolidations,
   getRecentHighImportanceMemories,
   getRecentWarRoomTranscriptForChat,
+  getSession,
   getTurnCountSinceTimestamp,
   logConversationTurn,
   pruneConversationLog,
@@ -23,6 +24,60 @@ import { generateContent, parseJsonResponse } from "./anthropic.js";
 import { logger } from './logger.js';
 import { ingestConversationTurn } from './memory-ingest.js';
 import { buildObsidianContext } from './obsidian.js';
+import { buildPaContextBlocks } from './pa-context.js';
+import type { HiveMindEntry } from './db.js';
+
+// ── Retrieval hygiene: "already injected this session" ──────────────
+// The Claude session keeps every earlier turn, so re-injecting the same
+// high-importance rows each turn only burns context. Tracked per
+// chat+agent and reset whenever the session id changes (/newchat, expiry).
+const injectedThisSession = new Map<string, { session: string; ids: Set<number> }>();
+
+function sessionInjectedSet(chatId: string, agentId: string): Set<number> | null {
+  let session: string;
+  try {
+    session = getSession(chatId, agentId) ?? '';
+  } catch {
+    return null; // no session store (tests / early boot): don't filter
+  }
+  const key = `${chatId}:${agentId}`;
+  const cur = injectedThisSession.get(key);
+  if (cur && cur.session === session) return cur.ids;
+  const fresh = { session, ids: new Set<number>() };
+  injectedThisSession.set(key, fresh);
+  return fresh.ids;
+}
+
+/** @internal tests */
+export function _resetInjectedMemoryTracking(): void {
+  injectedThisSession.clear();
+}
+
+/**
+ * Team-activity lines: one per agent (its most recent entry), with repeats
+ * of the same action collapsed into a count. Without this, 22 identical
+ * "TRIAGE_BLOCKED" rows from one agent crowded out everything else.
+ */
+export function dedupeTeamActivity(entries: HiveMindEntry[], nowSec = Date.now() / 1000): string[] {
+  const byAgent = new Map<string, { latest: HiveMindEntry; repeats: number }>();
+  for (const e of entries) {
+    const cur = byAgent.get(e.agent_id);
+    if (!cur) {
+      byAgent.set(e.agent_id, { latest: e, repeats: 1 });
+    } else if (e.action === cur.latest.action) {
+      cur.repeats++;
+    }
+    if (cur && e.created_at > cur.latest.created_at) cur.latest = e;
+  }
+  return [...byAgent.values()]
+    .sort((a, b) => b.latest.created_at - a.latest.created_at)
+    .map(({ latest, repeats }) => {
+      const ago = Math.round((nowSec - latest.created_at) / 60);
+      const timeStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
+      const rep = repeats > 1 ? ` (×${repeats} ${latest.action})` : '';
+      return `- [${latest.agent_id}] ${timeStr}: ${latest.summary}${rep}`;
+    });
+}
 
 /**
  * Build a structured memory context string to prepend to the user's message.
@@ -99,10 +154,17 @@ export async function buildMemoryContext(
     memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
   }
 
-  // Layer 2: recent high-importance memories (deduplicated)
-  const recent = getRecentHighImportanceMemories(chatId, 5, strictAgentId);
+  // Layer 2: high-importance memories, ranked by importance * salience,
+  // skipping rows this session has already been shown (deduplicated).
+  const injected = sessionInjectedSet(chatId, agentId);
+  const recent = getRecentHighImportanceMemories(chatId, injected ? 20 : 5, strictAgentId);
+  let layer2 = 0;
   for (const mem of recent) {
+    if (layer2 >= 5) break;
     if (seen.has(mem.id)) continue;
+    if (injected?.has(mem.id)) continue;
+    injected?.add(mem.id);
+    layer2++;
     seen.add(mem.id);
     summaryMap.set(mem.id, mem.summary);
     const topics = safeParse(mem.topics);
@@ -167,11 +229,14 @@ export async function buildMemoryContext(
     }
   }
 
-  if (memLines.length === 0 && insightLines.length === 0 && warRoomLines.length === 0 && !agentObsidianConfig) {
+  // Personal-assistant blocks ([Open loops], [People]) for the main agent.
+  const paBlocks = agentId === 'main' && !strictAgentId ? buildPaContextBlocks(userMessage) : [];
+
+  if (memLines.length === 0 && insightLines.length === 0 && warRoomLines.length === 0 && paBlocks.length === 0 && !agentObsidianConfig) {
     return { contextText: '', surfacedMemoryIds: [], surfacedMemorySummaries: new Map() };
   }
 
-  const parts: string[] = [];
+  const parts: string[] = [...paBlocks];
 
   if (memLines.length > 0 || insightLines.length > 0) {
     const blocks: string[] = ['[Memory context]'];
@@ -191,14 +256,10 @@ export async function buildMemoryContext(
   // Layer 4: Cross-agent activity awareness (skipped for strict per-agent
   // war-room callers).
   if (includeTeamActivity) {
-    const teamActivity = getOtherAgentActivity(agentId, 24, 10);
+    // Fetch a wider window so dedupe still yields one line per active agent.
+    const teamActivity = getOtherAgentActivity(agentId, 24, 50);
     if (teamActivity.length > 0) {
-      const activityLines = teamActivity.map((entry) => {
-        // Note: created_at is unix seconds, Date.now() is ms, so divide by 1000
-        const ago = Math.round((Date.now() / 1000 - entry.created_at) / 60);
-        const timeStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
-        return `- [${entry.agent_id}] ${timeStr}: ${entry.summary}`;
-      });
+      const activityLines = dedupeTeamActivity(teamActivity);
       parts.push(`[Team activity — what other agents have done recently]\n${activityLines.join('\n')}\n[End team activity]`);
     }
   }

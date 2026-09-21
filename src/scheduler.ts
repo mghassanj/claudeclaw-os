@@ -27,6 +27,7 @@ import {
   shouldAlertStatusChange,
   wrapScheduledPrompt,
 } from './turn-outcome.js';
+import { resumePendingLoopFires, setLoopTelegramSender, sweepOpenLoops } from './open-loops-runtime.js';
 
 type Sender = (text: string) => Promise<void>;
 
@@ -98,11 +99,19 @@ export function initScheduler(send: Sender, agentId = 'main'): void {
     });
   }
 
+  // Open loops (durable follow-ups) are owned by the main process: it fires
+  // them as queued main turns and sweeps due/expired ones on each tick.
+  if (agentId === 'main') {
+    setLoopTelegramSender(send);
+    try { resumePendingLoopFires(); } catch (err) { logger.error({ err }, 'open-loops resume failed'); }
+  }
+
   setInterval(() => void runDueTasks(), 60_000);
   logger.info({ agentId }, 'Scheduler started (checking every 60s)');
 }
 
 async function runDueTasks(): Promise<void> {
+  if (schedulerAgentId === 'main') await sweepOpenLoops();
   const tasks = getDueTasks(schedulerAgentId);
 
   if (tasks.length > 0) {

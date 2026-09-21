@@ -19,6 +19,7 @@ import { checkVoiceArtifact, isVoiceOrAvatarArtifact } from "./tools/voice-qa.js
 import { transcribeVoice } from "./tools/transcribe.js";
 import { extractDocument } from "./tools/extract_document.js";
 import { selectMissed, isSelfChatCandidate } from "./catchup.js";
+import { catchUpOpenLoops, notifyOpenLoops, reportSelfChatId } from "./open-loops-hook.js";
 
 async function safeContactName(msg: any): Promise<string> {
   try {
@@ -66,6 +67,8 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
       const selfLidList = (process.env.WHATSAPP_SELF_LIDS ?? "").split(",").map((x) => x.trim());
       const maybeSelf = msg.from === msg.to || selfLidList.includes(peerUser);
       if (!peer.endsWith("@g.us") && !maybeSelf) {
+        // Still a possible open-loop reply (e.g. an @lid contact we're waiting on).
+        if (!msg.fromMe) void notifyOpenLoops(msg, peer, false);
         console.log("[wa] skip: chat lookup failed for 1:1 dm (" + (peer.split("@")[1] ?? "?") + ")");
         return;
       }
@@ -98,7 +101,12 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
       // Self-chat ("Message Yourself") — Mohamed's private assistant channel.
       // Gated by WHATSAPP_SELF_CHAT so it can be toggled without a code change.
       if (!cfg.selfChatEnabled) return;
+      reportSelfChatId(chatId);
     } else {
+      // Open loops: any non-self inbound message (1:1 or group, allowed or
+      // not) may be the reply an await_reply loop is waiting for. Runs before
+      // the drops below; fire-and-forget so it never delays the handler.
+      if (!msg.fromMe) void notifyOpenLoops(msg, chatId, chat.isGroup);
       // Group pilot flow: only process Mohamed's own messages if selfReply on.
       if (msg.fromMe && !cfg.selfReply) return;
       if (!chat.isGroup) return;
@@ -455,8 +463,16 @@ async function reportInterruptedSelfChat(chatId: string, msgs: WAMessage[]): Pro
     }).catch((e) => console.warn("[wa] recordReply (interrupted) failed:", e));
   }
 }
+let loopCatchUpStarted = false;
 state.client.on("ready", () => {
   catchUpMissed().catch((e) => console.error("[wa] catch-up failed:", e));
+  // Open-loop replies that arrived while we were down (once per process).
+  if (!loopCatchUpStarted) {
+    loopCatchUpStarted = true;
+    state.patched
+      .then(() => catchUpOpenLoops(state.client))
+      .catch((e) => console.error("[wa] open-loops catch-up failed:", e));
+  }
 });
 
 process.on("SIGHUP", () => {
