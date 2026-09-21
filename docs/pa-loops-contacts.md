@@ -25,7 +25,7 @@ Your answer goes to Mohamed on the loop's origin.
 2. **Never write polling scripts:** no `while(true)`, no `sleep` loops, no DevTools/puppeteer watchers, no background `node` scripts that wait for messages. The WhatsApp service already feeds each inbound message to the loop matcher.
 3. There is one watcher per chat. `loops-cli add` refuses to create a duplicate `await_reply` loop for a chat that is already watched. Reuse the existing loop and don't pass `--force` to get around it.
 4. When a loop fires, act on its intent, then close it with `loops-cli close <id> "<what happened>"`. If more is needed, snooze it, or add a new loop.
-5. A fired loop does not approve sending anything. When a reply to a third party is needed, draft it and ask Mohamed. "Respond accordingly" means draft and ask. Only Mohamed's approval of that exact text sends it.
+5. A fired loop does not approve sending anything. "Respond accordingly" means: propose the reply through the outbound gateway (`outbound-cli propose wa --to <chatId> --text "…"`, see "Acting on Mohamed's behalf"), then tell Mohamed it is waiting for his approval. The fired prompt includes the WhatsApp chat id. Use `outbound-cli read <chatId> --since 1h` if you need more of the conversation.
 6. `[Open loops]` at the top of each turn lists the active loops, overdue first. Mention overdue ones when relevant. When one no longer matters, close it or drop it with `loops-cli drop`.
 7. Memory intake can capture a commitment on its own. It shows as `UNCONFIRMED` and never fires. Ask Mohamed, then run `loops-cli confirm <id>` or `loops-cli drop <id>`.
 
@@ -48,7 +48,7 @@ Your answer goes to Mohamed on the loop's origin.
 # "Go ahead, track her reply and respond accordingly" (from the WhatsApp self-chat)
 node dist/loops-cli.js add --kind await_reply --contact "Nora" \
   --summary "Nora's answer on the Thursday meeting" \
-  --intent "Summarise her reply for Mohamed and draft a response in Najdi Arabic; ask before sending" \
+  --intent "Summarise her reply for Mohamed and propose a response in Najdi Arabic via outbound-cli" \
   --origin whatsapp-self --expires 3d
 
 # Reply deadline: nudge if nothing comes back by 6pm Riyadh time

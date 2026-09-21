@@ -13,8 +13,6 @@
  * the DB (atomic UPDATE) BEFORE the turn runs and pending_trigger is only
  * cleared once the result was delivered.
  */
-import http from 'node:http';
-
 import { getDashboardSetting, setDashboardSetting } from './db.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
@@ -102,32 +100,11 @@ export async function deliverToOrigin(origin: string, text: string): Promise<voi
   await sendTelegram(text);
 }
 
-function waHeaders(body: string): Record<string, string | number> {
-  const h: Record<string, string | number> = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
-  // Sent when configured, for a token-gated WhatsApp HTTP API.
-  const token = envValue('WHATSAPP_API_TOKEN');
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
-}
-
-/** POST to the WhatsApp service's loopback /send (it adds the 🤖 prefix). */
-function postWhatsAppSend(chatId: string, text: string): Promise<void> {
-  const port = Number(envValue('WHATSAPP_QR_PORT') || '9334');
-  const body = JSON.stringify({ chatId, text });
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      { host: '127.0.0.1', port, path: '/send', method: 'POST', headers: waHeaders(body) },
-      (res) => {
-        let data = '';
-        res.setEncoding('utf8');
-        res.on('data', (c) => { data += c; });
-        res.on('end', () => (res.statusCode === 200 ? resolve() : reject(new Error(`whatsapp /send HTTP ${res.statusCode}: ${data.slice(0, 200)}`))));
-      },
-    );
-    req.setTimeout(30_000, () => req.destroy(new Error('whatsapp /send timeout')));
-    req.on('error', reject);
-    req.end(body);
-  });
+/** POST to the WhatsApp service's /send (bot reply, 🤖-prefixed; WA_API_TOKEN). */
+async function postWhatsAppSend(chatId: string, text: string): Promise<void> {
+  const { waRequest } = await import('./outbound.js');
+  const { status, data } = await waRequest('POST', '/send', { chatId, text });
+  if (status !== 200) throw new Error(`whatsapp /send HTTP ${status}: ${JSON.stringify(data).slice(0, 200)}`);
 }
 
 // ── Firing ─────────────────────────────────────────────────────────
@@ -140,6 +117,8 @@ export interface LoopTrigger {
   messageId?: string;
   at?: number;
   catchUp?: boolean;
+  /** WhatsApp chat the message arrived in (for outbound-cli read/propose). */
+  chatId?: string;
 }
 
 function originLabel(origin: string): string {
@@ -163,12 +142,13 @@ export function buildLoopPrompt(loop: OpenLoop, trigger: LoopTrigger, resumed = 
   if (contact?.language_pref) lines.push(`${contact.display_name} prefers: ${contact.language_pref}`);
   if (trigger.type === 'inbound') {
     const when = trigger.at ? new Date(trigger.at * 1000).toISOString() : 'just now';
-    lines.push(`Message (WhatsApp${loop.chat_ref ? ` chat ${loop.chat_ref}` : ''}, ${when}${trigger.catchUp ? ', received while offline' : ''}):`);
+    const chat = trigger.chatId ?? loop.chat_ref;
+    lines.push(`Message (WhatsApp${chat ? ` chat ${chat}` : ''}, ${when}${trigger.catchUp ? ', received while offline' : ''}):`);
     lines.push((trigger.text ?? '').slice(0, 3000) || '(no text: media message)');
   }
   lines.push('');
   lines.push(
-    `Act on the intent. A reply to a third party is a draft until Mohamed approves that exact text; do not send, revoke or delete on your own. ` +
+    `Act on the intent. Anything sent to a third party goes through the outbound gateway (outbound-cli propose; Mohamed approves the exact text); never send, revoke or delete directly. ` +
     `When handled run \`loops-cli close ${loop.id} "<what happened>"\` (or snooze it). ` +
     `Your answer is delivered to Mohamed on ${originLabel(loop.origin)}.`,
   );
@@ -227,7 +207,7 @@ export function handleInboundMessage(p: InboundPayload): number[] {
   for (const loop of matchAwaitReplyLoops(ids)) {
     if (at < loop.updated_at) continue;
     const trigger: LoopTrigger = {
-      type: 'inbound', from: p.senderName, text: p.text, messageId: p.messageId, at, catchUp: p.catchUp,
+      type: 'inbound', from: p.senderName, text: p.text, messageId: p.messageId, at, catchUp: p.catchUp, chatId: p.chatId,
     };
     const claimed = claimFire(loop.id, p.messageId || `${p.chatId}:${at}`, JSON.stringify(trigger));
     if (!claimed) continue;

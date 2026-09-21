@@ -50,6 +50,7 @@ describe('handleInboundMessage', () => {
     expect(prompt).toContain('Intent: Draft a reply, ask Mohamed');
     expect(prompt).toContain('Thursday works');
     expect(prompt).toContain('prefers: ar-najdi');
+    expect(prompt).toContain('WhatsApp chat 966500000001@c.us');
     expect(telegram.mock.calls[0][0]).toContain(`Loop #${l.id}`);
     expect(getLoop(l.id)?.status).toBe('fired');
     await vi.waitFor(() => expect(getLoop(l.id)?.pending_trigger).toBeNull());
@@ -145,7 +146,7 @@ describe('helpers', () => {
   it('prompt tells the agent drafts need approval and how to close', () => {
     const l = createLoop({ kind: 'promise', summary: 'send deck', due_at: now() });
     const p = buildLoopPrompt(l, { type: 'due' });
-    expect(p).toContain('Mohamed approves');
+    expect(p).toContain('outbound-cli propose');
     expect(p).toContain(`loops-cli close ${l.id}`);
   });
 
