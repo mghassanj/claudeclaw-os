@@ -8,7 +8,7 @@ import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, ENABLE_ACP, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG, updateAgentProvider } from './config.js';
-import { runMainTurnQueued } from './main-turn.js';
+import { runMainTurnQueued, type MainTurnMeta } from './main-turn.js';
 import { credHealthSnapshot } from './cred-monitor.js';
 import { registerOutboundRoutes } from './outbound-routes.js';
 import { registerLoopRoutes, LOOP_ROUTES_READONLY_EXEMPT } from './loops-routes.js';
@@ -826,10 +826,21 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     let body: any = {};
     try { body = await c.req.json(); } catch { /* empty body */ }
     const text = typeof body?.text === 'string' ? body.text.trim() : '';
-    if (!text) return c.json({ error: 'text required' }, 400);
+    // Optional channel metadata from the bridge (all fields optional, so an
+    // older bridge that only sends {text} keeps working).
+    const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 64) : undefined);
+    const inboundType = ['text', 'voice', 'image', 'document'].includes(body?.inboundType)
+      ? body.inboundType as MainTurnMeta['inboundType'] : undefined;
+    const image = typeof body?.image?.base64 === 'string' && typeof body?.image?.mime === 'string'
+      && body.image.mime.startsWith('image/')
+      ? { base64: body.image.base64 as string, mime: body.image.mime as string } : undefined;
+    const meta: MainTurnMeta = { channel: str(body?.channel), lang: str(body?.lang), inboundType, image };
+    if (!text && !image) return c.json({ error: 'text required' }, 400);
     try {
-      const reply = await runMainTurnQueued(text);
-      return c.json({ text: reply });
+      // files: [SEND_FILE]/[SEND_PHOTO] markers already stripped from text,
+      // for the bridge to deliver as media.
+      const reply = await runMainTurnQueued(text, meta);
+      return c.json({ text: reply.text, files: reply.files });
     } catch (err: any) {
       return c.json({ error: err?.message ?? 'main-turn failed' }, 500);
     }

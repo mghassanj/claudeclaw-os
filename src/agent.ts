@@ -19,6 +19,7 @@ import {
 } from './provider.js';
 import { defaultModelForProvider, getSelectedProviderConfig } from './active-provider.js';
 import { envRefNames, expandEnvInList, expandEnvInRecord, expandEnvRefs } from './mcp-allowlist.js';
+import { handoffForCurrentTurn } from './session-handoff.js';
 
 // ── MCP server loading ──────────────────────────────────────────────
 // The Agent SDK's settingSources loads CLAUDE.md and permissions from
@@ -225,6 +226,12 @@ export interface AgentProgressEvent {
 
 export interface AgentResult {
   text: string | null;
+  /**
+   * Only the text after the turn's last tool call (the final answer, without
+   * "Let me check…" narration). Undefined/null when the engine doesn't report
+   * it or the turn ended on a tool call; callers fall back to `text`.
+   */
+  finalText?: string | null;
   newSessionId: string | undefined;
   usage: UsageInfo | null;
   aborted?: boolean;
@@ -314,6 +321,7 @@ export async function runAgent(
 
   let newSessionId: string | undefined;
   let resultText: string | null = null;
+  let finalText: string | null = null;
   let usage: UsageInfo | null = null;
   let didCompact = false;
   let preCompactTokens: number | null = null;
@@ -403,6 +411,7 @@ export async function runAgent(
 
       if (event.type === 'result') {
         resultText = event.text;
+        finalText = event.finalText ?? null;
         if (event.usage) {
           usage = event.usage;
           logger.info(
@@ -454,14 +463,16 @@ export async function runAgent(
       { staleSessionId: providerSessionId },
       'Resume target not found; retrying once with a fresh session',
     );
+    // Hand the fresh session the recent conversation so it doesn't start cold.
+    const handoff = handoffForCurrentTurn();
     return runAgent(
-      message, undefined, onTyping, onProgress,
+      handoff ? `${handoff}\n\n${message}` : message, undefined, onTyping, onProgress,
       model, abortController, onStreamText,
       mcpAllowlist, providerConfig, toolPolicy,
     );
   }
 
-  return { text: resultText, newSessionId: encodeProviderSession(provider, newSessionId), usage };
+  return { text: resultText, finalText, newSessionId: encodeProviderSession(provider, newSessionId), usage };
 }
 
 // ── Retry wrapper ─────────────────────────────────────────────────

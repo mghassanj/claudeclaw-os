@@ -6,7 +6,8 @@ import { startHealthServer } from "./healthcheck.js";
 import { currentConfig, reloadConfig } from "./config.js";
 import { wasSentByBot, consumeExpectedOutgoing } from "./sent-registry.js";
 import { parseApprovalReply, forwardApprovalDecision } from "./outbound-approval.js";
-import { runMainBridge } from "./main-bridge.js";
+import { runMainBridge, type MainBridgeMeta } from "./main-bridge.js";
+import { BRIDGE_FALLBACK_TEXT, bridgeInboundText, deliverBridgeFiles } from "./self-chat.js";
 import { detectLang } from "./lang.js";
 import { composeReply } from "./reply-composer.js";
 import {
@@ -226,13 +227,23 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
         sendText(state.client, chatId, "Still working on it\u2026", msg.id._serialized)
           .catch((e) => console.warn("[wa] interim note failed:", e));
       }, Number(process.env.WA_SELF_INTERIM_MS ?? 60_000));
-      let bridged: string;
+      // Channel metadata so the main agent knows this is WhatsApp (formatting,
+      // length, language) and whether it came from a voice note or image.
+      const bridgeMeta: MainBridgeMeta = {
+        channel: "whatsapp-self",
+        lang: inboundLang,
+        inboundType: msg.type === "document" ? "document" : inboundType,
+        ...(inboundType === "image" && inlineImageBase64 && inlineImageMime
+          ? { image: { base64: inlineImageBase64, mime: inlineImageMime } }
+          : {}),
+      };
+      let bridged: Awaited<ReturnType<typeof runMainBridge>>;
       try {
-        bridged = await runMainBridge(inboundText);
+        bridged = await runMainBridge(bridgeInboundText(inboundType, inboundText, msg.body ?? ""), bridgeMeta);
       } catch (e) {
         clearTimeout(interim);
         console.error("[wa] main-bridge failed:", e);
-        const fallbackId = await sendText(state.client, chatId, "Couldn\u2019t reach the main agent right now \u2014 try again in a moment.", msg.id._serialized);
+        const fallbackId = await sendText(state.client, chatId, BRIDGE_FALLBACK_TEXT, msg.id._serialized);
         await recordReply({
           groupId: chatId, messageId: msg.id._serialized,
           chosenTier: "self", toolsCalled: [], sourcesCited: [],
@@ -245,14 +256,25 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
       clearTimeout(interim);
       // Outside the try: a send error must not trigger the "couldn't reach"
       // fallback, because the reply may already have been delivered.
-      const sentId = await sendText(state.client, chatId, bridged, msg.id._serialized);
-      console.log("[wa] self-chat reply sent:", sentId);
+      // sendText formats Markdown for WhatsApp and splits long replies.
+      const sentId = bridged.text
+        ? await sendText(state.client, chatId, bridged.text, msg.id._serialized)
+        : null;
+      // [SEND_FILE]/[SEND_PHOTO] markers from the agent, stripped server-side.
+      const fileIds = await deliverBridgeFiles(
+        bridged.files,
+        (filePath, caption) => sendMediaFromPath(state.client, chatId, filePath, caption, sentId ? undefined : msg.id._serialized),
+        (note) => sendText(state.client, chatId, note),
+      );
+      console.log("[wa] self-chat reply sent:", sentId, "files:", fileIds.sent.length);
       // Mark it replied (reply_at) so a re-fired message_create can't answer twice.
       await recordReply({
         groupId: chatId, messageId: msg.id._serialized,
         chosenTier: "self", toolsCalled: [], sourcesCited: [],
-        replyText: bridged, replyMediaUrl: null, replyAt: new Date(), replyMsgId: sentId,
-        durationMs: Date.now() - bridgeStart, costEstimate: 0, error: null,
+        replyText: bridged.text || null, replyMediaUrl: fileIds.sent[0] ?? null,
+        replyAt: new Date(), replyMsgId: sentId ?? fileIds.firstMsgId,
+        durationMs: Date.now() - bridgeStart, costEstimate: 0,
+        error: fileIds.failed.length ? `files not sent: ${fileIds.failed.join(", ")}`.slice(0, 500) : null,
       });
       return;
     }

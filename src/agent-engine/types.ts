@@ -88,7 +88,14 @@ export type AgentEngineEvent =
   | { type: 'progress'; progress: AgentEngineProgressEvent; raw?: unknown }
   | { type: 'usage'; usage: AgentEngineUsage; raw?: unknown }
   | { type: 'compact'; preCompactTokens: number | null; trigger?: string; raw?: unknown }
-  | { type: 'result'; text: string | null; usage: AgentEngineUsage | null; stopReason?: string; raw?: unknown }
+  /**
+   * `text` is every top-level assistant text block of the turn joined (the
+   * full reply, including narration such as "Let me check…" written before
+   * tool calls). `finalText`, when the engine can tell, is only the text
+   * written after the turn's last tool call: the final answer. Channels that
+   * must not show narration (the WhatsApp bridge) prefer it.
+   */
+  | { type: 'result'; text: string | null; finalText?: string | null; usage: AgentEngineUsage | null; stopReason?: string; raw?: unknown }
   | { type: 'aborted'; text: string | null; sessionId?: string; usage: AgentEngineUsage | null; raw?: unknown }
   | { type: 'error'; error: unknown; raw?: unknown };
 
