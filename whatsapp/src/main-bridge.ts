@@ -54,9 +54,14 @@ export async function runMainBridge(text: string, meta?: MainBridgeMeta): Promis
       {
         host: "127.0.0.1",
         port,
-        path: `/api/agent/main-turn?token=${encodeURIComponent(token)}`,
+        path: "/api/agent/main-turn",
         method: "POST",
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+        // Bearer header, not ?token=: keeps the token out of URLs and logs.
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          Authorization: `Bearer ${token}`,
+        },
       },
       (res) => {
         let chunks = "";
