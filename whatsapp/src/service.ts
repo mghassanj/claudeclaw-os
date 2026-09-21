@@ -48,7 +48,24 @@ state.client.on("message_create", async (msg) => {
     if (msg.fromMe && (msg.body ?? "").startsWith("\u{1F916}")) return;
     if (msg.fromMe && wasSentByBot(msg.id._serialized)) return;
 
-    const chat = await msg.getChat();
+    let chat: Awaited<ReturnType<typeof msg.getChat>>;
+    try {
+      chat = await msg.getChat();
+    } catch (e) {
+      // whatsapp-web.js getChatById throws (minified "r: r") for some 1:1
+      // chats addressed by @lid that aren't in the Chat collection yet.
+      // Non-group DMs are dropped below by design, so skip those quietly;
+      // groups and the self-chat still surface the error.
+      const peer = (msg.fromMe ? msg.to : msg.from) ?? "";
+      const peerUser = peer.split("@")[0];
+      const selfLidList = (process.env.WHATSAPP_SELF_LIDS ?? "").split(",").map((x) => x.trim());
+      const maybeSelf = msg.from === msg.to || selfLidList.includes(peerUser);
+      if (!peer.endsWith("@g.us") && !maybeSelf) {
+        console.log("[wa] skip: chat lookup failed for 1:1 dm (" + (peer.split("@")[1] ?? "?") + ")");
+        return;
+      }
+      throw e;
+    }
     chatId = chat.id._serialized;
     const selfId = (state.client.info as any)?.wid?._serialized as string | undefined;
     const selfUser = (state.client.info as any)?.wid?.user as string | undefined;
