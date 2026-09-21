@@ -18,6 +18,7 @@ import {
   sessionBelongsToProvider,
 } from './provider.js';
 import { defaultModelForProvider, getSelectedProviderConfig } from './active-provider.js';
+import { envRefNames, expandEnvInList, expandEnvInRecord, expandEnvRefs } from './mcp-allowlist.js';
 
 // ── MCP server loading ──────────────────────────────────────────────
 // The Agent SDK's settingSources loads CLAUDE.md and permissions from
@@ -47,7 +48,8 @@ export type McpServerConfig = McpStdioConfig | McpHttpConfig | McpSseConfig;
 /**
  * Merge MCP server configs from user settings (~/.claude/settings.json) and
  * project settings (.claude/settings.json in cwd), optionally filtered by
- * an allowlist (e.g. from an agent's agent.yaml `mcp_servers` field).
+ * an allowlist (agent.yaml `mcp_servers:`, or the `mcp:<name>` entries of
+ * `warroom_tools:` — see mcpAllowlistFromYaml).
  *
  * Supports both stdio transport (command/args/env) and HTTP/SSE transport
  * (type/url/headers), matching the Claude Agent SDK's McpServerConfig types.
@@ -55,6 +57,56 @@ export type McpServerConfig = McpStdioConfig | McpHttpConfig | McpSseConfig;
  * Exported so the voice bridge can reuse the exact same loader the text
  * bot uses — keeping behavior consistent across channels.
  */
+// Warn once per process per name (loadMcpServers runs every turn).
+const warnedMissingEnv = new Set<string>();
+const warnedUnknownMcp = new Set<string>();
+
+/**
+ * Expand `${VAR}` / `${VAR:-default}` / `$VAR` in an MCP server config's
+ * url, headers, args and env from process.env, falling back to the
+ * project .env (ClaudeClaw does not load .env into process.env). This lets
+ * ~/.claude/settings.json hold `"Authorization": "Bearer ${JISR_CODEWIKI_TOKEN}"`
+ * instead of a pasted literal. A missing var expands to '' with a one-time
+ * warning naming the VARIABLE (never a value). Claude Code itself does not
+ * read `mcpServers` from settings.json, so these refs are only interpreted
+ * here.
+ */
+export function expandMcpServerEnv(
+  cfg: McpServerConfig,
+  env: NodeJS.ProcessEnv = process.env,
+  serverName = '?',
+): McpServerConfig {
+  const strings: string[] = [];
+  if ('url' in cfg) {
+    strings.push(cfg.url, ...Object.values(cfg.headers ?? {}));
+  } else {
+    strings.push(...(cfg.args ?? []), ...Object.values(cfg.env ?? {}));
+  }
+  const names = Array.from(new Set(strings.flatMap((v) => (typeof v === 'string' ? envRefNames(v) : []))));
+  if (names.length === 0) return cfg;
+  const needFile = names.filter((n) => env[n] === undefined || env[n] === '');
+  const fromFile = needFile.length ? readEnvFile(needFile) : {};
+  const lookup = (n: string): string | undefined => (env[n] !== undefined && env[n] !== '' ? env[n] : fromFile[n]);
+  const onMissing = (n: string): void => {
+    const key = `${serverName}:${n}`;
+    if (warnedMissingEnv.has(key)) return;
+    warnedMissingEnv.add(key);
+    logger.warn({ mcpServer: serverName, envVar: n }, 'MCP config references an unset env var; expanded to empty string');
+  };
+  if ('url' in cfg) {
+    return {
+      ...cfg,
+      url: expandEnvRefs(cfg.url, lookup, onMissing),
+      ...(cfg.headers ? { headers: expandEnvInRecord(cfg.headers, lookup, onMissing) } : {}),
+    };
+  }
+  return {
+    ...cfg,
+    ...(cfg.args ? { args: expandEnvInList(cfg.args, lookup, onMissing) } : {}),
+    ...(cfg.env ? { env: expandEnvInRecord(cfg.env, lookup, onMissing) } : {}),
+  };
+}
+
 export function loadMcpServers(allowlist?: string[], projectCwd?: string): Record<string, McpServerConfig> {
   const merged: Record<string, McpServerConfig> = {};
 
@@ -111,6 +163,19 @@ export function loadMcpServers(allowlist?: string[], projectCwd?: string): Recor
     for (const name of Object.keys(merged)) {
       if (!allowed.has(name)) delete merged[name];
     }
+    // Phantom entries (listed but not configured anywhere) are a config
+    // smell worth one log line, not an error.
+    for (const name of allowed) {
+      if (!(name in merged) && !warnedUnknownMcp.has(name)) {
+        warnedUnknownMcp.add(name);
+        logger.warn({ mcpServer: name }, 'MCP allowlist names a server that is not configured in settings.json');
+      }
+    }
+  }
+
+  // Expand ${VAR} references only for the servers actually handed out.
+  for (const [name, cfg] of Object.entries(merged)) {
+    merged[name] = expandMcpServerEnv(cfg, process.env, name);
   }
 
   return merged;

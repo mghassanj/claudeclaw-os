@@ -28,6 +28,12 @@ for s in claudeclaw claudeclaw-ops claudeclaw-comms claudeclaw-content claudecla
   [ "$st" = "active" ] || problems+=("${s}:${st:-unknown}")
 done
 
+# Credential health (src/cred-monitor.ts): count of probes currently failing.
+creds=$(curl -s --max-time 5 \
+  "http://127.0.0.1:${DASHBOARD_PORT:-8989}/api/cred-health?token=${DASHBOARD_TOKEN:-}" || true)
+nfail=$(printf '%s' "$creds" | grep -o '"failing":[0-9]*' | head -1 | cut -d: -f2)
+[ -z "$nfail" ] || [ "$nfail" = "0" ] || problems+=("creds:${nfail}")
+
 wa=$(curl -s --max-time 5 "http://127.0.0.1:${WHATSAPP_QR_PORT:-9334}/health" || true)
 case "$wa" in *READY*) ;; *) problems+=("whatsapp:not-ready") ;; esac
 

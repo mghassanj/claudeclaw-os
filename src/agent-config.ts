@@ -4,6 +4,7 @@ import yaml from 'js-yaml';
 
 import { CLAUDECLAW_CONFIG, PROJECT_ROOT, STORE_DIR } from './config.js';
 import { readEnvFile } from './env.js';
+import { mcpAllowlistFromYaml } from './mcp-allowlist.js';
 import {
   ProviderConfig,
   readProviderFromYaml,
@@ -180,7 +181,10 @@ export function loadAgentConfig(agentId: string): AgentConfig {
     };
   }
 
-  const mcpServers = raw['mcp_servers'] as string[] | undefined;
+  // MCP allowlist: `mcp_servers:` if present, else the `mcp:<name>` entries
+  // of `warroom_tools:` (the key every real agent.yaml uses). Before this,
+  // only `mcp_servers:` was read, so every agent got every MCP server.
+  const mcpServers = mcpAllowlistFromYaml(raw);
   // War-room tool policy override. If present in agent.yaml, this list
   // overrides the per-agent default in warroom-tool-policy.ts. Tokens
   // can be SDK tool names ("Bash", "Write") or "mcp:<name>" to opt that
@@ -202,6 +206,24 @@ export function loadAgentConfig(agentId: string): AgentConfig {
     meetVoiceId,
     meetBotName,
   };
+}
+
+/**
+ * MCP allowlist for the main agent. Main has no mandatory agent.yaml, so
+ * this reads an OPTIONAL `CLAUDECLAW_CONFIG/agents/main/agent.yaml` and
+ * only looks at `mcp_servers:` / `warroom_tools:` (no name/token needed).
+ * Returns undefined (= every configured MCP server) when the file or both
+ * keys are absent; the caller logs which case applied.
+ */
+export function loadMainMcpAllowlist(): { allowlist: string[] | undefined; source: string | null } {
+  const p = path.join(CLAUDECLAW_CONFIG, 'agents', 'main', 'agent.yaml');
+  if (!fs.existsSync(p)) return { allowlist: undefined, source: null };
+  try {
+    const raw = yaml.load(fs.readFileSync(p, 'utf-8')) as Record<string, unknown> | null;
+    return { allowlist: mcpAllowlistFromYaml(raw), source: p };
+  } catch {
+    return { allowlist: undefined, source: p };
+  }
 }
 
 /** Update the model field in an agent's agent.yaml file. */
@@ -281,6 +303,10 @@ export function listAgentIds(): string[] {
     if (!fs.existsSync(baseDir)) continue;
     for (const d of fs.readdirSync(baseDir)) {
       if (d.startsWith('_')) continue;
+      // `main` is the root process, never a sub-agent. It may carry an
+      // optional agent.yaml (MCP allowlist only, see loadMainMcpAllowlist)
+      // which must not make it show up as a second "main" sub-agent.
+      if (d === 'main') continue;
       const yamlPath = path.join(baseDir, d, 'agent.yaml');
       if (fs.existsSync(yamlPath)) ids.add(d);
     }

@@ -324,3 +324,40 @@ describe('provider config', () => {
     expect(decodeProviderSession({ type: 'gemini' }, geminiSession)).toBe('abc');
   });
 });
+
+describe('MCP allowlist from agent.yaml (host shapes)', () => {
+  it('loadAgentConfig derives mcpServers from warroom_tools mcp: entries', async () => {
+    writeAgentYaml('ops', {
+      name: 'Ops',
+      telegram_bot_token_env: 'TEST_BOT_TOKEN',
+      warroom_tools: ['Bash', 'Skill', 'mcp:rag', 'mcp:gmail', 'mcp:google-calendar', 'mcp:jisr-backend-codewiki'],
+    });
+    const { loadAgentConfig } = await import('./agent-config.js');
+    const cfg = loadAgentConfig('ops');
+    expect(cfg.mcpServers).toEqual(['rag', 'gmail', 'google-calendar', 'jisr-backend-codewiki']);
+    expect(cfg.warroomTools).toContain('Bash');
+  });
+
+  it('warroom_tools without mcp: entries yields an empty allowlist (content)', async () => {
+    writeAgentYaml('content', {
+      name: 'Content',
+      telegram_bot_token_env: 'TEST_BOT_TOKEN',
+      warroom_tools: ['Skill', 'Write', 'Bash'],
+    });
+    const { loadAgentConfig } = await import('./agent-config.js');
+    expect(loadAgentConfig('content').mcpServers).toEqual([]);
+  });
+
+  it('loadMainMcpAllowlist: absent file -> undefined; present -> list; main never listed as sub-agent', async () => {
+    const { loadMainMcpAllowlist, listAgentIds } = await import('./agent-config.js');
+    expect(loadMainMcpAllowlist()).toEqual({ allowlist: undefined, source: null });
+
+    const mainDir = path.join(claudeclawConfig, 'agents', 'main');
+    fs.mkdirSync(mainDir, { recursive: true });
+    fs.writeFileSync(path.join(mainDir, 'agent.yaml'), yaml.dump({ mcp_servers: ['jisr-backend-codewiki', 'heygen'] }));
+    const res = loadMainMcpAllowlist();
+    expect(res.allowlist).toEqual(['jisr-backend-codewiki', 'heygen']);
+    expect(res.source).toBe(path.join(mainDir, 'agent.yaml'));
+    expect(listAgentIds()).not.toContain('main');
+  });
+});

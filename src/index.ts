@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { loadAgentConfig, listAgentIds, resolveAgentDir, resolveAgentClaudeMd, resolveInstructionMd, refreshWarRoomRoster } from './agent-config.js';
+import { loadAgentConfig, listAgentIds, resolveAgentDir, resolveAgentClaudeMd, resolveInstructionMd, refreshWarRoomRoster, loadMainMcpAllowlist } from './agent-config.js';
 import { createBot } from './bot.js';
 import { checkPendingMigrations } from './migrations.js';
 import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT } from './config.js';
@@ -14,6 +14,7 @@ import { runConsolidation } from './memory-consolidate.js';
 import { runDecaySweep } from './memory.js';
 import { runWarroomAvatarMigration } from './avatars.js';
 import { initOAuthHealthCheck } from './oauth-health.js';
+import { initCredMonitor } from './cred-monitor.js';
 import { initOrchestrator } from './orchestrator.js';
 import { initScheduler } from './scheduler.js';
 import { getMainProviderConfig } from './provider.js';
@@ -47,7 +48,7 @@ if (AGENT_ID !== 'main') {
     systemPrompt,
     mcpServers: agentConfig.mcpServers,
   });
-  logger.info({ agentId: AGENT_ID, name: agentConfig.name, provider: agentConfig.provider }, 'Running as agent');
+  logger.info({ agentId: AGENT_ID, name: agentConfig.name, provider: agentConfig.provider, mcpAllowlist: agentConfig.mcpServers ?? 'ALL' }, 'Running as agent');
 } else {
   // Main bot follows the same pattern as sub-agents: load CLAUDE.md from
   // CLAUDECLAW_CONFIG/agents/main/ and set CWD to that directory so the
@@ -67,12 +68,20 @@ if (AGENT_ID !== 'main') {
       systemPrompt = fs.readFileSync(claudeMdSource, 'utf-8');
     } catch { /* unreadable */ }
     if (systemPrompt) {
+      // Optional main MCP allowlist (CLAUDECLAW_CONFIG/agents/main/agent.yaml).
+      const mainMcp = loadMainMcpAllowlist();
+      if (mainMcp.allowlist) {
+        logger.info({ source: mainMcp.source, mcpAllowlist: mainMcp.allowlist }, 'Main MCP allowlist loaded');
+      } else {
+        logger.info({ source: mainMcp.source }, 'Main has no MCP allowlist (no agents/main/agent.yaml with mcp_servers/warroom_tools); loading ALL configured MCP servers');
+      }
       setAgentOverrides({
         agentId: 'main',
         botToken: activeBotToken,
         cwd: mainAgentDir ?? PROJECT_ROOT,
         provider: getMainProviderConfig(),
         systemPrompt,
+        mcpServers: mainMcp.allowlist,
       });
       logger.info({ source: claudeMdSource, cwd: mainAgentDir ?? PROJECT_ROOT }, 'Loaded main agent CLAUDE.md');
     }
@@ -389,6 +398,20 @@ async function main(): Promise<void> {
       });
     } else {
       logger.info('OAuth health check disabled (set OAUTH_HEALTH_ENABLED=true in .env to enable)');
+    }
+
+    // Credential health monitor (Telegram/Claude/Jira/Codewiki/Railway/
+    // OpenAI/Google/Voyage/WhatsApp/Gmail). Main process only; alerts once
+    // per ok<->fail transition. See src/cred-monitor.ts.
+    if (AGENT_ID === 'main') {
+      initCredMonitor(async (text) => {
+        const { splitMessage } = await import('./bot.js');
+        for (const chunk of splitMessage(text)) {
+          await bot.api.sendMessage(ALLOWED_CHAT_ID, chunk, { parse_mode: 'HTML' }).catch((err) =>
+            logger.error({ err }, 'Credential health alert failed'),
+          );
+        }
+      });
     }
   } else {
     logger.warn('ALLOWED_CHAT_ID not set — scheduler disabled (no destination for results)');
