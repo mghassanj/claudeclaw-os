@@ -10,6 +10,7 @@ import { spawnSync } from 'child_process';
 import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, ENABLE_ACP, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG, updateAgentProvider } from './config.js';
 import { runMainTurnQueued } from './main-turn.js';
 import { credHealthSnapshot } from './cred-monitor.js';
+import { registerOutboundRoutes } from './outbound-routes.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -366,6 +367,16 @@ function safeTokenEqual(provided: string | null | undefined, expected: string | 
 }
 
 /**
+ * Request token: `Authorization: Bearer <token>` (preferred: stays out of
+ * URLs, access logs and Referer) or the legacy `?token=` query parameter
+ * that the browser dashboard still uses.
+ */
+export function requestToken(c: { req: { header(name: string): string | undefined; query(name: string): string | undefined } }): string | undefined {
+  const m = (c.req.header('authorization') ?? '').match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : c.req.query('token');
+}
+
+/**
  * Build the dashboard Hono app without binding it to a port. Exported for
  * contract tests so the route surface can be exercised via `app.request()`
  * without standing up a real server. Production callers should use
@@ -399,7 +410,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       } catch { /* malformed Origin — emit no header */ }
     }
     c.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, PATCH, OPTIONS');
-    c.header('Access-Control-Allow-Headers', 'Content-Type');
+    c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     if (c.req.method === 'OPTIONS') return c.body(null, 204);
     await next();
   });
@@ -499,8 +510,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       await next();
       return;
     }
-    const token = c.req.query('token');
-    if (!safeTokenEqual(token, DASHBOARD_TOKEN)) {
+    if (!safeTokenEqual(requestToken(c), DASHBOARD_TOKEN)) {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     await next();
@@ -510,8 +520,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // middleware but now serve a public SPA shell on the same path. Used
   // by legacy fallbacks that DO embed the token in the page source.
   function requireToken(c: any): Response | null {
-    const token = c.req.query('token');
-    if (!safeTokenEqual(token, DASHBOARD_TOKEN)) {
+    if (!safeTokenEqual(requestToken(c), DASHBOARD_TOKEN)) {
       return c.json({ error: 'Unauthorized' }, 401) as Response;
     }
     return null;
@@ -807,6 +816,9 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // Bridge: run the MAIN agent on the canonical Telegram-main session so other
   // channels (WhatsApp self-chat) share one conversation + memory. Token-gated
   // by the global /api/ middleware; exempt from the mutation kill-switch above.
+  // Outbound gateway: GET /api/outbound (history), POST /api/outbound/decide.
+  registerOutboundRoutes(app);
+
   app.post('/api/agent/main-turn', async (c) => {
     let body: any = {};
     try { body = await c.req.json(); } catch { /* empty body */ }

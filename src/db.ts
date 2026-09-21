@@ -420,6 +420,47 @@ function createSchema(database: Database.Database): void {
       created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     );
   `);
+
+  // ── Outbound gateway (src/outbound.ts) ─────────────────────────────
+  // One row per outbound action an agent wants to take on Mohamed's
+  // behalf (WhatsApp as him, email, calendar, Jira/Slack post, revoke).
+  // Only an approval moves a row to executed, exactly once; the row is
+  // also the audit log + receipt the agent must check before claiming
+  // what it did. Times are unix seconds.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS outbound_actions (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind               TEXT NOT NULL,
+      target             TEXT NOT NULL,
+      target_name        TEXT NOT NULL DEFAULT '',
+      payload            TEXT NOT NULL,
+      payload_hash       TEXT NOT NULL,
+      dedupe_hash        TEXT NOT NULL,
+      idempotency_key    TEXT NOT NULL UNIQUE,
+      status             TEXT NOT NULL DEFAULT 'proposed',
+      approval_code      TEXT NOT NULL,
+      requested_by_agent TEXT NOT NULL DEFAULT 'main',
+      session_ref        TEXT,
+      turn_ref           TEXT,
+      forced             INTEGER NOT NULL DEFAULT 0,
+      created_at         INTEGER NOT NULL,
+      expires_at         INTEGER NOT NULL,
+      decided_at         INTEGER,
+      decided_via        TEXT,
+      executed_at        INTEGER,
+      receipt            TEXT,
+      error              TEXT,
+      tg_message_id      INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_actions(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_outbound_dedupe ON outbound_actions(dedupe_hash, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_outbound_code ON outbound_actions(approval_code, status);
+  `);
+}
+
+/** Raw handle for self-contained modules that own their own tables (outbound.ts). */
+export function getOutboundDb(): Database.Database {
+  return db;
 }
 
 export function initDatabase(): void {

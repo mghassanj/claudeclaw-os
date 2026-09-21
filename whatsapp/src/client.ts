@@ -1,6 +1,8 @@
 import pkg from "whatsapp-web.js";
 const { Client, LocalAuth, MessageMedia } = pkg;
 import qrcode from "qrcode";
+import fs from "node:fs";
+import path from "node:path";
 
 export type WAClient = InstanceType<typeof Client>;
 
@@ -13,10 +15,18 @@ export interface ClientState {
 }
 
 export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState {
+  // Chrome used to run with --remote-debugging-port (puppeteer's default),
+  // publishing the port in <profile>/DevToolsActivePort. Agents found it and
+  // drove WhatsApp Web directly over CDP (2026-09-21 Nora double-send and
+  // unapproved revoke). With pipe:true puppeteer talks to Chrome over
+  // --remote-debugging-pipe (fds 3/4): no TCP port, no DevToolsActivePort.
+  // Remove a stale port file left by an older launch so nothing points at it.
+  try { fs.rmSync(path.join(authPath, "session", "DevToolsActivePort"), { force: true }); } catch { /* ignore */ }
   const client = new Client({
     authStrategy: new LocalAuth({ dataPath: authPath }),
     puppeteer: {
       headless: true,
+      pipe: true,
       executablePath: "/usr/bin/google-chrome",
       args: [
         "--no-sandbox",

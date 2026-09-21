@@ -167,6 +167,7 @@ import {
 } from './voice.js';
 import { getSlackConversations, getSlackMessages, sendSlackMessage, SlackConversation } from './slack.js';
 import { getWaChats, getWaChatMessages, sendWhatsAppMessage, WaChat } from './whatsapp.js';
+import { registerOutboundHandlers } from './outbound-telegram.js';
 
 // Per-chat voice mode toggle (in-memory, resets on restart)
 const voiceEnabledChats = new Set<string>();
@@ -963,6 +964,10 @@ export function createBot(): Bot {
     }
     await next();
   });
+
+  // Outbound gateway: ✅/❌ approval buttons + /outbox (main bot only;
+  // proposal cards are always posted through the main bot).
+  if (AGENT_ID === 'main') registerOutboundHandlers(bot);
 
   // Register callback for high-importance memory notifications.
   // When a memory with importance >= 0.8 is created, notify via Telegram

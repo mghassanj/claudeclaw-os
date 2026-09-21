@@ -77,6 +77,14 @@ const KILL_SWITCH_LABELS: Record<string, { label: string; description: string }>
     label: 'Scheduler',
     description: 'Allow scheduled cron tasks to fire',
   },
+  OUTBOUND_ENABLED: {
+    label: 'Outbound gateway',
+    description: 'Allow new outbound proposals and approvals (WhatsApp as Mohamed, email, revokes)',
+  },
+  OUTBOUND_AUTONOMY_ENABLED: {
+    label: 'Outbound autonomy',
+    description: 'Let OUTBOUND_AUTONOMOUS_CONTACTS be messaged without an approval',
+  },
 };
 
 const THEME_ORDER: ThemeName[] = ['graphite', 'midnight', 'crimson'];

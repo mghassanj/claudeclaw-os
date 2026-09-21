@@ -75,6 +75,11 @@ export interface AgentTurnInput {
    * in-band instead.
    */
   systemPrompt?: string;
+  /**
+   * Extra Agent SDK hooks (Claude SDK engine only). The outbound guard
+   * (src/outbound-guard.ts) is always added on top of these.
+   */
+  hooks?: Record<string, Array<{ matcher?: string; hooks: Array<(input: unknown) => Promise<unknown>> }>>;
 }
 
 export type AgentEngineEvent =

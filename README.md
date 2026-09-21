@@ -1065,13 +1065,13 @@ npm run build:warroom-client
 
 No API key needed. Uses your existing WhatsApp account via Linked Devices.
 
-### Start the daemon
+### Start the service
 
 ```bash
-npx tsx scripts/wa-daemon.ts
+cd whatsapp && npm ci && npm run build && npm start
 ```
 
-A QR code prints. Open WhatsApp → Settings → Linked Devices → scan within 30 seconds. Session saves to `store/waweb/`. you only scan once.
+Open `http://127.0.0.1:9334/qr` and scan it from WhatsApp → Settings → Linked Devices. The session persists, so you only scan once. Set `WA_API_TOKEN` in `.env`; the service's API is locked without it. Agents send on your behalf only through `outbound-cli propose` (see `docs/pa-outbound-rules.md`).
 
 ### Use it from Telegram
 
@@ -1654,7 +1654,7 @@ Or view it in the dashboard via the API: `GET /api/audit?limit=50`.
 
 ### Other things to know
 
-**WhatsApp daemon runs on localhost only.** The `wa-daemon` HTTP API (port 4242) and Chrome DevTools Protocol (port 9222) bind to `127.0.0.1`. They are not accessible from outside your machine, but any local process can reach them.
+**WhatsApp service runs on localhost only.** Its HTTP API binds to `127.0.0.1:9334` and every route except `/health` and `/qr` requires `Authorization: Bearer $WA_API_TOKEN`. Chrome is driven over `--remote-debugging-pipe`, so there is no DevTools port for other local processes to attach to.
 
 **`notify.sh` is called by Claude.** The notification script sends Telegram messages via `curl`. Since Claude has full shell access, it can call this script with any content. This is by design (progress updates), but prompt injection via external content could theoretically cause unexpected messages.
 
@@ -1692,9 +1692,9 @@ Or view it in the dashboard via the API: `GET /api/audit?limit=50`.
 - Either `/voice` mode must be on, or say "respond with voice" in your message
 
 **WhatsApp not connecting**
-- `wa-daemon` must be running separately: `npx tsx scripts/wa-daemon.ts`
-- QR code expires after ~30s. kill and restart the daemon if it timed out
-- To force re-authentication, delete `store/waweb/` and restart the daemon
+- The `whatsapp/` service must be running separately: `cd whatsapp && npm start`
+- QR code expires after ~30s. Reload `http://127.0.0.1:9334/qr` for a fresh one
+- To force re-authentication, delete the LocalAuth session dir and restart the service
 
 **"409 Conflict: terminated by other getUpdates request"**
 - Two instances running. Kill the old one: `kill $(cat store/claudeclaw.pid)`
@@ -1836,8 +1836,7 @@ claudeclaw/
 ├── scripts/
 │   ├── setup.ts          Interactive setup wizard. run with: npm run setup
 │   ├── status.ts         Health check. run with: npm run status
-│   ├── notify.sh         Sends a Telegram message from the shell (used by Claude)
-│   └── wa-daemon.ts      WhatsApp daemon. run separately for WhatsApp bridge
+│   └── notify.sh         Sends a Telegram message from the shell (used by Claude)
 │
 │  ← Runtime data (auto-created, gitignored)
 ├── store/

@@ -23,7 +23,12 @@ export type KillSwitch =
   | 'LLM_SPAWN_ENABLED'
   | 'DASHBOARD_MUTATIONS_ENABLED'
   | 'MISSION_AUTO_ASSIGN_ENABLED'
-  | 'SCHEDULER_ENABLED';
+  | 'SCHEDULER_ENABLED'
+  // Outbound gateway (src/outbound.ts): OUTBOUND_ENABLED off refuses new
+  // proposals and approvals; OUTBOUND_AUTONOMY_ENABLED off forces every
+  // action (even OUTBOUND_AUTONOMOUS_CONTACTS) through an approval.
+  | 'OUTBOUND_ENABLED'
+  | 'OUTBOUND_AUTONOMY_ENABLED';
 
 const ALL_SWITCHES: KillSwitch[] = [
   'WARROOM_TEXT_ENABLED',
@@ -32,6 +37,8 @@ const ALL_SWITCHES: KillSwitch[] = [
   'DASHBOARD_MUTATIONS_ENABLED',
   'MISSION_AUTO_ASSIGN_ENABLED',
   'SCHEDULER_ENABLED',
+  'OUTBOUND_ENABLED',
+  'OUTBOUND_AUTONOMY_ENABLED',
 ];
 
 const TTL_MS = 1500;
