@@ -185,10 +185,17 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
     if (isSelfChat) {
       console.log("[wa] self-chat -> main agent bridge");
       const bridgeStart = Date.now();
+      // Long turns (or turns queued behind another one) used to look like
+      // failures; send a single interim note so silence isn't read as an error.
+      const interim = setTimeout(() => {
+        sendText(state.client, chatId, "Still working on it\u2026", msg.id._serialized)
+          .catch((e) => console.warn("[wa] interim note failed:", e));
+      }, Number(process.env.WA_SELF_INTERIM_MS ?? 60_000));
       let bridged: string;
       try {
         bridged = await runMainBridge(inboundText);
       } catch (e) {
+        clearTimeout(interim);
         console.error("[wa] main-bridge failed:", e);
         const fallbackId = await sendText(state.client, chatId, "Couldn\u2019t reach the main agent right now \u2014 try again in a moment.", msg.id._serialized);
         await recordReply({
@@ -200,6 +207,7 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
         });
         return;
       }
+      clearTimeout(interim);
       // Outside the try: a send error must not trigger the "couldn't reach"
       // fallback, because the reply may already have been delivered.
       const sentId = await sendText(state.client, chatId, bridged, msg.id._serialized);
