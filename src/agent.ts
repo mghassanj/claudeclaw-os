@@ -372,6 +372,24 @@ export async function runAgent(
     clearInterval(typingInterval);
   }
 
+  // Self-heal a stale session: we asked the SDK to resume a specific session
+  // (providerSessionId set) but no session-init event ever arrived
+  // (newSessionId still undefined) — the resumed conversation no longer exists
+  // on disk (e.g. the SDK session store was rotated by an upgrade). Retry once
+  // from a fresh session so the user is not stuck on a dead session forever.
+  // The caller persists the new id via setSession(), overwriting the stale row.
+  if (providerSessionId && !newSessionId) {
+    logger.warn(
+      { staleSessionId: providerSessionId },
+      'Resume target not found; retrying once with a fresh session',
+    );
+    return runAgent(
+      message, undefined, onTyping, onProgress,
+      model, abortController, onStreamText,
+      mcpAllowlist, providerConfig, toolPolicy,
+    );
+  }
+
   return { text: resultText, newSessionId: encodeProviderSession(provider, newSessionId), usage };
 }
 

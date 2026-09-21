@@ -1,6 +1,7 @@
 import type { WAClient } from "../client.js";
 import { MessageMedia } from "../client.js";
 import fs from "node:fs/promises";
+import { markSent } from "../sent-registry.js";
 
 const PREFIX = "🤖";
 const THROTTLE_MS = 3000;
@@ -19,6 +20,7 @@ export async function sendText(
   const sent = await client.sendMessage(chatId, `${PREFIX} ${text}`, {
     quotedMessageId: replyToMsgId,
   });
+  markSent(sent.id._serialized);
   return sent.id._serialized;
 }
 
@@ -29,6 +31,7 @@ export async function sendInterim(
   const sent = await client.sendMessage(chatId, `${PREFIX} ${text}`, {
     quotedMessageId: replyToMsgId,
   });
+  markSent(sent.id._serialized);
   return sent.id._serialized;
 }
 
@@ -41,6 +44,7 @@ export async function sendMediaFromPath(
     caption: caption ? `${PREFIX} ${caption}` : undefined,
     quotedMessageId: replyToMsgId,
   });
+  markSent(sent.id._serialized);
   return sent.id._serialized;
 }
 
@@ -53,6 +57,7 @@ export async function sendMediaFromUrl(
     caption: caption ? `${PREFIX} ${caption}` : undefined,
     quotedMessageId: replyToMsgId,
   });
+  markSent(sent.id._serialized);
   return sent.id._serialized;
 }
 
@@ -66,5 +71,6 @@ export async function sendVoice(
     sendAudioAsVoice: true,
     quotedMessageId: replyToMsgId,
   });
+  markSent(sent.id._serialized);
   return sent.id._serialized;
 }

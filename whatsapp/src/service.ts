@@ -3,6 +3,8 @@ import fs from "node:fs/promises";
 import { buildClient } from "./client.js";
 import { startHealthServer } from "./healthcheck.js";
 import { currentConfig, reloadConfig } from "./config.js";
+import { wasSentByBot } from "./sent-registry.js";
+import { runMainBridge } from "./main-bridge.js";
 import { detectLang } from "./lang.js";
 import { composeReply } from "./reply-composer.js";
 import {
@@ -40,16 +42,64 @@ state.client.on("message_create", async (msg) => {
   try {
     console.log("[wa] msg event fired");
     const cfg = currentConfig();
-    // Loop prevention: skip the bot's own outbound replies
+    // Loop prevention: skip the bot's own outbound replies. The 🤖 text
+    // prefix covers text + captioned media; the sent-id registry also covers
+    // voice notes and uncaptioned media (which have no body to prefix).
     if (msg.fromMe && (msg.body ?? "").startsWith("\u{1F916}")) return;
-    // Self-reply gate: only process Mohamed's own messages if explicitly enabled
-    if (msg.fromMe && !cfg.selfReply) return;
-    const chat = await msg.getChat();
-    console.log("[wa] chat:", chat.isGroup ? "group" : "dm", "name=", (chat as any).name ?? "?");
-    if (!chat.isGroup) return;
+    if (msg.fromMe && wasSentByBot(msg.id._serialized)) return;
+
+    let chat: Awaited<ReturnType<typeof msg.getChat>>;
+    try {
+      chat = await msg.getChat();
+    } catch (e) {
+      // whatsapp-web.js getChatById throws (minified "r: r") for some 1:1
+      // chats addressed by @lid that aren't in the Chat collection yet.
+      // Non-group DMs are dropped below by design, so skip those quietly;
+      // groups and the self-chat still surface the error.
+      const peer = (msg.fromMe ? msg.to : msg.from) ?? "";
+      const peerUser = peer.split("@")[0];
+      const selfLidList = (process.env.WHATSAPP_SELF_LIDS ?? "").split(",").map((x) => x.trim());
+      const maybeSelf = msg.from === msg.to || selfLidList.includes(peerUser);
+      if (!peer.endsWith("@g.us") && !maybeSelf) {
+        console.log("[wa] skip: chat lookup failed for 1:1 dm (" + (peer.split("@")[1] ?? "?") + ")");
+        return;
+      }
+      throw e;
+    }
     chatId = chat.id._serialized;
-    const groupName = (chat as any).name ?? "";
-    if (!cfg.isGroupAllowed(groupName)) return;
+    const selfId = (state.client.info as any)?.wid?._serialized as string | undefined;
+    const selfUser = (state.client.info as any)?.wid?.user as string | undefined;
+    const chatUser = (chat.id as any)?.user as string | undefined;
+    // The self-chat ("Message Yourself") uses WhatsApp's @lid namespace, whose
+    // id is unrelated to the phone number, so id/number comparisons fail.
+    // contact.isMe is the account-independent signal; WHATSAPP_SELF_LIDS is an
+    // explicit fallback (comma list of lid user-parts known to be self).
+    const selfLids = (process.env.WHATSAPP_SELF_LIDS ?? "")
+      .split(",").map((x) => x.trim()).filter(Boolean);
+    let contactIsMe = false;
+    if (!chat.isGroup) {
+      try { contactIsMe = !!((await chat.getContact()) as any)?.isMe; } catch { /* ignore */ }
+    }
+    const isSelfChat = !chat.isGroup && (
+      contactIsMe ||
+      (!!selfId && chatId === selfId) ||
+      (!!selfUser && !!chatUser && selfUser === chatUser) ||
+      (!!chatUser && selfLids.includes(chatUser)) ||
+      (!!msg.from && msg.from === msg.to)
+    );
+    console.log("[wa] chat:", chat.isGroup ? "group" : isSelfChat ? "self" : "dm", "name=", (chat as any).name ?? "?");
+
+    if (isSelfChat) {
+      // Self-chat ("Message Yourself") — Mohamed's private assistant channel.
+      // Gated by WHATSAPP_SELF_CHAT so it can be toggled without a code change.
+      if (!cfg.selfChatEnabled) return;
+    } else {
+      // Group pilot flow: only process Mohamed's own messages if selfReply on.
+      if (msg.fromMe && !cfg.selfReply) return;
+      if (!chat.isGroup) return;
+      if (!cfg.isGroupAllowed((chat as any).name ?? "")) return;
+    }
+    const groupName = isSelfChat ? "Self Chat" : ((chat as any).name ?? "");
     console.log("[wa] group allowed");
 
     if (await alreadyReplied(chatId, msg.id._serialized)) return;
@@ -131,6 +181,18 @@ state.client.on("message_create", async (msg) => {
     })));
     console.log("[wa] thread context size:", threadContext.length);
 
+    if (isSelfChat) {
+      console.log("[wa] self-chat -> main agent bridge");
+      try {
+        const bridged = await runMainBridge(inboundText);
+        const sentId = await sendText(state.client, chatId, bridged, msg.id._serialized);
+        console.log("[wa] self-chat reply sent:", sentId);
+      } catch (e) {
+        console.error("[wa] main-bridge failed:", e);
+        await sendText(state.client, chatId, "Couldn\u2019t reach the main agent right now \u2014 try again in a moment.", msg.id._serialized);
+      }
+      return;
+    }
     console.log("[wa] calling composeReply...");
     const result = await composeReply({
       inboundText,
