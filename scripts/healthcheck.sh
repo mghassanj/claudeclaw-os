@@ -7,6 +7,10 @@ CCROOT=/home/ubuntu/claudeclaw-os
 STATE_DIR=/home/ubuntu/.cache/claudeclaw-healthcheck
 mkdir -p "$STATE_DIR"
 
+# Out-of-band heartbeat on every exit path, including the early exit 1 below
+# (see scripts/heartbeat.sh and .github/workflows/heartbeat-watch.yml).
+trap '"$CCROOT/scripts/heartbeat.sh" || true' EXIT
+
 # shellcheck source=/dev/null
 source "$CCROOT/.env"
 
