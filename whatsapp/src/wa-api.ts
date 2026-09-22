@@ -1,7 +1,7 @@
 // Supported WhatsApp API for the ClaudeClaw outbound gateway (served by
 // healthcheck.ts on 127.0.0.1:9334). Replaces the ad-hoc DevTools scripts
 // agents were writing (2026-09-21 Nora incident):
-//   GET  /contacts/find?q=               name/phone -> chat ids
+//   GET  /contacts/find?q=               name/phone -> chat ids (cached contacts + chat titles)
 //   GET  /chats/:id/messages?since=&limit=
 //   POST /send-as-me   {chatId, text, idempotencyKey, actionId}   (no 🤖 prefix)
 //   POST /revoke-as-me {chatId, messageId, idempotencyKey, actionId}
@@ -81,9 +81,80 @@ export function matchContacts(list: ContactLike[], q: string, limit = 20): Conta
   return out.slice(0, limit);
 }
 
+// getContacts() walks every contact through the page (~18 s on a large
+// address book), so lookups use an in-memory snapshot of contacts + chat
+// titles. A stale snapshot is served immediately and refreshed in the
+// background; only the very first lookup (or one after a failed load)
+// waits for WhatsApp. TTL: WA_CONTACTS_CACHE_MS (default 10 min).
+
+export interface ChatLike {
+  id: { _serialized: string };
+  name?: string;
+  formattedTitle?: string;
+  isGroup?: boolean;
+}
+
+interface Snapshot { list: ContactLike[]; at: number }
+interface CacheEntry { snap: Snapshot | null; loading: Promise<Snapshot> | null }
+const contactCache = new WeakMap<object, CacheEntry>();
+
+export function contactsCacheMs(): number {
+  const v = Number(process.env.WA_CONTACTS_CACHE_MS);
+  return Number.isFinite(v) && v >= 0 && process.env.WA_CONTACTS_CACHE_MS !== undefined && process.env.WA_CONTACTS_CACHE_MS !== ""
+    ? v : 10 * 60 * 1000;
+}
+
+/** Chats as ContactLike, keyed on their title (saved names, group subjects). */
+export function chatsAsContacts(chats: ChatLike[]): ContactLike[] {
+  return chats
+    .map((c) => ({
+      id: c.id,
+      name: c.name ?? c.formattedTitle ?? (c as any)?._data?.formattedTitle,
+      isGroup: !!c.isGroup,
+    }))
+    .filter((c) => !!c.id?._serialized && !!c.name);
+}
+
+async function loadSnapshot(client: WAClient): Promise<Snapshot> {
+  const [contacts, chats] = await Promise.all([
+    client.getContacts() as unknown as Promise<ContactLike[]>,
+    // Chat titles are a bonus; a getChats failure must not break lookups.
+    Promise.resolve().then(() => client.getChats() as unknown as Promise<ChatLike[]>).catch(() => [] as ChatLike[]),
+  ]);
+  // Contacts first so their richer fields (number, isMyContact) win the de-dupe in matchContacts.
+  return { list: [...contacts, ...chatsAsContacts(chats)], at: Date.now() };
+}
+
+function refresh(client: WAClient, entry: CacheEntry): Promise<Snapshot> {
+  if (!entry.loading) {
+    entry.loading = loadSnapshot(client)
+      .then((snap) => { entry.snap = snap; return snap; })
+      .finally(() => { entry.loading = null; });
+  }
+  return entry.loading;
+}
+
+/** Contacts + chat titles, cached; stale data is returned while a background refresh runs. */
+export async function cachedContactList(client: WAClient, now = Date.now()): Promise<ContactLike[]> {
+  let entry = contactCache.get(client);
+  if (!entry) { entry = { snap: null, loading: null }; contactCache.set(client, entry); }
+  if (!entry.snap) return (await refresh(client, entry)).list;
+  if (now - entry.snap.at >= contactsCacheMs()) {
+    refresh(client, entry).catch((e) => console.warn(`[wa-api] background contacts refresh failed: ${String(e).slice(0, 150)}`));
+  }
+  return entry.snap.list;
+}
+
+/** Warm the cache (e.g. on READY) so the first lookup is fast too. Never throws. */
+export function warmContactsCache(client: WAClient): void {
+  cachedContactList(client).catch((e) => console.warn(`[wa-api] contacts warm-up failed: ${String(e).slice(0, 150)}`));
+}
+
+/** Test-only. */
+export function _resetContactsCache(client: WAClient): void { contactCache.delete(client); }
+
 export async function findContacts(client: WAClient, q: string): Promise<ContactMatch[]> {
-  const contacts = (await client.getContacts()) as unknown as ContactLike[];
-  return matchContacts(contacts, q);
+  return matchContacts(await cachedContactList(client), q);
 }
 
 // ── Chat history ─────────────────────────────────────────────────────

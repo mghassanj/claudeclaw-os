@@ -3,6 +3,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import {
   checkBearer, matchContacts, onceByKey, _resetIdempotency, sendAsMe, revokeAsMe, validateSendAsMe,
+  findContacts, cachedContactList, chatsAsContacts,
 } from "../src/wa-api.js";
 import { consumeExpectedOutgoing, wasSentByBot } from "../src/sent-registry.js";
 import { parseApprovalReply } from "../src/outbound-approval.js";
@@ -40,6 +41,75 @@ describe("matchContacts", () => {
   it("matches phone digits (>= 4)", () => {
     expect(matchContacts(list, "+966 50 000 0009").map((x) => x.id)).toEqual(["966500000009@c.us"]);
     expect(matchContacts(list, "00")).toEqual([]);
+  });
+});
+
+describe("findContacts cache", () => {
+  const contacts = [
+    { id: { _serialized: "966500000001@c.us" }, name: "Nora Alharbi", number: "966500000001", isMyContact: true },
+  ];
+  const chats = [
+    { id: { _serialized: "120363000000000001@g.us" }, name: "Payroll Squad", isGroup: true },
+    { id: { _serialized: "966500000001@c.us" }, name: "Nora Alharbi" },
+    { id: { _serialized: "966500000007@c.us" }, formattedTitle: "Abu Fahad" },
+  ];
+  const makeClient = () => ({
+    getContacts: vi.fn(async () => contacts),
+    getChats: vi.fn(async () => chats),
+  });
+  const saved = process.env.WA_CONTACTS_CACHE_MS;
+  afterEach(() => { if (saved === undefined) delete process.env.WA_CONTACTS_CACHE_MS; else process.env.WA_CONTACTS_CACHE_MS = saved; });
+
+  it("second lookup is served from the cache without calling getContacts again", async () => {
+    const client = makeClient();
+    expect((await findContacts(client as any, "nora")).map((m) => m.id)).toEqual(["966500000001@c.us"]);
+    expect((await findContacts(client as any, "alharbi")).map((m) => m.id)).toEqual(["966500000001@c.us"]);
+    expect(client.getContacts).toHaveBeenCalledTimes(1);
+    expect(client.getChats).toHaveBeenCalledTimes(1);
+  });
+
+  it("matches chat titles (group subjects, formattedTitle) and de-dupes against contacts", async () => {
+    const client = makeClient();
+    const g = await findContacts(client as any, "payroll");
+    expect(g).toEqual([{ id: "120363000000000001@g.us", name: "Payroll Squad", number: undefined, isGroup: true, isMyContact: false }]);
+    expect((await findContacts(client as any, "abu fahad")).map((m) => m.id)).toEqual(["966500000007@c.us"]);
+    const nora = await findContacts(client as any, "Nora");
+    expect(nora).toHaveLength(1);
+    expect(nora[0]).toMatchObject({ number: "966500000001", isMyContact: true });
+  });
+
+  it("serves stale data immediately and refreshes once in the background after the TTL", async () => {
+    process.env.WA_CONTACTS_CACHE_MS = "1000";
+    const client = makeClient();
+    await cachedContactList(client as any);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const updated = [...contacts, { id: { _serialized: "966500000002@c.us" }, name: "Nora B", number: "966500000002" }];
+    client.getContacts.mockImplementationOnce(async () => { await gate; return updated; });
+    const later = Date.now() + 5_000;
+    const stale = await cachedContactList(client as any, later);
+    const stale2 = await cachedContactList(client as any, later);
+    expect(stale.some((c) => c.id._serialized === "966500000002@c.us")).toBe(false);
+    expect(stale2).toBe(stale);
+    expect(client.getContacts).toHaveBeenCalledTimes(2); // one background refresh, not two
+    release();
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    const fresh = await cachedContactList(client as any);
+    expect(fresh.some((c) => c.id._serialized === "966500000002@c.us")).toBe(true);
+  });
+
+  it("a failed first load is not cached; a getChats failure still returns contacts", async () => {
+    const client = makeClient();
+    client.getContacts.mockRejectedValueOnce(new Error("page crashed"));
+    await expect(findContacts(client as any, "nora")).rejects.toThrow("page crashed");
+    client.getChats.mockRejectedValueOnce(new Error("no chats"));
+    expect((await findContacts(client as any, "nora")).map((m) => m.id)).toEqual(["966500000001@c.us"]);
+    expect(client.getContacts).toHaveBeenCalledTimes(2);
+  });
+
+  it("chatsAsContacts drops untitled chats", () => {
+    expect(chatsAsContacts([{ id: { _serialized: "x@c.us" } }])).toEqual([]);
   });
 });
 
