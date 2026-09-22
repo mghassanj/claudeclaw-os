@@ -42,11 +42,9 @@ jobs:
       - name: Install (root)
         run: npm ci
 
-      # --legacy-peer-deps: openai@4 declares an optional peer zod@^3 while
-      # @anthropic-ai/claude-agent-sdk needs zod@^4. See CONTRIBUTING.md.
       - name: Install (whatsapp)
         working-directory: whatsapp
-        run: npm ci --legacy-peer-deps
+        run: npm ci
 
       - name: Typecheck (root)
         run: npx tsc --noEmit

@@ -23,14 +23,8 @@ Tests use [Vitest](https://vitest.dev). Install dependencies first (the
 
 ```bash
 PUPPETEER_SKIP_DOWNLOAD=1 npm ci
-cd whatsapp && PUPPETEER_SKIP_DOWNLOAD=1 npm ci --legacy-peer-deps && cd ..
+cd whatsapp && PUPPETEER_SKIP_DOWNLOAD=1 npm ci && cd ..
 ```
-
-`--legacy-peer-deps` is needed because `openai@4` declares an optional peer
-`zod@^3` while `@anthropic-ai/claude-agent-sdk` needs `zod@^4`. Bumping to
-`openai@6` resolves it, but that also makes npm install the agent SDK's
-peers (`zod@4`, `@modelcontextprotocol/sdk`) that the deployed WhatsApp
-service currently runs without, so it is left for a deliberate follow-up.
 
 ### Test safety guard
 
