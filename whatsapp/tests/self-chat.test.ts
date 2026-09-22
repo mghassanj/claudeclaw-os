@@ -18,6 +18,8 @@ describe("bridgeInboundText", () => {
     expect(bridgeInboundText("image", "[image attached — describe…]", " what is this? ")).toBe("what is this?");
     expect(bridgeInboundText("image", "[image attached — describe…]", "")).toBe("");
     expect(bridgeInboundText("text", "hello", "hello")).toBe("hello");
+    const doc = "[Document attached: a.pdf, 10 bytes]\n\nExtracted content:\nInvoice total 500";
+    expect(bridgeInboundText("document", doc, "")).toBe(doc);
   });
 });
 

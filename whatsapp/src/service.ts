@@ -230,17 +230,18 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
       }, Number(process.env.WA_SELF_INTERIM_MS ?? 60_000));
       // Channel metadata so the main agent knows this is WhatsApp (formatting,
       // length, language) and whether it came from a voice note or image.
+      const bridgeType = msg.type === "document" ? "document" : inboundType;
       const bridgeMeta: MainBridgeMeta = {
         channel: "whatsapp-self",
         lang: inboundLang,
-        inboundType: msg.type === "document" ? "document" : inboundType,
+        inboundType: bridgeType,
         ...(inboundType === "image" && inlineImageBase64 && inlineImageMime
           ? { image: { base64: inlineImageBase64, mime: inlineImageMime } }
           : {}),
       };
       let bridged: Awaited<ReturnType<typeof runMainBridge>>;
       try {
-        bridged = await runMainBridge(bridgeInboundText(inboundType, inboundText, msg.body ?? ""), bridgeMeta);
+        bridged = await runMainBridge(bridgeInboundText(bridgeType, inboundText, msg.body ?? ""), bridgeMeta);
       } catch (e) {
         clearTimeout(interim);
         console.error("[wa] main-bridge failed:", e);

@@ -21,10 +21,12 @@ export const BRIDGE_FALLBACK_TEXT = [
  *   agent treats them as spoken commands (main CLAUDE.md "Message Format");
  * - images send only the caption (the image itself travels in the metadata and
  *   the server wraps it as "Photo received. File saved at: …");
- * - everything else (text, extracted documents) is passed as is.
+ * - everything else (text, extracted documents) is passed as is. Documents must
+ *   be passed as "document", not the "image" they are recorded under, or the
+ *   extracted text is dropped and the agent sees an empty message.
  */
 export function bridgeInboundText(
-  inboundType: "text" | "voice" | "image",
+  inboundType: "text" | "voice" | "image" | "document",
   inboundText: string,
   rawBody: string,
 ): string {
