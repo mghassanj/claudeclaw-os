@@ -1,3 +1,4 @@
+import type { InboundKind } from "./inbound-media.js";
 // Helpers for the WhatsApp self-chat -> main agent bridge (service.ts).
 // Kept free of whatsapp-web.js so they can be unit-tested.
 import fs from "node:fs/promises";
@@ -19,19 +20,18 @@ export const BRIDGE_FALLBACK_TEXT = [
  * The text sent to the main agent for a self-chat message:
  * - voice notes get the same "[Voice transcribed]: " tag Telegram uses, so the
  *   agent treats them as spoken commands (main CLAUDE.md "Message Format");
- * - images send only the caption (the image itself travels in the metadata and
- *   the server wraps it as "Photo received. File saved at: …");
- * - everything else (text, extracted documents) is passed as is. Documents must
- *   be passed as "document", not the "image" they are recorded under, or the
- *   extracted text is dropped and the agent sees an empty message.
+ * - plain images send only the caption (the image itself travels in the
+ *   metadata and the server wraps it as "Photo received. File saved at: …");
+ * - everything else (text, documents, video, audio, stickers, locations,
+ *   contacts, polls) sends the description built by describeInbound.
  */
 export function bridgeInboundText(
-  inboundType: "text" | "voice" | "image" | "document",
+  kind: InboundKind,
   inboundText: string,
   rawBody: string,
 ): string {
-  if (inboundType === "voice") return `[Voice transcribed]: ${inboundText.trim()}`;
-  if (inboundType === "image") return rawBody.trim();
+  if (kind === "voice") return `[Voice transcribed]: ${inboundText.trim()}`;
+  if (kind === "image") return rawBody.trim();
   return inboundText;
 }
 

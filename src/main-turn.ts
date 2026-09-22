@@ -30,9 +30,70 @@ export interface MainTurnMeta {
   channel?: string;
   /** Detected language of the inbound message ('ar' | 'en' | 'unknown'). */
   lang?: string;
-  inboundType?: 'text' | 'voice' | 'image' | 'document';
+  inboundType?: InboundType;
   /** Image attached to the inbound message (base64, as whatsapp-web.js gives it). */
   image?: { base64: string; mime: string };
+  /** Other files from the message: the original plus derived frames/pages. */
+  attachments?: BridgeAttachment[];
+}
+
+export const INBOUND_TYPES = [
+  'text', 'voice', 'audio', 'image', 'sticker', 'video', 'document',
+  'location', 'contact', 'poll', 'event', 'other',
+] as const;
+export type InboundType = typeof INBOUND_TYPES[number];
+
+export interface BridgeAttachment {
+  base64: string;
+  mime: string;
+  filename: string;
+  role: 'original' | 'derived';
+}
+
+const MAX_BRIDGE_ATTACHMENTS = 16;
+
+/** Validate the bridge's attachments field; undefined when absent or empty. */
+export function parseBridgeAttachments(raw: unknown): BridgeAttachment[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const list = raw
+    .filter((a): a is BridgeAttachment => !!a && typeof a === 'object'
+      && typeof (a as BridgeAttachment).base64 === 'string' && (a as BridgeAttachment).base64.length > 0
+      && typeof (a as BridgeAttachment).mime === 'string'
+      && typeof (a as BridgeAttachment).filename === 'string')
+    .slice(0, MAX_BRIDGE_ATTACHMENTS)
+    .map((a) => ({ base64: a.base64, mime: a.mime.slice(0, 100), filename: a.filename.slice(0, 200), role: a.role === 'derived' ? 'derived' as const : 'original' as const }));
+  return list.length ? list : undefined;
+}
+
+/** Filesystem-safe name that keeps the extension (and Arabic letters). */
+export function safeUploadName(filename: string): string {
+  const base = path.basename(filename).replace(/[^\p{L}\p{N}._-]+/gu, '_').replace(/^\.+/, '').slice(-120);
+  return base || 'file';
+}
+
+/**
+ * Save bridged attachments into the uploads dir (cleaned by cleanupOldUploads)
+ * and return the lines telling the agent where they are. Files that fail to
+ * save are listed as such, never silently dropped.
+ */
+export function stageBridgeAttachments(attachments: BridgeAttachment[]): string {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  const stamp = Date.now();
+  const lines = attachments.map((a, i) => {
+    try {
+      const localPath = path.join(UPLOADS_DIR, `${stamp}_${i}_whatsapp_${safeUploadName(a.filename)}`);
+      fs.writeFileSync(localPath, Buffer.from(a.base64, 'base64'));
+      return `- ${a.role === 'original' ? 'Original file' : 'Derived image'}: ${localPath} (${a.filename}, ${a.mime})`;
+    } catch (err) {
+      logger.warn({ err, filename: a.filename }, 'main-turn bridge: could not stage attachment');
+      return `- ${a.filename}: could not be saved`;
+    }
+  });
+  return [
+    'Files from this message, saved locally (open them with Read; for Office files use python):',
+    ...lines,
+    'The original file is authoritative: any extracted text above may be truncated or come from OCR.',
+  ].join('\n');
 }
 
 /** Reply for the bridge: redacted final answer with [SEND_FILE] markers pulled out. */
@@ -48,8 +109,15 @@ const CHANNEL_LABELS: Record<string, string> = {
 
 const INBOUND_LABELS: Record<string, string> = {
   voice: 'voice note',
+  audio: 'audio file',
   image: 'image',
+  sticker: 'sticker',
+  video: 'video',
   document: 'document',
+  location: 'location',
+  contact: 'contact card',
+  poll: 'poll',
+  event: 'event',
 };
 
 /**
@@ -150,7 +218,10 @@ export async function runMainTurn(text: string, meta: MainTurnMeta = {}): Promis
 
   // What the user said, as logged/recalled (an image becomes the standard
   // "Photo received… File saved at" prompt, like Telegram photos).
-  const userText = (meta.image && stageBridgeImage(meta.image, text)) || text || '[Image attached, but it could not be saved]';
+  const baseText = (meta.image && stageBridgeImage(meta.image, text)) || text || (meta.image ? '[Image attached, but it could not be saved]' : '');
+  const userText = meta.attachments?.length
+    ? [baseText, stageBridgeAttachments(meta.attachments)].filter(Boolean).join('\n\n')
+    : baseText;
 
   const sessionId = getSession(chatId, MAIN_AGENT_ID);
   const { contextText, surfacedMemoryIds, surfacedMemorySummaries } = await buildMemoryContext(chatId, userText, MAIN_AGENT_ID);

@@ -20,6 +20,8 @@ describe("bridgeInboundText", () => {
     expect(bridgeInboundText("text", "hello", "hello")).toBe("hello");
     const doc = "[Document attached: a.pdf, 10 bytes]\n\nExtracted content:\nInvoice total 500";
     expect(bridgeInboundText("document", doc, "")).toBe(doc);
+    expect(bridgeInboundText("video", "[Video attached]", "caption")).toBe("[Video attached]");
+    expect(bridgeInboundText("location", "[Location shared]", "")).toBe("[Location shared]");
   });
 });
 
