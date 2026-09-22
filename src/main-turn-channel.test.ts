@@ -29,7 +29,7 @@ vi.mock('./memory.js', () => ({
   saveConversationTurn: vi.fn(),
 }));
 vi.mock('./logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
-vi.mock('./state.js', () => ({ emitChatEvent: vi.fn(), setActiveAbort: vi.fn() }));
+vi.mock('./state.js', () => ({ emitChatEvent: vi.fn(), setActiveAbort: vi.fn(), setProcessing: vi.fn() }));
 vi.mock('./media.js', () => ({
   UPLOADS_DIR: uploadsDir,
   buildPhotoMessage: (p: string, caption?: string) => `Photo received. File saved at: ${p}${caption ? `\nCaption: "${caption}"` : ''}`,

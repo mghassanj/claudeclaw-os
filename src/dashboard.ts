@@ -3471,9 +3471,12 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // Abort current processing
   app.post('/api/chat/abort', (c) => {
     const { chatId } = getIsProcessing();
-    if (!chatId) return c.json({ ok: false, reason: 'not_processing' });
-    const aborted = abortActiveQuery(chatId);
-    return c.json({ ok: aborted });
+    if (chatId) return c.json({ ok: abortActiveQuery(chatId) });
+    // Fallback: a turn registered under the main chat without the processing
+    // flag (e.g. a bridged main-turn in flight) is still stoppable, the same
+    // way Telegram /stop reaches it.
+    if (ALLOWED_CHAT_ID && abortActiveQuery(String(ALLOWED_CHAT_ID))) return c.json({ ok: true });
+    return c.json({ ok: false, reason: 'not_processing' });
   });
 
   // SPA catch-all — any unmatched GET to a non-/api/* path falls through

@@ -25,7 +25,7 @@ vi.mock('./agent.js', () => ({
 }));
 
 import { runMainTurn } from './main-turn.js';
-import { abortActiveQuery } from './state.js';
+import { abortActiveQuery, getIsProcessing } from './state.js';
 
 /** Resolves like runAgent does when its AbortController fires. */
 function waitForAbort(partial: string | null) {
@@ -64,5 +64,21 @@ describe('runMainTurn outcome honesty', () => {
     expect((await p).text).toBe('Stopped — partial result:\npartial');
     // Cleared afterwards: nothing left to stop.
     expect(abortActiveQuery('4242')).toBe(false);
+  });
+
+  it('marks the main chat processing for the turn and clears it after (also on error)', async () => {
+    let during: ReturnType<typeof getIsProcessing> | null = null;
+    state.impl = async () => {
+      during = getIsProcessing();
+      return { text: 'ok', newSessionId: undefined, usage: null };
+    };
+    expect(getIsProcessing()).toEqual({ processing: false, chatId: '' });
+    await runMainTurn('hi');
+    expect(during).toEqual({ processing: true, chatId: '4242' });
+    expect(getIsProcessing()).toEqual({ processing: false, chatId: '' });
+
+    state.impl = async () => { throw new Error('boom'); };
+    await expect(runMainTurn('hi')).rejects.toThrow('boom');
+    expect(getIsProcessing()).toEqual({ processing: false, chatId: '' });
   });
 });
