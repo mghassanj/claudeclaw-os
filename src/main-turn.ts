@@ -18,7 +18,7 @@ import { messageQueue } from './message-queue.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
 import { extractFileMarkers, type FileMarker } from './file-markers.js';
 import { UPLOADS_DIR, buildPhotoMessage } from './media.js';
-import { emitChatEvent, setActiveAbort, type ChatEvent } from './state.js';
+import { emitChatEvent, setActiveAbort, setProcessing, type ChatEvent } from './state.js';
 import { formatAbortedReply } from './turn-outcome.js';
 import { runWithTurnContext, takePendingHandoff } from './session-handoff.js';
 
@@ -169,8 +169,12 @@ export async function runMainTurn(text: string, meta: MainTurnMeta = {}): Promis
   // Register under the main chat id so Telegram /stop (and the dashboard
   // abort) can cancel a bridged turn exactly like a Telegram-native one.
   // Safe because turns on this chat are serialized by messageQueue.
+  // Also mark the chat as processing, like a Telegram turn does, so the
+  // dashboard shows the turn, its Stop button works (/api/chat/abort keys off
+  // getIsProcessing) and /api/chat/send answers busy instead of stacking.
   const abortKey = String(chatId);
   setActiveAbort(abortKey, abortCtrl);
+  setProcessing(abortKey, true);
   try {
     logger.info({ chatId, hasSession: !!sessionId, len: text.length, channel: meta.channel }, 'main-turn bridge: starting');
     const result = await runWithTurnContext({ chatId, agentId: MAIN_AGENT_ID }, () => runAgentWithRetry(
@@ -200,6 +204,7 @@ export async function runMainTurn(text: string, meta: MainTurnMeta = {}): Promis
   } finally {
     clearTimeout(timer);
     setActiveAbort(abortKey, null);
+    setProcessing(abortKey, false);
   }
 }
 

@@ -137,6 +137,7 @@ PROJECT_ROOT=$(git rev-parse --show-toplevel)
 node "$PROJECT_ROOT/dist/mission-cli.js" list                    # see all tasks
 node "$PROJECT_ROOT/dist/mission-cli.js" result <task-id>         # get a task's result
 node "$PROJECT_ROOT/dist/mission-cli.js" cancel <task-id>         # cancel a queued task
+node "$PROJECT_ROOT/dist/mission-cli.js" retry <task-id>          # re-queue a mission interrupted by a restart (never automatic)
 ```
 
 Available agents: main, research, comms, content, ops. Use `--priority 10` for high priority, `--priority 0` for low (default is 5).

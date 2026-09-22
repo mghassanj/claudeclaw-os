@@ -27,9 +27,20 @@ import {
   shouldAlertStatusChange,
   wrapScheduledPrompt,
 } from './turn-outcome.js';
+import { MISSION_RETRY_CALLBACK } from './mission-telegram.js';
 import { resumePendingLoopFires, setLoopTelegramSender, sweepOpenLoops } from './open-loops-runtime.js';
 
-type Sender = (text: string) => Promise<void>;
+/** Inline button (Telegram callback_data) attached to the last chunk of a message. */
+export interface SendButton {
+  text: string;
+  data: string;
+}
+
+type Sender = (text: string, opts?: { buttons?: SendButton[] }) => Promise<void>;
+
+/** callback_data is capped at 64 bytes; ids longer than this get no button. */
+const MAX_CALLBACK_ID_LEN = 64 - MISSION_RETRY_CALLBACK.length;
+const MAX_RETRY_BUTTONS = 8;
 
 /** Max time (ms) a scheduled task can run before being killed.
  *  Override via TASK_TIMEOUT_MS env var (e.g. 1800000 for 30 min). */
@@ -86,15 +97,20 @@ export function initScheduler(send: Sender, agentId = 'main'): void {
   for (const t of interruptedTasks) {
     lines.push(`• Scheduled task "${escapeHtml(snippet(t.prompt, 60))}" did not finish; not re-run (next run follows its schedule).`);
   }
+  // Missions are one-shot jobs: never re-run on their own after a restart
+  // (a from-scratch re-run would repeat side effects). The user retries.
+  const buttons: SendButton[] = [];
   for (const m of interruptedMissions) {
     lines.push(
-      m.action === 'requeued'
-        ? `• Mission "${escapeHtml(snippet(m.title, 60))}" (attempt ${m.attempts}) re-queued; it runs again within a minute. Cancel it in Mission Control if not wanted.`
-        : `• Mission "${escapeHtml(snippet(m.title, 60))}" failed: interrupted again on attempt ${m.attempts}; not re-run.`,
+      `• Mission "${escapeHtml(snippet(m.title, 60))}" (attempt ${m.attempts}) was interrupted and will NOT re-run on its own. ` +
+      `Retry: <code>mission-cli retry ${escapeHtml(m.id)}</code>`,
     );
+    if (buttons.length < MAX_RETRY_BUTTONS && m.id.length <= MAX_CALLBACK_ID_LEN) {
+      buttons.push({ text: `↻ Retry "${snippet(m.title, 24)}"`, data: `${MISSION_RETRY_CALLBACK}${m.id}` });
+    }
   }
   if (lines.length > 0 && ALLOWED_CHAT_ID) {
-    void sender(`⚠ Interrupted by a restart:\n${lines.join('\n')}`).catch((err) => {
+    void sender(`⚠ Interrupted by a restart:\n${lines.join('\n')}`, buttons.length ? { buttons } : undefined).catch((err) => {
       logger.warn({ err }, 'Failed to send interrupted-task notice');
     });
   }

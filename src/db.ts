@@ -385,7 +385,8 @@ function createSchema(database: Database.Database): void {
       detail          TEXT NOT NULL DEFAULT '',
       checked_at      INTEGER NOT NULL,
       last_ok_at      INTEGER,
-      last_change_at  INTEGER NOT NULL
+      last_change_at  INTEGER NOT NULL,
+      fail_streak     INTEGER NOT NULL DEFAULT 0
     );
 
     -- Phase 4.2: Skill health checks
@@ -508,6 +509,16 @@ function createSchema(database: Database.Database): void {
       updated_at          INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_contacts_wa ON contacts(wa_chat_id);
+
+    -- /newchat handoffs waiting for the next fresh-session turn
+    -- (session-handoff.ts). Persisted so a restart between /newchat and the
+    -- next message doesn't lose it; the row is deleted when consumed.
+    CREATE TABLE IF NOT EXISTS pending_handoffs (
+      agent_id    TEXT NOT NULL,
+      chat_id     TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, chat_id)
+    );
   `);
 }
 
@@ -816,10 +827,13 @@ function runMigrations(database: Database.Database): void {
     logger.info('Migration: made mission_tasks.assigned_agent nullable');
   }
 
-  // Mission Control: attempts counter so a mission interrupted by a restart
-  // is re-queued at most once (with a notification) instead of silently
-  // re-running forever. Incremented on claim.
+  // Mission Control: attempts counter (incremented on claim), shown in the
+  // interrupted-by-restart notice.
   addColumnIfMissing(database, 'mission_tasks', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
+
+  // Credential monitor debounce: consecutive raw probe failures, persisted so
+  // a restart between two failing probes doesn't reset the count.
+  addColumnIfMissing(database, 'cred_health', 'fail_streak', 'INTEGER NOT NULL DEFAULT 0');
 
   // Live Meetings: add provider column so we can track which platform
   // each session used (pika avatar vs recall voice-only). Default 'pika'
@@ -1524,65 +1538,10 @@ export function getRecentTaskOutputs(
     .all(agentId, cutoff) as Array<{ prompt: string; last_result: string; last_run: number }>;
 }
 
-// ── WhatsApp message map ──────────────────────────────────────────────
-
-export function saveWaMessageMap(telegramMsgId: number, waChatId: string, contactName: string): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `INSERT OR REPLACE INTO wa_message_map (telegram_msg_id, wa_chat_id, contact_name, created_at)
-     VALUES (?, ?, ?, ?)`,
-  ).run(telegramMsgId, waChatId, contactName, now);
-}
-
-export function lookupWaChatId(telegramMsgId: number): { waChatId: string; contactName: string } | null {
-  const row = db
-    .prepare('SELECT wa_chat_id, contact_name FROM wa_message_map WHERE telegram_msg_id = ?')
-    .get(telegramMsgId) as { wa_chat_id: string; contact_name: string } | undefined;
-  if (!row) return null;
-  return { waChatId: row.wa_chat_id, contactName: row.contact_name };
-}
-
-export function getRecentWaContacts(limit = 20): Array<{ waChatId: string; contactName: string; lastSeen: number }> {
-  const rows = db.prepare(
-    `SELECT wa_chat_id, contact_name, MAX(created_at) as lastSeen
-     FROM wa_message_map
-     GROUP BY wa_chat_id
-     ORDER BY lastSeen DESC
-     LIMIT ?`,
-  ).all(limit) as Array<{ wa_chat_id: string; contact_name: string; lastSeen: number }>;
-  return rows.map((r) => ({ waChatId: r.wa_chat_id, contactName: r.contact_name, lastSeen: r.lastSeen }));
-}
-
-// ── WhatsApp outbox ──────────────────────────────────────────────────
-
-export interface WaOutboxItem {
-  id: number;
-  to_chat_id: string;
-  body: string;
-  created_at: number;
-}
-
-export function enqueueWaMessage(toChatId: string, body: string): number {
-  const now = Math.floor(Date.now() / 1000);
-  const result = db.prepare(
-    `INSERT INTO wa_outbox (to_chat_id, body, created_at) VALUES (?, ?, ?)`,
-  ).run(toChatId, encryptField(body), now);
-  return result.lastInsertRowid as number;
-}
-
-export function getPendingWaMessages(): WaOutboxItem[] {
-  const rows = db.prepare(
-    `SELECT id, to_chat_id, body, created_at FROM wa_outbox WHERE sent_at IS NULL ORDER BY created_at`,
-  ).all() as WaOutboxItem[];
-  return rows.map((r) => ({ ...r, body: decryptField(r.body) }));
-}
-
-export function markWaMessageSent(id: number): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(`UPDATE wa_outbox SET sent_at = ? WHERE id = ?`).run(now, id);
-}
-
-// ── WhatsApp messages ────────────────────────────────────────────────
+// ── WhatsApp retention ───────────────────────────────────────────────
+// The wa_messages / wa_outbox / wa_message_map tables belonged to the old
+// in-process whatsapp-web.js client (removed). The WhatsApp service in
+// whatsapp/ owns its own storage; the sweep below still purges old rows.
 
 /**
  * Prune WhatsApp messages older than the given number of days.
@@ -1630,35 +1589,61 @@ export interface CredHealthRow {
   checked_at: number;
   last_ok_at: number | null;
   last_change_at: number;
+  /** Consecutive raw probe failures (0 after any non-fail result). */
+  fail_streak: number;
 }
 
 export function getCredHealth(): CredHealthRow[] {
   return db.prepare('SELECT * FROM cred_health ORDER BY name').all() as CredHealthRow[];
 }
 
+export function getCredHealthRow(name: string): CredHealthRow | null {
+  return (db.prepare('SELECT * FROM cred_health WHERE name = ?').get(name) as CredHealthRow | undefined) ?? null;
+}
+
 /**
- * Record one probe result. Returns the previous status (null = first time
- * this probe was seen) so the caller can detect transitions.
+ * Record one probe result. `status` is the (debounced) status to store;
+ * `rawStatus` is what the probe actually observed and drives last_ok_at, so an
+ * unconfirmed failure that keeps the stored status 'ok' doesn't count as an ok
+ * observation. Returns the previous stored status (null = first time this
+ * probe was seen) so the caller can detect transitions.
  */
 export function recordCredHealth(
   name: string,
   status: CredHealthRow['status'],
   detail: string,
   nowSec = Math.floor(Date.now() / 1000),
+  failStreak = 0,
+  rawStatus: CredHealthRow['status'] = status,
 ): CredHealthRow['status'] | null {
   const prev = db.prepare('SELECT status FROM cred_health WHERE name = ?').get(name) as { status: CredHealthRow['status'] } | undefined;
   const changed = !prev || prev.status !== status;
   db.prepare(`
-    INSERT INTO cred_health (name, status, detail, checked_at, last_ok_at, last_change_at)
-    VALUES (@name, @status, @detail, @now, CASE WHEN @status = 'ok' THEN @now END, @now)
+    INSERT INTO cred_health (name, status, detail, checked_at, last_ok_at, last_change_at, fail_streak)
+    VALUES (@name, @status, @detail, @now, CASE WHEN @raw = 'ok' THEN @now END, @now, @streak)
     ON CONFLICT(name) DO UPDATE SET
       status = excluded.status,
       detail = excluded.detail,
       checked_at = excluded.checked_at,
-      last_ok_at = CASE WHEN excluded.status = 'ok' THEN excluded.checked_at ELSE cred_health.last_ok_at END,
-      last_change_at = CASE WHEN @changed = 1 THEN excluded.checked_at ELSE cred_health.last_change_at END
-  `).run({ name, status, detail, now: nowSec, changed: changed ? 1 : 0 });
+      last_ok_at = CASE WHEN @raw = 'ok' THEN excluded.checked_at ELSE cred_health.last_ok_at END,
+      last_change_at = CASE WHEN @changed = 1 THEN excluded.checked_at ELSE cred_health.last_change_at END,
+      fail_streak = excluded.fail_streak
+  `).run({ name, status, detail, now: nowSec, changed: changed ? 1 : 0, streak: failStreak, raw: rawStatus });
   return prev ? prev.status : null;
+}
+
+// ── Pending /newchat handoffs (session-handoff.ts) ────────────────────
+
+export function setPendingHandoff(chatId: string, agentId: string, nowSec = Math.floor(Date.now() / 1000)): void {
+  db.prepare(
+    `INSERT INTO pending_handoffs (agent_id, chat_id, created_at) VALUES (?, ?, ?)
+     ON CONFLICT(agent_id, chat_id) DO UPDATE SET created_at = excluded.created_at`,
+  ).run(agentId, chatId, nowSec);
+}
+
+/** Delete the pending mark; true when one existed (so it is consumed at most once). */
+export function deletePendingHandoff(chatId: string, agentId: string): boolean {
+  return db.prepare('DELETE FROM pending_handoffs WHERE agent_id = ? AND chat_id = ?').run(agentId, chatId).changes > 0;
 }
 
 // ── Conversation Log ──────────────────────────────────────────────────
@@ -1846,42 +1831,6 @@ export function pruneWarRoomMeetings(retentionDays = 90): { meetings: number; co
       convLog: Number(convDel.changes),
     };
   })();
-}
-
-// ── WhatsApp messages ────────────────────────────────────────────────
-
-export function saveWaMessage(
-  chatId: string,
-  contactName: string,
-  body: string,
-  timestamp: number,
-  isFromMe: boolean,
-): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `INSERT INTO wa_messages (chat_id, contact_name, body, timestamp, is_from_me, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, contactName, encryptField(body), timestamp, isFromMe ? 1 : 0, now);
-}
-
-export interface WaMessageRow {
-  id: number;
-  chat_id: string;
-  contact_name: string;
-  body: string;
-  timestamp: number;
-  is_from_me: number;
-  created_at: number;
-}
-
-export function getRecentWaMessages(chatId: string, limit = 20): WaMessageRow[] {
-  const rows = db
-    .prepare(
-      `SELECT * FROM wa_messages WHERE chat_id = ?
-       ORDER BY timestamp DESC LIMIT ?`,
-    )
-    .all(chatId, limit) as WaMessageRow[];
-  return rows.map((r) => ({ ...r, body: decryptField(r.body) }));
 }
 
 // ── Slack messages ────────────────────────────────────────────────
@@ -2359,7 +2308,8 @@ export interface MissionTask {
   title: string;
   prompt: string;
   assigned_agent: string | null;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  /** 'interrupted': was running when the process restarted; waits for a manual retry. */
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   result: string | null;
   error: string | null;
   created_by: string;
@@ -2600,14 +2550,14 @@ export function completeMissionTask(
 
 export function cancelMissionTask(id: string): boolean {
   const result = db.prepare(
-    `UPDATE mission_tasks SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('queued', 'running')`,
+    `UPDATE mission_tasks SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('queued', 'running', 'interrupted')`,
   ).run(Math.floor(Date.now() / 1000), id);
   return result.changes > 0;
 }
 
 export function deleteMissionTask(id: string): boolean {
   const result = db.prepare(
-    `DELETE FROM mission_tasks WHERE id = ? AND status IN ('completed', 'cancelled', 'failed')`,
+    `DELETE FROM mission_tasks WHERE id = ? AND status IN ('completed', 'cancelled', 'failed', 'interrupted')`,
   ).run(id);
   return result.changes > 0;
 }
@@ -2615,7 +2565,7 @@ export function deleteMissionTask(id: string): boolean {
 export function cleanupOldMissionTasks(olderThanDays = 7): number {
   const cutoff = Math.floor(Date.now() / 1000) - olderThanDays * 86400;
   const result = db.prepare(
-    `DELETE FROM mission_tasks WHERE status IN ('completed', 'cancelled', 'failed') AND completed_at < ?`,
+    `DELETE FROM mission_tasks WHERE status IN ('completed', 'cancelled', 'failed', 'interrupted') AND completed_at < ?`,
   ).run(cutoff);
   return result.changes;
 }
@@ -2636,31 +2586,27 @@ export function assignMissionTask(id: string, agent: string): boolean {
 
 export function getMissionTaskHistory(limit = 30, offset = 0): { tasks: MissionTask[]; total: number } {
   const total = (db.prepare(
-    `SELECT COUNT(*) as c FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled')`,
+    `SELECT COUNT(*) as c FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled', 'interrupted')`,
   ).get() as { c: number }).c;
   const tasks = db.prepare(
-    `SELECT * FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled')
+    `SELECT * FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled', 'interrupted')
      ORDER BY completed_at DESC LIMIT ? OFFSET ?`,
   ).all(limit, offset) as MissionTask[];
   return { tasks, total };
 }
 
-/** A mission interrupted this many times is failed instead of re-queued. */
-export const MAX_MISSION_ATTEMPTS = 2;
-
 export interface InterruptedMission {
   id: string;
   title: string;
   attempts: number;
-  action: 'requeued' | 'failed';
 }
 
 /**
- * Startup recovery for missions left 'running' by a crash/restart. A mission
- * interrupted before its MAX_MISSION_ATTEMPTS-th attempt is re-queued (with
- * the interruption recorded in `error`); after that it is marked failed so it
- * cannot loop through restarts repeating side effects. Returns what happened
- * so the caller can notify once — nothing is re-queued silently.
+ * Startup recovery for missions left 'running' by a crash/restart. They are
+ * marked 'interrupted' and NOT re-run: a mission is a one-shot job whose
+ * side effects (messages sent, files written, tickets filed) would repeat on
+ * a from-scratch re-run. Returns them so the caller notifies once; the user
+ * re-queues with retryMissionTask (mission-cli retry <id> / Telegram button).
  */
 export function recoverInterruptedMissions(agentId: string): InterruptedMission[] {
   const txn = db.transaction(() => {
@@ -2671,25 +2617,31 @@ export function recoverInterruptedMissions(agentId: string): InterruptedMission[
     const out: InterruptedMission[] = [];
     for (const r of rows) {
       const attempts = r.attempts ?? 0;
-      if (attempts >= MAX_MISSION_ATTEMPTS) {
-        db.prepare(
-          `UPDATE mission_tasks SET status = 'failed', error = ?, completed_at = ? WHERE id = ?`,
-        ).run(
-          `Interrupted by a restart on attempt ${attempts}; not re-run automatically. Re-queue it if still wanted.`,
-          now,
-          r.id,
-        );
-        out.push({ id: r.id, title: r.title, attempts, action: 'failed' });
-      } else {
-        db.prepare(
-          `UPDATE mission_tasks SET status = 'queued', started_at = NULL, error = ? WHERE id = ?`,
-        ).run(`Interrupted by a restart on attempt ${attempts}; re-queued.`, r.id);
-        out.push({ id: r.id, title: r.title, attempts, action: 'requeued' });
-      }
+      db.prepare(
+        `UPDATE mission_tasks SET status = 'interrupted', error = ?, completed_at = ? WHERE id = ?`,
+      ).run(
+        `Interrupted by a restart on attempt ${attempts}; not re-run automatically. Retry: mission-cli retry ${r.id}`,
+        now,
+        r.id,
+      );
+      out.push({ id: r.id, title: r.title, attempts });
     }
     return out;
   });
   return txn();
+}
+
+/**
+ * Re-queue an interrupted mission (it runs again from scratch on its agent's
+ * next scheduler tick). Only 'interrupted' missions can be retried; returns
+ * the re-queued task, or null when the id is unknown or not interrupted.
+ */
+export function retryMissionTask(id: string): MissionTask | null {
+  const res = db.prepare(
+    `UPDATE mission_tasks SET status = 'queued', started_at = NULL, completed_at = NULL, error = NULL, result = NULL
+     WHERE id = ? AND status = 'interrupted'`,
+  ).run(id);
+  return res.changes > 0 ? getMissionTask(id) : null;
 }
 
 export function resetStuckMissionTasks(agentId: string): number {

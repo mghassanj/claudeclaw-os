@@ -6,7 +6,13 @@
  * the `cred_health` table. A Telegram alert is sent once on ok->fail and once
  * on fail->ok (never repeated while a probe stays failed), plus a daily
  * summary at CRED_MONITOR_SUMMARY_HOUR_UTC (default 5 = 08:00 Riyadh) only
- * when something is failing.
+ * when something is failing. The "summary sent on <day>" marker lives in the
+ * DB so a restart inside the summary hour can't send it twice.
+ *
+ * Debounce: a probe only counts as failing after CRED_MONITOR_FAIL_THRESHOLD
+ * (default 2) consecutive failed probes, so a single timeout / 5xx blip does
+ * not page. Auth-definitive failures (HTTP 401/403, invalid_grant) are not
+ * blips and alert on the first observation. One ok probe is a recovery.
  *
  * Probe details carry an HTTP status code or a provider error code such as
  * `invalid_grant` -- never a token, key, or response body.
@@ -17,7 +23,14 @@ import path from 'path';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
-import { getCredHealth, recordCredHealth, type CredHealthRow } from './db.js';
+import {
+  getCredHealth,
+  getCredHealthRow,
+  getDashboardSetting,
+  recordCredHealth,
+  setDashboardSetting,
+  type CredHealthRow,
+} from './db.js';
 
 export type ProbeStatus = 'ok' | 'fail' | 'skip';
 
@@ -308,17 +321,45 @@ export interface CheckOutcome {
   recovered: ProbeResult[];
 }
 
+export const DEFAULT_FAIL_THRESHOLD = 2;
+
+/** Failures that a retry can't fix: the credential itself was rejected. */
+export function isAuthDefinitive(r: Pick<ProbeResult, 'status' | 'detail'>): boolean {
+  if (r.status !== 'fail') return false;
+  return /^http (401|403)\b/.test(r.detail) || /\binvalid_grant\b/.test(r.detail);
+}
+
+export function failThreshold(env: ProbeContext['env']): number {
+  const n = parseInt(env('CRED_MONITOR_FAIL_THRESHOLD') || '', 10);
+  return Number.isFinite(n) && n >= 1 ? n : DEFAULT_FAIL_THRESHOLD;
+}
+
 /**
- * Record results and work out transitions. Alert on ok/skip/unknown -> fail
- * and on fail -> ok. A probe that stays failed produces nothing.
+ * Record results and work out transitions. A raw failure is only stored (and
+ * alerted) as 'fail' once `threshold` consecutive probes failed, or at once
+ * when it is auth-definitive; until then the previous status is kept and the
+ * detail is marked unconfirmed. Alert on ok/skip/unknown -> fail and on
+ * fail -> ok. A probe that stays failed produces nothing.
  */
-export function recordResults(results: ProbeResult[], nowSec = Math.floor(Date.now() / 1000)): CheckOutcome {
+export function recordResults(
+  results: ProbeResult[],
+  nowSec = Math.floor(Date.now() / 1000),
+  threshold = DEFAULT_FAIL_THRESHOLD,
+): CheckOutcome {
   const newlyFailing: ProbeResult[] = [];
   const recovered: ProbeResult[] = [];
   for (const r of results) {
-    const prev = recordCredHealth(r.name, r.status, r.detail, nowSec);
-    if (r.status === 'fail' && prev !== 'fail') newlyFailing.push(r);
-    else if (r.status === 'ok' && prev === 'fail') recovered.push(r);
+    const prevRow = getCredHealthRow(r.name);
+    const streak = r.status === 'fail' ? (prevRow?.fail_streak ?? 0) + 1 : 0;
+    let status = r.status;
+    let detail = r.detail;
+    if (r.status === 'fail' && prevRow?.status !== 'fail' && streak < threshold && !isAuthDefinitive(r)) {
+      status = prevRow?.status ?? 'skip';
+      detail = `${r.detail} (unconfirmed, ${streak}/${threshold})`;
+    }
+    const prev = recordCredHealth(r.name, status, detail, nowSec, streak, r.status);
+    if (status === 'fail' && prev !== 'fail') newlyFailing.push(r);
+    else if (status === 'ok' && prev === 'fail') recovered.push(r);
   }
   return { results, newlyFailing, recovered };
 }
@@ -348,14 +389,16 @@ export function credHealthSnapshot(): { failing: number; checks: CredHealthRow[]
 }
 
 let running = false;
-let lastSummaryDay = '';
+
+/** dashboard_settings key holding the UTC day the last daily summary went out. */
+export const SUMMARY_DAY_KEY = 'cred_monitor_summary_day';
 
 export async function runCredCheck(sender: Sender, ctx: ProbeContext = defaultProbeContext(), now = new Date()): Promise<CheckOutcome | null> {
   if (running) return null;
   running = true;
   try {
     const results = await runAllProbes(ctx);
-    const outcome = recordResults(results, Math.floor(now.getTime() / 1000));
+    const outcome = recordResults(results, Math.floor(now.getTime() / 1000), failThreshold(ctx.env));
     logger.info(
       { ok: results.filter((r) => r.status === 'ok').length, fail: results.filter((r) => r.status === 'fail').map((r) => r.name), skip: results.filter((r) => r.status === 'skip').length },
       'Credential health check',
@@ -365,8 +408,9 @@ export async function runCredCheck(sender: Sender, ctx: ProbeContext = defaultPr
 
     const summaryHour = parseInt(ctx.env('CRED_MONITOR_SUMMARY_HOUR_UTC') || '5', 10);
     const day = now.toISOString().slice(0, 10);
-    if (now.getUTCHours() === summaryHour && lastSummaryDay !== day) {
-      lastSummaryDay = day;
+    if (now.getUTCHours() === summaryHour && getDashboardSetting(SUMMARY_DAY_KEY) !== day) {
+      // Mark before sending: a failed send is logged, not retried every tick.
+      setDashboardSetting(SUMMARY_DAY_KEY, day);
       const summary = formatDailySummary(getCredHealth(), Math.floor(now.getTime() / 1000));
       if (summary) await sender(summary).catch((err) => logger.error({ err }, 'cred summary send failed'));
     }
@@ -382,7 +426,6 @@ export async function runCredCheck(sender: Sender, ctx: ProbeContext = defaultPr
 /** @internal tests only */
 export function _resetCredMonitorState(): void {
   running = false;
-  lastSummaryDay = '';
 }
 
 /**
