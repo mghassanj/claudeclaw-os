@@ -385,7 +385,8 @@ function createSchema(database: Database.Database): void {
       detail          TEXT NOT NULL DEFAULT '',
       checked_at      INTEGER NOT NULL,
       last_ok_at      INTEGER,
-      last_change_at  INTEGER NOT NULL
+      last_change_at  INTEGER NOT NULL,
+      fail_streak     INTEGER NOT NULL DEFAULT 0
     );
 
     -- Phase 4.2: Skill health checks
@@ -820,6 +821,10 @@ function runMigrations(database: Database.Database): void {
   // is re-queued at most once (with a notification) instead of silently
   // re-running forever. Incremented on claim.
   addColumnIfMissing(database, 'mission_tasks', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
+
+  // Credential monitor debounce: consecutive raw probe failures, persisted so
+  // a restart between two failing probes doesn't reset the count.
+  addColumnIfMissing(database, 'cred_health', 'fail_streak', 'INTEGER NOT NULL DEFAULT 0');
 
   // Live Meetings: add provider column so we can track which platform
   // each session used (pika avatar vs recall voice-only). Default 'pika'
@@ -1630,34 +1635,46 @@ export interface CredHealthRow {
   checked_at: number;
   last_ok_at: number | null;
   last_change_at: number;
+  /** Consecutive raw probe failures (0 after any non-fail result). */
+  fail_streak: number;
 }
 
 export function getCredHealth(): CredHealthRow[] {
   return db.prepare('SELECT * FROM cred_health ORDER BY name').all() as CredHealthRow[];
 }
 
+export function getCredHealthRow(name: string): CredHealthRow | null {
+  return (db.prepare('SELECT * FROM cred_health WHERE name = ?').get(name) as CredHealthRow | undefined) ?? null;
+}
+
 /**
- * Record one probe result. Returns the previous status (null = first time
- * this probe was seen) so the caller can detect transitions.
+ * Record one probe result. `status` is the (debounced) status to store;
+ * `rawStatus` is what the probe actually observed and drives last_ok_at, so an
+ * unconfirmed failure that keeps the stored status 'ok' doesn't count as an ok
+ * observation. Returns the previous stored status (null = first time this
+ * probe was seen) so the caller can detect transitions.
  */
 export function recordCredHealth(
   name: string,
   status: CredHealthRow['status'],
   detail: string,
   nowSec = Math.floor(Date.now() / 1000),
+  failStreak = 0,
+  rawStatus: CredHealthRow['status'] = status,
 ): CredHealthRow['status'] | null {
   const prev = db.prepare('SELECT status FROM cred_health WHERE name = ?').get(name) as { status: CredHealthRow['status'] } | undefined;
   const changed = !prev || prev.status !== status;
   db.prepare(`
-    INSERT INTO cred_health (name, status, detail, checked_at, last_ok_at, last_change_at)
-    VALUES (@name, @status, @detail, @now, CASE WHEN @status = 'ok' THEN @now END, @now)
+    INSERT INTO cred_health (name, status, detail, checked_at, last_ok_at, last_change_at, fail_streak)
+    VALUES (@name, @status, @detail, @now, CASE WHEN @raw = 'ok' THEN @now END, @now, @streak)
     ON CONFLICT(name) DO UPDATE SET
       status = excluded.status,
       detail = excluded.detail,
       checked_at = excluded.checked_at,
-      last_ok_at = CASE WHEN excluded.status = 'ok' THEN excluded.checked_at ELSE cred_health.last_ok_at END,
-      last_change_at = CASE WHEN @changed = 1 THEN excluded.checked_at ELSE cred_health.last_change_at END
-  `).run({ name, status, detail, now: nowSec, changed: changed ? 1 : 0 });
+      last_ok_at = CASE WHEN @raw = 'ok' THEN excluded.checked_at ELSE cred_health.last_ok_at END,
+      last_change_at = CASE WHEN @changed = 1 THEN excluded.checked_at ELSE cred_health.last_change_at END,
+      fail_streak = excluded.fail_streak
+  `).run({ name, status, detail, now: nowSec, changed: changed ? 1 : 0, streak: failStreak, raw: rawStatus });
   return prev ? prev.status : null;
 }
 

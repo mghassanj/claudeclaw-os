@@ -5,7 +5,7 @@ import path from 'path';
 
 vi.mock('./logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
-import { _initTestDatabase, getCredHealth } from './db.js';
+import { _initTestDatabase, getCredHealth, getDashboardSetting } from './db.js';
 import {
   ProbeContext,
   runAllProbes,
@@ -15,6 +15,8 @@ import {
   credHealthSnapshot,
   probeGmail,
   probeRailway,
+  isAuthDefinitive,
+  SUMMARY_DAY_KEY,
   _resetCredMonitorState,
 } from './cred-monitor.js';
 
@@ -183,7 +185,7 @@ describe('transitions + alerting', () => {
     expect(sent).toHaveLength(2);
     expect(sent[1]).toContain('1 failing');
 
-    expect(formatDailySummary([{ name: 'x', status: 'ok', detail: '', checked_at: 1, last_ok_at: 1, last_change_at: 1 }])).toBeNull();
+    expect(formatDailySummary([{ name: 'x', status: 'ok', detail: '', checked_at: 1, last_ok_at: 1, last_change_at: 1, fail_streak: 0 }])).toBeNull();
   });
 
   it('snapshot counts failing rows (shape consumed by /api/cred-health and heartbeat.sh)', () => {
@@ -196,5 +198,114 @@ describe('transitions + alerting', () => {
     expect(snap.failing).toBe(1);
     expect(snap.checks.map((c) => c.name)).toEqual(['a', 'b', 'c']);
     expect(JSON.stringify(snap)).toMatch(/"failing":1/);
+  });
+});
+
+describe('debounce (CRED_MONITOR_FAIL_THRESHOLD)', () => {
+  const home = () => fs.mkdtempSync(path.join(os.tmpdir(), 'cm-home-'));
+  const at = (hhmm: string) => new Date(`2026-09-21T${hhmm}:00Z`);
+
+  it('classifies auth-definitive failures', () => {
+    expect(isAuthDefinitive({ status: 'fail', detail: 'http 401' })).toBe(true);
+    expect(isAuthDefinitive({ status: 'fail', detail: 'http 403' })).toBe(true);
+    expect(isAuthDefinitive({ status: 'fail', detail: 'http 400 invalid_grant' })).toBe(true);
+    expect(isAuthDefinitive({ status: 'fail', detail: 'http 500' })).toBe(false);
+    expect(isAuthDefinitive({ status: 'fail', detail: 'timeout' })).toBe(false);
+    expect(isAuthDefinitive({ status: 'fail', detail: 'http 4010' })).toBe(false);
+    expect(isAuthDefinitive({ status: 'ok', detail: 'http 401' })).toBe(false);
+  });
+
+  it('a single transient failure (timeout / 5xx) does not alert; the second consecutive one does', async () => {
+    let mode: 'ok' | 'timeout' | '500' = 'ok';
+    const { ctx } = makeCtx(SECRETS, (url) => {
+      if (url.includes('openai')) {
+        if (mode === 'timeout') { const e = new Error('t'); e.name = 'TimeoutError'; return e; }
+        if (mode === '500') return { status: 500 };
+      }
+      return allOk(url);
+    }, home());
+    const sent: string[] = [];
+    const sender = async (t: string) => { sent.push(t); };
+
+    await runCredCheck(sender, ctx, at('12:00'));
+    const okAt = getCredHealth().find((r) => r.name === 'openai')!.last_ok_at;
+
+    mode = 'timeout';
+    await runCredCheck(sender, ctx, at('12:30'));
+    expect(sent).toHaveLength(0);
+    const blip = getCredHealth().find((r) => r.name === 'openai')!;
+    expect(blip.status).toBe('ok'); // unconfirmed: previous status kept
+    expect(blip.detail).toBe('timeout (unconfirmed, 1/2)');
+    expect(blip.fail_streak).toBe(1);
+    expect(blip.last_ok_at).toBe(okAt); // a failed probe is not an ok observation
+
+    mode = 'ok'; // blip cleared: streak resets, still no alert
+    await runCredCheck(sender, ctx, at('13:00'));
+    expect(sent).toHaveLength(0);
+    expect(getCredHealth().find((r) => r.name === 'openai')!.fail_streak).toBe(0);
+
+    mode = '500';
+    await runCredCheck(sender, ctx, at('13:30'));
+    expect(sent).toHaveLength(0);
+    await runCredCheck(sender, ctx, at('14:00'));
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('openai');
+    expect(sent[0]).toContain('http 500');
+    expect(getCredHealth().find((r) => r.name === 'openai')!.status).toBe('fail');
+
+    await runCredCheck(sender, ctx, at('14:30'));
+    expect(sent).toHaveLength(1); // stays failed: no repeat
+
+    mode = 'ok'; // recovery alerts after one ok
+    await runCredCheck(sender, ctx, at('15:00'));
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toContain('recovered');
+  });
+
+  it('auth-definitive failures alert on the first observation', async () => {
+    const { ctx } = makeCtx(SECRETS, (url) => (url.includes('openai') ? { status: 403 } : allOk(url)), home());
+    const sent: string[] = [];
+    await runCredCheck(async (t) => { sent.push(t); }, ctx, at('12:00'));
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('http 403');
+  });
+
+  it('the streak survives a restart (it lives in cred_health, not memory)', () => {
+    recordResults([{ name: 'jira', status: 'ok', detail: 'http 200' }], 100);
+    expect(recordResults([{ name: 'jira', status: 'fail', detail: 'timeout' }], 200).newlyFailing).toHaveLength(0);
+    _resetCredMonitorState(); // process restart
+    expect(recordResults([{ name: 'jira', status: 'fail', detail: 'timeout' }], 300).newlyFailing.map((r) => r.name)).toEqual(['jira']);
+  });
+
+  it('first-ever unconfirmed failure is stored as skip, not fail', () => {
+    const o = recordResults([{ name: 'voyage', status: 'fail', detail: 'http 502' }], 100);
+    expect(o.newlyFailing).toHaveLength(0);
+    expect(getCredHealth()[0]).toMatchObject({ name: 'voyage', status: 'skip', detail: 'http 502 (unconfirmed, 1/2)', last_ok_at: null });
+  });
+
+  it('CRED_MONITOR_FAIL_THRESHOLD is honoured', async () => {
+    const { ctx } = makeCtx({ ...SECRETS, CRED_MONITOR_FAIL_THRESHOLD: '3' }, (url) => (url.includes('openai') ? { status: 503 } : allOk(url)), home());
+    const sent: string[] = [];
+    const sender = async (t: string) => { sent.push(t); };
+    await runCredCheck(sender, ctx, at('12:00'));
+    await runCredCheck(sender, ctx, at('12:30'));
+    expect(sent).toHaveLength(0);
+    await runCredCheck(sender, ctx, at('13:00'));
+    expect(sent).toHaveLength(1);
+  });
+
+  it('daily summary marker is persisted: a restart in the summary hour does not resend it', async () => {
+    const { ctx } = makeCtx({ ...SECRETS, CRED_MONITOR_SUMMARY_HOUR_UTC: '5' }, (url) => (url.includes('openai') ? { status: 401 } : allOk(url)), home());
+    const sent: string[] = [];
+    const sender = async (t: string) => { sent.push(t); };
+    await runCredCheck(sender, ctx, at('04:30')); // transition alert
+    await runCredCheck(sender, ctx, at('05:00')); // summary
+    expect(sent).toHaveLength(2);
+    expect(getDashboardSetting(SUMMARY_DAY_KEY)).toBe('2026-09-21');
+    _resetCredMonitorState(); // process restart
+    await runCredCheck(sender, ctx, at('05:30'));
+    expect(sent).toHaveLength(2);
+    await runCredCheck(sender, ctx, new Date('2026-09-22T05:00:00Z')); // next day
+    expect(sent).toHaveLength(3);
   });
 });
