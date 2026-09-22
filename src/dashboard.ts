@@ -11,6 +11,7 @@ import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_U
 import { runMainTurnQueued, type MainTurnMeta } from './main-turn.js';
 import { credHealthSnapshot } from './cred-monitor.js';
 import { registerOutboundRoutes } from './outbound-routes.js';
+import { isBodyLimitError, payloadTooLarge, requestBodyLimits } from './body-limits.js';
 import { registerLoopRoutes, LOOP_ROUTES_READONLY_EXEMPT } from './loops-routes.js';
 import crypto from 'crypto';
 import {
@@ -454,6 +455,8 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
 
   // Global error handler — prevents unhandled throws from killing the server
   app.onError((err, c) => {
+    // A handler read a chunked body past its limit (see body-limits.ts).
+    if (isBodyLimitError(err)) return payloadTooLarge(c);
     logger.error({ err: err.message }, 'Dashboard request error');
     return c.json({ error: 'Internal server error' }, 500);
   });
@@ -516,6 +519,10 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     }
     await next();
   });
+
+  // Request body caps (after auth, so unauthenticated calls get 401, not
+  // 413): 25 MB for main-turn, 1 MB for other /api JSON routes. 413 JSON.
+  app.use('*', requestBodyLimits());
 
   // Inline token check for handlers that USED to rely on the global
   // middleware but now serve a public SPA shell on the same path. Used
@@ -762,7 +769,11 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   });
 
   // Upload custom War Room entrance music from the dashboard
+  // Token-gated inline: this path is outside /api/, so the global gate
+  // doesn't cover it (the war room page already sends ?token=).
   app.post('/warroom-music-upload', async (c) => {
+    const denied = requireToken(c);
+    if (denied) return denied;
     const body = await c.req.parseBody();
     const file = body['file'];
     if (!file || typeof file === 'string') return c.json({ error: 'No file uploaded' }, 400);
