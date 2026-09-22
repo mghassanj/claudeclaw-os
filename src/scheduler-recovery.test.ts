@@ -9,7 +9,9 @@ import {
   claimNextMissionTask,
   getMissionTask,
   recoverInterruptedMissions,
-  MAX_MISSION_ATTEMPTS,
+  retryMissionTask,
+  getMissionTaskHistory,
+  cancelMissionTask,
   INTERRUPTED_TASK_NOTE,
   updateTaskAfterRun,
 } from './db.js';
@@ -46,23 +48,51 @@ describe('startup recovery records interruptions', () => {
     expect(getAllScheduledTasks('main')[0].last_status).toBe('blocked');
   });
 
-  it('counts mission attempts, re-queues once, then fails instead of looping', () => {
+  it('marks a running mission interrupted (never re-queued automatically) and returns it once', () => {
     createMissionTask('m1', 'Draft report', 'do it', 'main');
-    const claimed = claimNextMissionTask('main')!;
-    expect(claimed.attempts).toBe(1);
+    createMissionTask('m2', 'Other agent', 'x', 'research');
+    expect(claimNextMissionTask('main')!.attempts).toBe(1);
+    claimNextMissionTask('research');
 
-    let rec = recoverInterruptedMissions('main');
-    expect(rec).toEqual([{ id: 'm1', title: 'Draft report', attempts: 1, action: 'requeued' }]);
-    let m = getMissionTask('m1')!;
-    expect(m.status).toBe('queued');
-    expect(m.error).toMatch(/Interrupted by a restart on attempt 1/);
-
-    expect(claimNextMissionTask('main')!.attempts).toBe(MAX_MISSION_ATTEMPTS);
-    rec = recoverInterruptedMissions('main');
-    expect(rec[0].action).toBe('failed');
-    m = getMissionTask('m1')!;
-    expect(m.status).toBe('failed');
-    expect(m.error).toMatch(/not re-run automatically/);
+    const rec = recoverInterruptedMissions('main');
+    expect(rec).toEqual([{ id: 'm1', title: 'Draft report', attempts: 1 }]);
+    const m = getMissionTask('m1')!;
+    expect(m.status).toBe('interrupted');
+    expect(m.error).toMatch(/Interrupted by a restart on attempt 1; not re-run automatically/);
+    expect(m.error).toContain('mission-cli retry m1');
+    expect(m.completed_at).not.toBeNull();
+    // Not claimable: it does not run again on its own.
     expect(claimNextMissionTask('main')).toBeNull();
+    // Notify once: a second startup finds nothing.
+    expect(recoverInterruptedMissions('main')).toHaveLength(0);
+    // Other agents' missions are untouched.
+    expect(getMissionTask('m2')!.status).toBe('running');
+    // Shows up in history (terminal until retried).
+    expect(getMissionTaskHistory().tasks.map((t) => t.id)).toContain('m1');
+  });
+
+  it('retry re-queues only interrupted missions; the retried run is a fresh claim', () => {
+    createMissionTask('m1', 'Draft report', 'do it', 'main');
+    claimNextMissionTask('main');
+    expect(retryMissionTask('m1')).toBeNull(); // running: not retryable
+    recoverInterruptedMissions('main');
+
+    const t = retryMissionTask('m1')!;
+    expect(t).toMatchObject({ id: 'm1', status: 'queued', error: null, started_at: null, completed_at: null });
+    expect(retryMissionTask('m1')).toBeNull(); // already queued
+    expect(retryMissionTask('nope')).toBeNull();
+
+    const again = claimNextMissionTask('main')!;
+    expect(again.id).toBe('m1');
+    expect(again.attempts).toBe(2);
+  });
+
+  it('an interrupted mission can be cancelled instead of retried', () => {
+    createMissionTask('m1', 'Draft report', 'do it', 'main');
+    claimNextMissionTask('main');
+    recoverInterruptedMissions('main');
+    expect(cancelMissionTask('m1')).toBe(true);
+    expect(getMissionTask('m1')!.status).toBe('cancelled');
+    expect(retryMissionTask('m1')).toBeNull();
   });
 });

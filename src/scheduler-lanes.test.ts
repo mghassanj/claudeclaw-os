@@ -113,22 +113,40 @@ describe('scheduler lanes + STATUS honesty', () => {
     expect(vi.mocked(updateTaskAfterRun)).toHaveBeenCalledWith('t1', expect.any(Number), 'done', 'success');
   });
 
-  it('notifies once at startup about interrupted tasks and missions', async () => {
+  it('notifies once at startup about interrupted tasks and missions, with a Retry button per mission', async () => {
     state.dueTasks = [];
     state.interruptedTasks = [{ id: 't9', prompt: 'nightly <sync>', started_at: 1 }];
     state.interruptedMissions = [
-      { id: 'm1', title: 'Report', attempts: 1, action: 'requeued' },
-      { id: 'm2', title: 'Deploy', attempts: 2, action: 'failed' },
+      { id: 'm1', title: 'Report', attempts: 1 },
+      { id: 'm2', title: 'Deploy <prod>', attempts: 2 },
     ];
-    const send = vi.fn(async (_t: string) => {});
+    const send = vi.fn(async (_t: string, _o?: { buttons?: Array<{ text: string; data: string }> }) => {});
     const { initScheduler } = await import('./scheduler.js');
     initScheduler(send, 'main');
     for (let i = 0; i < 5; i++) await Promise.resolve();
     expect(send).toHaveBeenCalledTimes(1);
-    const msg = send.mock.calls[0][0];
+    const [msg, opts] = send.mock.calls[0];
     expect(msg).toContain('Interrupted by a restart');
     expect(msg).toContain('nightly &lt;sync&gt;');
-    expect(msg).toContain('Mission "Report" (attempt 1) re-queued');
-    expect(msg).toContain('Mission "Deploy" failed');
+    expect(msg).toContain('Mission "Report" (attempt 1) was interrupted and will NOT re-run on its own');
+    expect(msg).toContain('<code>mission-cli retry m1</code>');
+    expect(msg).toContain('Mission "Deploy &lt;prod&gt;" (attempt 2)');
+    expect(msg).not.toMatch(/re-queued|runs again/);
+    expect(opts?.buttons).toEqual([
+      { text: '↻ Retry "Report"', data: 'mission:retry:m1' },
+      { text: '↻ Retry "Deploy <prod>"', data: 'mission:retry:m2' },
+    ]);
+  });
+
+  it('interrupted scheduled tasks alone get no buttons', async () => {
+    state.dueTasks = [];
+    state.interruptedTasks = [{ id: 't9', prompt: 'nightly', started_at: 1 }];
+    state.interruptedMissions = [];
+    const send = vi.fn(async (_t: string, _o?: unknown) => {});
+    const { initScheduler } = await import('./scheduler.js');
+    initScheduler(send, 'main');
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][1]).toBeUndefined();
   });
 });

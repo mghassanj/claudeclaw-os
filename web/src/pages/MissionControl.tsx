@@ -24,7 +24,7 @@ interface MissionTask {
   title: string;
   prompt: string;
   assigned_agent: string | null;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   priority: number;
   created_by: string;
   created_at: number;
@@ -36,7 +36,8 @@ interface MissionTask {
 
 interface Agent { id: string; name: string; description: string; running: boolean; }
 
-const TERMINAL: MissionTask['status'][] = ['completed', 'failed', 'cancelled'];
+// 'interrupted' = stopped by a restart; waits for `mission-cli retry <id>` or the Telegram ↻ Retry button.
+const TERMINAL: MissionTask['status'][] = ['completed', 'failed', 'cancelled', 'interrupted'];
 const DONE_VISIBLE_SECS = 30 * 60;
 
 export function MissionControl() {

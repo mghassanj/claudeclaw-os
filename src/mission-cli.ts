@@ -10,6 +10,7 @@
  *   node dist/mission-cli.js list [--status queued]
  *   node dist/mission-cli.js result <id>
  *   node dist/mission-cli.js cancel <id>
+ *   node dist/mission-cli.js retry <id>    (re-queue a mission interrupted by a restart)
  */
 
 import { randomBytes } from 'crypto';
@@ -20,6 +21,7 @@ import {
   getMissionTasks,
   getMissionTask,
   cancelMissionTask,
+  retryMissionTask,
 } from './db.js';
 
 initDatabase();
@@ -129,7 +131,22 @@ switch (command) {
     break;
   }
 
+  case 'retry': {
+    const id = rest[0];
+    if (!id) { console.error('Usage: mission-cli retry <id>'); process.exit(1); }
+    const task = retryMissionTask(id);
+    if (!task) {
+      const existing = getMissionTask(id);
+      console.error(existing
+        ? `Only interrupted missions can be retried; ${id} is ${existing.status}.`
+        : `Task not found: ${id}`);
+      process.exit(1);
+    }
+    console.log(`Re-queued mission ${task.id} for @${task.assigned_agent ?? 'unassigned'}: ${task.title}`);
+    break;
+  }
+
   default:
-    console.error('Commands: create | list | result | cancel');
+    console.error('Commands: create | list | result | cancel | retry');
     process.exit(1);
 }

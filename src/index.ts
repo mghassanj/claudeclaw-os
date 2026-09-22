@@ -366,13 +366,18 @@ async function main(): Promise<void> {
 
   if (ALLOWED_CHAT_ID) {
     initScheduler(
-      async (text) => {
+      async (text, opts) => {
         // Split long messages to respect Telegram's 4096 char limit.
         // The scheduler's splitMessage handles chunking, but the sender
         // callback is also called directly for status messages which may exceed the limit.
+        // Inline buttons (e.g. "↻ Retry" on an interrupted mission) go on the last chunk.
         const { splitMessage } = await import('./bot.js');
-        for (const chunk of splitMessage(text)) {
-          await bot.api.sendMessage(ALLOWED_CHAT_ID, chunk, { parse_mode: 'HTML' }).catch((err) =>
+        const chunks = splitMessage(text);
+        for (const [i, chunk] of chunks.entries()) {
+          const replyMarkup = opts?.buttons?.length && i === chunks.length - 1
+            ? { inline_keyboard: opts.buttons.map((b) => [{ text: b.text, callback_data: b.data }]) }
+            : undefined;
+          await bot.api.sendMessage(ALLOWED_CHAT_ID, chunk, { parse_mode: 'HTML', ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }).catch((err) =>
             logger.error({ err }, 'Scheduler failed to send message'),
           );
         }

@@ -50,6 +50,7 @@ import { engineSupportsSystemPrompt } from './agent-engine/index.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
 import { registerLoopsCommand } from './loops-telegram.js';
+import { registerMissionRetryButton } from './mission-telegram.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
 import {
@@ -1322,6 +1323,9 @@ export function createBot(): Bot {
   if (AGENT_ID === 'main') {
     registerLoopsCommand(bot, async (ctx) => !!ctx.chat && !(await replyIfLocked(ctx)));
   }
+
+  // "↻ Retry" on the interrupted-mission notice (scheduler.ts); every agent.
+  registerMissionRetryButton(bot, async (ctx) => !!ctx.chat && !(await replyIfLocked(ctx)));
 
   // /delegate — delegate task to an agent (handled via handleMessage delegation detection)
   // This command is intercepted by handleMessage's parseDelegation(),

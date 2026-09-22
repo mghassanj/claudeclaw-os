@@ -1317,6 +1317,7 @@ node dist/mission-cli.js create --agent research --title "Competitor analysis" "
 node dist/mission-cli.js list
 node dist/mission-cli.js result <id>
 node dist/mission-cli.js cancel <id>
+node dist/mission-cli.js retry <id>     # re-queue a mission interrupted by a restart
 ```
 
 Omit `--agent` to create an unassigned task (assign from dashboard).

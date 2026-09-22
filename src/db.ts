@@ -827,9 +827,8 @@ function runMigrations(database: Database.Database): void {
     logger.info('Migration: made mission_tasks.assigned_agent nullable');
   }
 
-  // Mission Control: attempts counter so a mission interrupted by a restart
-  // is re-queued at most once (with a notification) instead of silently
-  // re-running forever. Incremented on claim.
+  // Mission Control: attempts counter (incremented on claim), shown in the
+  // interrupted-by-restart notice.
   addColumnIfMissing(database, 'mission_tasks', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
 
   // Credential monitor debounce: consecutive raw probe failures, persisted so
@@ -2309,7 +2308,8 @@ export interface MissionTask {
   title: string;
   prompt: string;
   assigned_agent: string | null;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  /** 'interrupted': was running when the process restarted; waits for a manual retry. */
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   result: string | null;
   error: string | null;
   created_by: string;
@@ -2550,14 +2550,14 @@ export function completeMissionTask(
 
 export function cancelMissionTask(id: string): boolean {
   const result = db.prepare(
-    `UPDATE mission_tasks SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('queued', 'running')`,
+    `UPDATE mission_tasks SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('queued', 'running', 'interrupted')`,
   ).run(Math.floor(Date.now() / 1000), id);
   return result.changes > 0;
 }
 
 export function deleteMissionTask(id: string): boolean {
   const result = db.prepare(
-    `DELETE FROM mission_tasks WHERE id = ? AND status IN ('completed', 'cancelled', 'failed')`,
+    `DELETE FROM mission_tasks WHERE id = ? AND status IN ('completed', 'cancelled', 'failed', 'interrupted')`,
   ).run(id);
   return result.changes > 0;
 }
@@ -2565,7 +2565,7 @@ export function deleteMissionTask(id: string): boolean {
 export function cleanupOldMissionTasks(olderThanDays = 7): number {
   const cutoff = Math.floor(Date.now() / 1000) - olderThanDays * 86400;
   const result = db.prepare(
-    `DELETE FROM mission_tasks WHERE status IN ('completed', 'cancelled', 'failed') AND completed_at < ?`,
+    `DELETE FROM mission_tasks WHERE status IN ('completed', 'cancelled', 'failed', 'interrupted') AND completed_at < ?`,
   ).run(cutoff);
   return result.changes;
 }
@@ -2586,31 +2586,27 @@ export function assignMissionTask(id: string, agent: string): boolean {
 
 export function getMissionTaskHistory(limit = 30, offset = 0): { tasks: MissionTask[]; total: number } {
   const total = (db.prepare(
-    `SELECT COUNT(*) as c FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled')`,
+    `SELECT COUNT(*) as c FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled', 'interrupted')`,
   ).get() as { c: number }).c;
   const tasks = db.prepare(
-    `SELECT * FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled')
+    `SELECT * FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled', 'interrupted')
      ORDER BY completed_at DESC LIMIT ? OFFSET ?`,
   ).all(limit, offset) as MissionTask[];
   return { tasks, total };
 }
 
-/** A mission interrupted this many times is failed instead of re-queued. */
-export const MAX_MISSION_ATTEMPTS = 2;
-
 export interface InterruptedMission {
   id: string;
   title: string;
   attempts: number;
-  action: 'requeued' | 'failed';
 }
 
 /**
- * Startup recovery for missions left 'running' by a crash/restart. A mission
- * interrupted before its MAX_MISSION_ATTEMPTS-th attempt is re-queued (with
- * the interruption recorded in `error`); after that it is marked failed so it
- * cannot loop through restarts repeating side effects. Returns what happened
- * so the caller can notify once — nothing is re-queued silently.
+ * Startup recovery for missions left 'running' by a crash/restart. They are
+ * marked 'interrupted' and NOT re-run: a mission is a one-shot job whose
+ * side effects (messages sent, files written, tickets filed) would repeat on
+ * a from-scratch re-run. Returns them so the caller notifies once; the user
+ * re-queues with retryMissionTask (mission-cli retry <id> / Telegram button).
  */
 export function recoverInterruptedMissions(agentId: string): InterruptedMission[] {
   const txn = db.transaction(() => {
@@ -2621,25 +2617,31 @@ export function recoverInterruptedMissions(agentId: string): InterruptedMission[
     const out: InterruptedMission[] = [];
     for (const r of rows) {
       const attempts = r.attempts ?? 0;
-      if (attempts >= MAX_MISSION_ATTEMPTS) {
-        db.prepare(
-          `UPDATE mission_tasks SET status = 'failed', error = ?, completed_at = ? WHERE id = ?`,
-        ).run(
-          `Interrupted by a restart on attempt ${attempts}; not re-run automatically. Re-queue it if still wanted.`,
-          now,
-          r.id,
-        );
-        out.push({ id: r.id, title: r.title, attempts, action: 'failed' });
-      } else {
-        db.prepare(
-          `UPDATE mission_tasks SET status = 'queued', started_at = NULL, error = ? WHERE id = ?`,
-        ).run(`Interrupted by a restart on attempt ${attempts}; re-queued.`, r.id);
-        out.push({ id: r.id, title: r.title, attempts, action: 'requeued' });
-      }
+      db.prepare(
+        `UPDATE mission_tasks SET status = 'interrupted', error = ?, completed_at = ? WHERE id = ?`,
+      ).run(
+        `Interrupted by a restart on attempt ${attempts}; not re-run automatically. Retry: mission-cli retry ${r.id}`,
+        now,
+        r.id,
+      );
+      out.push({ id: r.id, title: r.title, attempts });
     }
     return out;
   });
   return txn();
+}
+
+/**
+ * Re-queue an interrupted mission (it runs again from scratch on its agent's
+ * next scheduler tick). Only 'interrupted' missions can be retried; returns
+ * the re-queued task, or null when the id is unknown or not interrupted.
+ */
+export function retryMissionTask(id: string): MissionTask | null {
+  const res = db.prepare(
+    `UPDATE mission_tasks SET status = 'queued', started_at = NULL, completed_at = NULL, error = NULL, result = NULL
+     WHERE id = ? AND status = 'interrupted'`,
+  ).run(id);
+  return res.changes > 0 ? getMissionTask(id) : null;
 }
 
 export function resetStuckMissionTasks(agentId: string): number {
