@@ -10,7 +10,14 @@
  *   node dist/outbound-cli.js propose wa --to <chatId|phone|name> --text "..." [--name "Nora"]
  *   node dist/outbound-cli.js propose wa --to <...> --text-file /path/to/draft.txt
  *   node dist/outbound-cli.js propose revoke --to <chatId> --message-id <waMsgId>
- *   node dist/outbound-cli.js propose email|calendar|jira|slack|other --to <target> --text "..." [--payload '{json}']
+ *   node dist/outbound-cli.js propose email --account m.ghassan@jisr.net --to a@b.com [--to ...] [--cc ..] [--bcc ..]
+ *        --subject "..." --text "..." | --text-file f [--html-file f] [--thread <gmailThreadId>] [--in-reply-to <Message-ID>]
+ *   node dist/outbound-cli.js propose email --account <acct> --draft-id <gmailDraftId>     (send an existing draft as-is)
+ *   node dist/outbound-cli.js propose calendar --account <acct> --action create --summary "..." --start 2026-09-30T10:00
+ *        --end 2026-09-30T11:00 [--attendee x@y]... [--tz Asia/Riyadh] [--location ..] [--description ..] [--conference] [--calendar primary]
+ *   node dist/outbound-cli.js propose calendar --account <acct> --action update --event-id <id> [--summary|--start+--end|--attendee|...]
+ *   node dist/outbound-cli.js propose calendar --account <acct> --action cancel --event-id <id>
+ *   node dist/outbound-cli.js propose jira|slack|other --to <target> --text "..." [--payload '{json}']
  *   node dist/outbound-cli.js status <id>
  *   node dist/outbound-cli.js list [--limit 20] [--status executed] [--to <name|chatId>] [--json]
  *   node dist/outbound-cli.js complete <id> --receipt '{"ref":"..."}'     (approved email/calendar/jira/slack/other only)
@@ -34,23 +41,113 @@ process.env.LOG_LEVEL = process.env.LOG_LEVEL || 'warn';
 
 const { initDatabase } = await import('./db.js');
 const outbound = await import('./outbound.js');
-const { OutboundError, propose, getAction, listActions, complete, publicView, payloadText, waRequest, OUTBOUND_KINDS } = outbound;
+const { OutboundError, propose, getAction, listActions, complete, publicView, payloadText, waRequest, OUTBOUND_KINDS, defaultGoogleClient } = outbound;
+const { GoogleAuthError, parseAddress } = await import('./google-executor.js');
+
+/** Bare addresses for the row's target column (names stay in the payload). */
+function addressesOnly(list: string[]): string {
+  return list.map((a) => { try { return parseAddress(a).email; } catch { return a; } }).join(', ');
+}
 
 type Flags = Record<string, string | true>;
 
-function parseArgs(argv: string[]): { positional: string[]; flags: Flags } {
+function parseArgs(argv: string[]): { positional: string[]; flags: Flags; multi: Record<string, string[]> } {
   const positional: string[] = [];
   const flags: Flags = {};
+  const multi: Record<string, string[]> = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const key = a.slice(2);
       const next = argv[i + 1];
       if (next === undefined || next.startsWith('--')) flags[key] = true;
-      else { flags[key] = next; i++; }
+      else { flags[key] = next; (multi[key] ??= []).push(next); i++; }
     } else positional.push(a);
   }
-  return { positional, flags };
+  return { positional, flags, multi };
+}
+
+/** Repeatable, comma-separable flag values: --to a@x --to b@y  or  --to "a@x, b@y". */
+function listFlag(multi: Record<string, string[]>, ...keys: string[]): string[] {
+  const out: string[] = [];
+  for (const k of keys) for (const v of multi[k] ?? []) out.push(...v.split(',').map((x) => x.trim()).filter(Boolean));
+  return out;
+}
+
+function readTextFlag(flags: Flags, inline: string, file: string): string | undefined {
+  const f = str(flags[file]);
+  if (f) return fs.readFileSync(f, 'utf-8');
+  return str(flags[inline]);
+}
+
+/** Build + pre-check an email payload (reads the draft / thread from Gmail so the card shows exactly what will go out). */
+async function buildEmailPayload(flags: Flags, multi: Record<string, string[]>): Promise<{ payload: Record<string, unknown>; target: string; name: string }> {
+  const account = str(flags.account);
+  if (!account) die('--account is required for email (the Google account to send from, e.g. m.ghassan@jisr.net or semo.790@gmail.com)');
+  const google = defaultGoogleClient();
+  const draftId = str(flags['draft-id']);
+  if (draftId) {
+    for (const f of ['to', 'cc', 'bcc', 'subject', 'text', 'text-file', 'html-file', 'thread', 'in-reply-to']) {
+      if (flags[f] !== undefined) die(`--${f} can't be combined with --draft-id: the draft is sent exactly as it is in Gmail. Edit the draft instead.`);
+    }
+    const d = await google.getDraft(account.toLowerCase(), draftId);
+    const payload = {
+      account, draftId, draftMessageId: d.messageId, to: d.to, cc: d.cc, bcc: d.bcc,
+      subject: d.subject, body: d.body, ...(d.threadId ? { threadId: d.threadId } : {}), attachments: d.attachments,
+    };
+    return { payload, target: addressesOnly(d.to), name: d.subject };
+  }
+  const to = listFlag(multi, 'to');
+  const subjectFlag = str(flags.subject);
+  const body = readTextFlag(flags, 'text', 'text-file');
+  const htmlFile = str(flags['html-file']);
+  const html = htmlFile ? fs.readFileSync(htmlFile, 'utf-8') : undefined;
+  const threadId = str(flags.thread);
+  let inReplyTo = str(flags['in-reply-to']);
+  let references = str(flags.references);
+  let subject = subjectFlag;
+  if (threadId && !inReplyTo) {
+    // Reply properly: thread it on the recipients' side too (In-Reply-To / References).
+    const info = await google.threadReplyInfo(account.toLowerCase(), threadId);
+    inReplyTo = info.inReplyTo;
+    references = references ?? info.references;
+    if (!subject && info.subject) subject = /^re:/i.test(info.subject) ? info.subject : `Re: ${info.subject}`;
+  }
+  const payload = {
+    account, to, cc: listFlag(multi, 'cc'), bcc: listFlag(multi, 'bcc'), subject: subject ?? '', body: body ?? '',
+    ...(html ? { html } : {}), ...(threadId ? { threadId } : {}), ...(inReplyTo ? { inReplyTo } : {}), ...(references ? { references } : {}),
+  };
+  return { payload, target: addressesOnly(to), name: subject ?? '' };
+}
+
+async function buildCalendarPayload(flags: Flags, multi: Record<string, string[]>): Promise<{ payload: Record<string, unknown>; target: string; name: string }> {
+  const account = str(flags.account);
+  if (!account) die('--account is required for calendar (whose calendar, e.g. m.ghassan@jisr.net)');
+  const action = str(flags.action) ?? 'create';
+  const calendarId = str(flags.calendar) ?? 'primary';
+  const eventId = str(flags['event-id']);
+  const attendees = multi.attendee || multi.attendees ? listFlag(multi, 'attendee', 'attendees') : undefined;
+  const payload: Record<string, unknown> = {
+    account, action, calendarId,
+    ...(eventId ? { eventId } : {}),
+    ...(str(flags.summary) !== undefined ? { summary: str(flags.summary) } : {}),
+    ...(str(flags.start) ? { start: str(flags.start) } : {}),
+    ...(str(flags.end) ? { end: str(flags.end) } : {}),
+    ...(str(flags.tz) || str(flags['time-zone']) ? { timeZone: str(flags.tz) ?? str(flags['time-zone']) } : {}),
+    ...(attendees ? { attendees } : {}),
+    ...(str(flags.location) !== undefined ? { location: str(flags.location) } : {}),
+    ...(readTextFlag(flags, 'description', 'description-file') !== undefined ? { description: readTextFlag(flags, 'description', 'description-file') } : {}),
+    ...(flags.conference === true ? { conference: true } : {}),
+  };
+  let name = str(flags.summary) ?? '';
+  if ((action === 'update' || action === 'cancel') && eventId) {
+    // Show Mohamed which event this touches (and that it exists).
+    const ev = await defaultGoogleClient().getEvent(account.toLowerCase(), calendarId, eventId);
+    payload.current = { summary: ev.summary, start: ev.start, end: ev.end, attendees: ev.attendees };
+    name = name || ev.summary || eventId;
+  }
+  const target = (attendees ?? []).join(', ') || account.toLowerCase();
+  return { payload, target, name };
 }
 
 const str = (v: string | true | undefined): string | undefined => (typeof v === 'string' ? v : undefined);
@@ -102,7 +199,7 @@ async function resolveWaTarget(to: string): Promise<{ chatId: string; name?: str
 }
 
 async function main(): Promise<void> {
-  const { positional, flags } = parseArgs(process.argv.slice(2));
+  const { positional, flags, multi } = parseArgs(process.argv.slice(2));
   const [command, ...rest] = positional;
   const agent = str(flags.agent) ?? process.env.CLAUDECLAW_AGENT_ID ?? 'main';
 
@@ -113,6 +210,21 @@ async function main(): Promise<void> {
       if (kind === 'wa' || kind === 'whatsapp') kind = 'wa_message';
       if (!kind || !(OUTBOUND_KINDS as readonly string[]).includes(kind)) {
         die(`Usage: outbound-cli propose <wa|${OUTBOUND_KINDS.filter((k) => k !== 'wa_message').join('|')}> --to <target> --text "..."`);
+      }
+      if (kind === 'email' || kind === 'calendar') {
+        const built = kind === 'email' ? await buildEmailPayload(flags, multi) : await buildCalendarPayload(flags, multi);
+        const ttlG = str(flags['ttl-hours']);
+        const resG = await propose({
+          kind, target: built.target || String(built.payload.account), targetName: built.name, payload: built.payload, agent,
+          sessionRef: str(flags.session), turnRef: str(flags.turn),
+          force: flags.force === true, ttlHours: ttlG ? Number(ttlG) : undefined,
+        });
+        console.log(`PROPOSED #${resG.action.id} (${kind} as ${String(built.payload.account).toLowerCase()} → ${resG.action.target}).`);
+        console.log(resG.action.tg_message_id
+          ? 'Mohamed has the full details on Telegram (✅ / ❌) and can also reply "YES <code>" in his WhatsApp self-chat.'
+          : 'WARNING: could not post the approval card to Telegram; tell Mohamed to check /outbox.');
+        console.log(`Nothing has been ${kind === 'email' ? 'sent' : 'changed or sent to attendees'}. On approval the gateway does it and posts the receipt; check with: outbound-cli status ${resG.action.id}`);
+        break;
       }
       const to = str(flags.to);
       if (!to) die('--to is required');
@@ -232,5 +344,6 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   if (err instanceof OutboundError) die(`REFUSED (${err.code}): ${err.message}`, 3);
+  if (err instanceof GoogleAuthError) die(`REFUSED (google_auth): ${err.message}. Tell Mohamed; don't retry.`, 3);
   die(`ERROR: ${err?.message ?? err}`);
 });

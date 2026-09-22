@@ -22,9 +22,15 @@
  * dedupe hash (suffixed ~n for sanctioned repeats) and is also passed to
  * the WhatsApp service, which refuses to send the same key twice.
  *
- * Kinds without an executor here (email, calendar, jira, slack, other) are
- * approval-only: approval flips the row to `approved`, the agent performs
- * the action itself and records the result with `outbound-cli complete`.
+ * email and calendar are executed here too, through src/google-executor.ts
+ * (Gmail send / draft send, Calendar insert / patch / delete with
+ * sendUpdates=all), using the workspace-mcp OAuth credentials of the
+ * account named in the payload. Agents only have read + draft Google
+ * tools, so this is the only path that sends mail or invites people.
+ *
+ * Kinds without an executor (jira, slack, other) are approval-only:
+ * approval flips the row to `approved`, the agent performs the action
+ * itself and records the result with `outbound-cli complete`.
  */
 import crypto from 'crypto';
 import fs from 'fs';
@@ -33,6 +39,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { getOutboundDb } from './db.js';
+import {
+  GoogleClient, formatWhen, validateCalendarPayload, validateEmailPayload, type GoogleExecutor,
+} from './google-executor.js';
 import { isEnabled } from './kill-switches.js';
 import { logger } from './logger.js';
 
@@ -41,7 +50,8 @@ export type OutboundKind = typeof OUTBOUND_KINDS[number];
 export type OutboundStatus = 'proposed' | 'approved' | 'rejected' | 'executed' | 'failed' | 'expired';
 
 /** Kinds the gateway executes itself after approval. */
-export const EXECUTABLE_KINDS: ReadonlySet<OutboundKind> = new Set(['wa_message', 'revoke']);
+export const EXECUTABLE_KINDS: ReadonlySet<OutboundKind> = new Set(['wa_message', 'revoke', 'email', 'calendar']);
+const GOOGLE_KINDS: ReadonlySet<OutboundKind> = new Set(['email', 'calendar']);
 /** Kinds that can never run without an explicit approval (autonomy never applies). */
 const ALWAYS_APPROVE_KINDS: ReadonlySet<OutboundKind> = new Set(['revoke', 'email', 'calendar', 'jira', 'slack', 'other']);
 
@@ -192,6 +202,13 @@ export function payloadText(action: Pick<OutboundAction, 'payload'>): string {
   try {
     const p = JSON.parse(action.payload) as Record<string, unknown>;
     if (typeof p.text === 'string') return p.text;
+    if (typeof p.account === 'string' && typeof p.subject === 'string') {
+      return `${p.subject}${typeof p.body === 'string' && p.body ? ` — ${p.body}` : ''}`;
+    }
+    if (typeof p.account === 'string' && typeof p.action === 'string') {
+      const cur = (p.current ?? {}) as Record<string, unknown>;
+      return `${p.action} ${String(p.summary ?? cur.summary ?? p.eventId ?? '')}${typeof p.start === 'string' ? ` @ ${p.start}` : ''}`;
+    }
     if (typeof p.messageId === 'string') return `revoke ${p.messageId}`;
     return action.payload;
   } catch { return action.payload; }
@@ -207,6 +224,21 @@ export function formatReceipt(action: OutboundAction, receipt: Record<string, un
   const mid = typeof receipt.messageId === 'string' ? receipt.messageId : '';
   const idPart = mid ? ` · id …${mid.slice(-8)}` : '';
   if (action.kind === 'revoke') return `Revoked in ${who} ✓ ${oneLine(payloadText(action), 40)}${idPart} (#${action.id})`;
+  const p = parsePayload(action);
+  if (action.kind === 'email' && typeof p.account === 'string') {
+    const to = [...asList(p.to), ...asList(p.cc), ...asList(p.bcc)];
+    return `Email sent from ${p.account} to ${oneLine(to.join(', '), 120)} ✓ "${oneLine(String(p.subject ?? ''), 60)}"${idPart}${receipt.viaDraft ? ' (draft)' : ''} (#${action.id})`;
+  }
+  if (action.kind === 'calendar' && typeof p.account === 'string') {
+    const cur = (p.current ?? {}) as Record<string, unknown>;
+    const title = oneLine(String(p.summary ?? cur.summary ?? p.eventId ?? ''), 60);
+    const verb = p.action === 'create' ? 'created' : p.action === 'update' ? 'updated' : 'cancelled';
+    const when = p.action === 'cancel' ? '' : ` ${formatWhen(p.start as string | undefined, p.end as string | undefined, String(p.timeZone ?? ''))}`;
+    const eid = typeof receipt.eventId === 'string' ? ` · event …${receipt.eventId.slice(-8)}` : '';
+    const link = typeof receipt.htmlLink === 'string' ? ` ${receipt.htmlLink}` : '';
+    const note = receipt.duplicate ? ' (already existed)' : receipt.alreadyCancelled ? ' (was already cancelled)' : '';
+    return `Calendar event ${verb} ✓ "${title}"${p.action === 'update' && !p.start ? '' : when}${eid}${note} · invites sent (#${action.id})${link}`;
+  }
   return `Sent to ${who} ✓ ${oneLine(payloadText(action), 40)}${idPart} (#${action.id})`;
 }
 
@@ -220,7 +252,80 @@ const KIND_LABEL: Record<OutboundKind, string> = {
   other: 'Action',
 };
 
+function parsePayload(action: Pick<OutboundAction, 'payload'>): Record<string, unknown> {
+  try { return JSON.parse(action.payload) as Record<string, unknown>; } catch { return {}; }
+}
+
+function asList(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+
+const BODY_PREVIEW_CHARS = 300;
+
+function bodyPreview(body: string): string {
+  const b = body.trim();
+  if (b.length <= BODY_PREVIEW_CHARS) return b;
+  return `${b.slice(0, BODY_PREVIEW_CHARS)}… (first ${BODY_PREVIEW_CHARS} of ${b.length} chars)`;
+}
+
+function approveFooter(action: OutboundAction, what: string): string[] {
+  const exp = new Date(action.expires_at * 1000).toISOString().replace('T', ' ').slice(0, 16);
+  return [
+    `Approve once, ${what}: tap ✅, or reply "YES ${action.approval_code}" in your WhatsApp self-chat ("NO ${action.approval_code}" to cancel).`,
+    `Expires ${exp} UTC.`,
+  ];
+}
+
+function formatEmailProposal(action: OutboundAction, p: Record<string, unknown>): string {
+  const lines = [
+    `📤 Approval needed #${action.id} · Email${p.draftId ? ' (existing Gmail draft)' : ''}`,
+    `From: ${p.account}`,
+    `To: ${asList(p.to).join(', ') || '(none)'}`,
+  ];
+  if (asList(p.cc).length) lines.push(`Cc: ${asList(p.cc).join(', ')}`);
+  if (asList(p.bcc).length) lines.push(`Bcc: ${asList(p.bcc).join(', ')}`);
+  lines.push(`Subject: ${p.subject || '(no subject)'}`);
+  if (p.threadId || p.inReplyTo) lines.push(`Reply in thread ${p.threadId ?? ''}${p.inReplyTo ? ` (to ${p.inReplyTo})` : ''}`.trim());
+  if (typeof p.attachments === 'number' && p.attachments > 0) lines.push(`Attachments: ${p.attachments}`);
+  if (p.html) lines.push('Includes an HTML version');
+  lines.push(`From agent: ${action.requested_by_agent}`, '', bodyPreview(String(p.body ?? '')), '');
+  return [...lines, ...approveFooter(action, 'this exact email')].join('\n');
+}
+
+function formatCalendarProposal(action: OutboundAction, p: Record<string, unknown>): string {
+  const act = String(p.action);
+  const cur = (p.current ?? {}) as Record<string, unknown>;
+  const tz = String(p.timeZone ?? '');
+  const head = act === 'create' ? 'CREATE event' : act === 'update' ? 'UPDATE event' : 'CANCEL event';
+  const lines = [
+    `📤 Approval needed #${action.id} · Calendar ${head} (attendees get the ${act === 'cancel' ? 'cancellation' : 'invite/update'} email)`,
+    `Account: ${p.account}${p.calendarId && p.calendarId !== 'primary' ? ` · calendar ${p.calendarId}` : ''}`,
+  ];
+  if (act !== 'create') {
+    lines.push(`Event: ${cur.summary ?? '(untitled)'} · ${formatWhen(cur.start as string | undefined, cur.end as string | undefined, tz)} · id ${p.eventId}`);
+    if (asList(cur.attendees).length) lines.push(`Current attendees: ${asList(cur.attendees).join(', ')}`);
+  }
+  if (act !== 'cancel') {
+    const arrow = act === 'update' ? '→ ' : '';
+    if (p.summary !== undefined) lines.push(`Title: ${arrow}${p.summary}`);
+    if (p.start) lines.push(`When: ${arrow}${formatWhen(p.start as string, p.end as string, tz)}`);
+    if (p.attendees !== undefined) lines.push(`Attendees: ${arrow}${asList(p.attendees).join(', ') || '(none)'}`);
+    else if (act === 'create') lines.push('Attendees: (none)');
+    if (p.location !== undefined) lines.push(`Location: ${arrow}${p.location}`);
+    if (p.conference) lines.push('Google Meet link: add');
+    if (typeof p.description === 'string' && p.description) lines.push(`Description: ${arrow}${bodyPreview(p.description)}`);
+  }
+  lines.push(`From agent: ${action.requested_by_agent}`, '');
+  return [...lines, ...approveFooter(action, `this exact ${act}`)].join('\n');
+}
+
 export function formatProposal(action: OutboundAction): string {
+  if (GOOGLE_KINDS.has(action.kind)) {
+    const p = parsePayload(action);
+    if (typeof p.account === 'string') {
+      return action.kind === 'email' ? formatEmailProposal(action, p) : formatCalendarProposal(action, p);
+    }
+  }
   const text = payloadText(action);
   const preview = text.length > 3500 ? text.slice(0, 3500) + `\n… (preview truncated; full text is ${text.length} chars)` : text;
   const exp = new Date(action.expires_at * 1000).toISOString().replace('T', ' ').slice(0, 16);
@@ -248,6 +353,20 @@ export interface OutboundDeps {
   notify(text: string, buttonsForActionId?: { id: number; kind: OutboundKind }): Promise<number | null>;
   /** Drop the ✅/❌ buttons from a proposal card after a decision. */
   clearButtons(messageId: number, footer: string, originalText: string): Promise<void>;
+  /** Gmail / Calendar executor (defaults to the workspace-mcp-credentialed GoogleClient). */
+  google?: GoogleExecutor;
+}
+
+let _google: GoogleClient | null = null;
+let _googleDir: string | undefined;
+/** Process-wide Google client (keeps refreshed access tokens in memory). */
+export function defaultGoogleClient(): GoogleClient {
+  const dir = outboundEnv('GOOGLE_CREDENTIALS_DIR');
+  if (!_google || dir !== _googleDir) {
+    _google = new GoogleClient({ credentialsDir: dir });
+    _googleDir = dir;
+  }
+  return _google;
 }
 
 function httpJson(method: 'GET' | 'POST', port: number, pathName: string, token: string, body?: unknown, timeoutMs = 60_000): Promise<{ status: number; data: any }> {
@@ -310,7 +429,8 @@ export const defaultDeps: OutboundDeps = {
   async notify(text, buttons) {
     const chatId = outboundEnv('ALLOWED_CHAT_ID');
     if (!chatId) { logger.warn('outbound: ALLOWED_CHAT_ID not set, cannot notify'); return null; }
-    const approveLabel = buttons?.kind === 'wa_message' ? '✅ Send' : '✅ Approve';
+    const approveLabel = buttons?.kind === 'wa_message' ? '✅ Send'
+      : buttons?.kind === 'email' ? '✅ Send email' : '✅ Approve';
     const result = await telegram('sendMessage', {
       chat_id: chatId,
       text,
@@ -415,6 +535,20 @@ export async function propose(input: ProposeInput, deps: OutboundDeps = defaultD
   }
   if (input.kind === 'revoke' && typeof input.payload.messageId !== 'string') {
     throw new OutboundError('revoke needs payload.messageId (the WhatsApp message id to delete for everyone)', 'bad_payload');
+  }
+  if (GOOGLE_KINDS.has(input.kind)) {
+    // Email / calendar are executed by the gateway, so the payload must be
+    // complete and valid now: that is exactly what Mohamed will approve.
+    try {
+      input = {
+        ...input,
+        payload: (input.kind === 'email'
+          ? validateEmailPayload(input.payload)
+          : validateCalendarPayload(input.payload)) as unknown as Record<string, unknown>,
+      };
+    } catch (err: any) {
+      throw new OutboundError(`${input.kind}: ${err?.message ?? err}`, 'bad_payload');
+    }
   }
 
   const now = deps.now();
@@ -532,7 +666,7 @@ export async function decide(input: DecideInput, deps: OutboundDeps = defaultDep
   action = getAction(action.id)!;
   logger.info({ id: action.id, via: input.via }, 'outbound: approved');
 
-  if (!EXECUTABLE_KINDS.has(action.kind)) {
+  if (!gatewayExecutes(action)) {
     await finishCard(action, `✅ Approved (${input.via}); the agent must now do it and record it`, deps);
     return {
       ok: true, action,
@@ -560,29 +694,55 @@ async function execute(action: OutboundAction, deps: OutboundDeps): Promise<Deci
   }
   const payload = JSON.parse(action.payload) as Record<string, unknown>;
 
-  let res: WaCallResult;
-  try {
-    res = action.kind === 'wa_message'
-      ? await deps.waPost('/send-as-me', { chatId: action.target, text: payload.text, idempotencyKey: action.idempotency_key, actionId: action.id })
-      : await deps.waPost('/revoke-as-me', { chatId: action.target, messageId: payload.messageId, idempotencyKey: action.idempotency_key, actionId: action.id });
-  } catch (err: any) {
-    return fail(err?.message ?? String(err));
+  let receipt: Record<string, unknown>;
+  if (GOOGLE_KINDS.has(action.kind)) {
+    // Never crash: a missing credentials file, a refused refresh
+    // (invalid_grant) or an API error all end as a failed row with a reason.
+    try {
+      const google = deps.google ?? defaultGoogleClient();
+      const r = action.kind === 'email'
+        ? await google.sendEmail(validateEmailPayload(payload), action.idempotency_key)
+        : await google.calendar(validateCalendarPayload(payload), action.idempotency_key);
+      receipt = { ...r, sentAt: new Date(deps.now() * 1000).toISOString() };
+    } catch (err: any) {
+      return fail(err?.message ?? String(err));
+    }
+  } else {
+    let res: WaCallResult;
+    try {
+      res = action.kind === 'wa_message'
+        ? await deps.waPost('/send-as-me', { chatId: action.target, text: payload.text, idempotencyKey: action.idempotency_key, actionId: action.id })
+        : await deps.waPost('/revoke-as-me', { chatId: action.target, messageId: payload.messageId, idempotencyKey: action.idempotency_key, actionId: action.id });
+    } catch (err: any) {
+      return fail(err?.message ?? String(err));
+    }
+    if (!res.ok) return fail(res.error ?? 'WhatsApp service refused');
+    receipt = {
+      messageId: res.messageId ?? null,
+      sentAt: new Date((res.timestamp ?? deps.now()) * 1000).toISOString(),
+      chatId: action.target,
+      duplicate: !!res.duplicate,
+    };
   }
-  if (!res.ok) return fail(res.error ?? 'WhatsApp service refused');
 
-  const receipt = {
-    messageId: res.messageId ?? null,
-    sentAt: new Date((res.timestamp ?? deps.now()) * 1000).toISOString(),
-    chatId: action.target,
-    duplicate: !!res.duplicate,
-  };
   setStatus(action.id, 'approved', 'executed', { executed_at: deps.now(), receipt: JSON.stringify(receipt) });
   const done = getAction(action.id)!;
   const line = formatReceipt(done, receipt);
-  logger.info({ id: done.id, messageId: receipt.messageId }, 'outbound: executed');
+  logger.info({ id: done.id, kind: done.kind, messageId: receipt.messageId ?? receipt.eventId ?? null }, 'outbound: executed');
   await deps.notify(line).catch((err) => logger.warn({ err }, 'outbound: receipt post failed'));
   await finishCard(done, '✅ Done', deps);
   return { ok: true, action: done, message: line };
+}
+
+/**
+ * Whether approval makes the gateway execute this row itself. Email /
+ * calendar rows proposed before the Google executor existed carry no
+ * `account`; they stay approval-only (agent + `complete`).
+ */
+export function gatewayExecutes(action: Pick<OutboundAction, 'kind' | 'payload'>): boolean {
+  if (!EXECUTABLE_KINDS.has(action.kind)) return false;
+  if (GOOGLE_KINDS.has(action.kind)) return typeof parsePayload(action).account === 'string';
+  return true;
 }
 
 async function finishCard(action: OutboundAction, footer: string, deps: OutboundDeps): Promise<void> {
@@ -594,7 +754,7 @@ async function finishCard(action: OutboundAction, footer: string, deps: Outbound
 export async function complete(id: number, receipt: Record<string, unknown>, deps: OutboundDeps = defaultDeps): Promise<DecisionResult> {
   const action = getAction(id);
   if (!action) return { ok: false, message: `Action #${id} not found.` };
-  if (EXECUTABLE_KINDS.has(action.kind)) {
+  if (gatewayExecutes(action)) {
     return { ok: false, action, message: `#${id} (${action.kind}) is executed by the gateway itself; nothing to complete.` };
   }
   if (action.status !== 'approved') {

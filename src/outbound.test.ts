@@ -195,8 +195,8 @@ describe('outbound gateway', () => {
 
   it('approval-only kinds: approve, then the agent records completion once', async () => {
     const { deps } = makeDeps();
-    const { action } = await propose({ kind: 'email', target: 'Someone@Example.com', payload: { text: 'Body', subject: 'Hi' } }, deps);
-    expect(action.target).toBe('someone@example.com');
+    const { action } = await propose({ kind: 'jira', target: 'JTS-136', payload: { text: 'Comment body' } }, deps);
+    expect(action.target).toBe('JTS-136');
     expect((await complete(action.id, { ref: 'x' }, deps)).ok).toBe(false); // not approved yet
     const r = await decide({ id: action.id, decision: 'approve', via: 'telegram' }, deps);
     expect(r.ok).toBe(true);

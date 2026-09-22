@@ -16,7 +16,7 @@ export function formatOutboxLine(a: OutboundAction): string {
   const when = new Date((a.executed_at ?? a.decided_at ?? a.created_at) * 1000).toISOString().slice(5, 16).replace('T', ' ');
   const text = payloadText(a).replace(/\s+/g, ' ').slice(0, 40);
   let mid = '';
-  try { const r = a.receipt ? JSON.parse(a.receipt) : null; if (r?.messageId) mid = ` · id …${String(r.messageId).slice(-8)}`; } catch { /* ignore */ }
+  try { const r = a.receipt ? JSON.parse(a.receipt) : null; if (r?.messageId) mid = ` · id …${String(r.messageId).slice(-8)}`; else if (r?.eventId) mid = ` · event …${String(r.eventId).slice(-8)}`; } catch { /* ignore */ }
   return `#${a.id} ${a.status} · ${a.kind} → ${a.target_name || a.target} · ${when} · ${text}${mid}`;
 }
 
