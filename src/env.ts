@@ -6,8 +6,13 @@ import path from 'path';
  * Does NOT load anything into process.env — callers decide what to
  * do with the values. This keeps secrets out of the process environment
  * so they don't leak to child processes.
+ *
+ * CLAUDECLAW_IGNORE_DOTENV=1 disables the file entirely (returns {}). The
+ * test harness sets it (src/test-guard.ts) so no test ever picks up real
+ * secrets or paths from a developer's or the production host's .env.
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
+  if (process.env.CLAUDECLAW_IGNORE_DOTENV === '1') return {};
   const envFile = path.join(process.cwd(), '.env');
   let content: string;
   try {

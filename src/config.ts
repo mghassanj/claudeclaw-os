@@ -115,7 +115,11 @@ const __dirname = path.dirname(__filename);
 // The SDK uses this as cwd, which causes Claude Code to load our CLAUDE.md
 // and all global skills from ~/.claude/skills/ via settingSources.
 export const PROJECT_ROOT = path.resolve(__dirname, '..');
-export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
+// STORE_DIR env var overrides the location (the test harness points it at a
+// temp dir so tests can never touch the live store).
+export const STORE_DIR = process.env.STORE_DIR
+  ? path.resolve(process.env.STORE_DIR)
+  : path.resolve(PROJECT_ROOT, 'store');
 
 // ── External config directory ────────────────────────────────────────
 // Personal config files (CLAUDE.md, agent.yaml, agent CLAUDE.md) can live

@@ -39,8 +39,27 @@ vi.mock('child_process', async () => {
 
 import { _initTestDatabase } from './db.js';
 import { buildDashboardApp } from './dashboard.js';
-import { STORE_DIR, CLAUDECLAW_CONFIG } from './config.js';
+import { PROJECT_ROOT, STORE_DIR, CLAUDECLAW_CONFIG } from './config.js';
 import type { Hono } from 'hono';
+import os from 'os';
+
+// This suite rewrites STORE_DIR/main-config.json and deletes
+// CLAUDECLAW_CONFIG/agents/main in afterAll. Those must be the temp dirs
+// set up by src/test-guard.ts, never a live install. Fail loudly otherwise.
+for (const [name, dir] of [['STORE_DIR', STORE_DIR], ['CLAUDECLAW_CONFIG', CLAUDECLAW_CONFIG]] as const) {
+  const tmp = fs.realpathSync(os.tmpdir());
+  const real = fs.realpathSync(dir);
+  if (!real.startsWith(tmp + path.sep)) {
+    throw new Error(`dashboard.contract.test: ${name}=${dir} is not a temp dir; refusing to run`);
+  }
+}
+
+// The SPA-shell tests need the Vite build (dist/web/index.html); without it
+// the dashboard falls back to the token-gated legacy HTML by design. CI runs
+// `npm run build` first and must never skip them; locally they skip with a
+// hint until you build.
+const SPA_BUILT = fs.existsSync(path.join(PROJECT_ROOT, 'dist', 'web', 'index.html'));
+const SKIP_SPA = !SPA_BUILT && !process.env.CI;
 
 const TOKEN = 'test-contract-token';
 const Q = '?token=' + TOKEN;
@@ -137,7 +156,9 @@ describe('auth gate', () => {
     '/agents/comms/files', '/chat', '/memories', '/hive', '/usage',
     '/audit', '/settings',
   ]) {
-    it(`serves SPA shell at ${path} without a token`, async () => {
+    // Only / and /warroom have a legacy (token-gated) fallback when unbuilt.
+    const needsBuild = path === '/' || path === '/warroom';
+    it.skipIf(SKIP_SPA && needsBuild)(`serves SPA shell at ${path} without a token`, async () => {
       const res = await app.request(path);
       expect(res.status).not.toBe(401);
     });

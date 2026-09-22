@@ -1,23 +1,21 @@
 // Runs before any test module imports. Sets the env vars that config.ts
 // reads at import time so contract tests can build a working dashboard
 // app without polluting the developer's real .env or DB.
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import { assertSafeTestEnvironment, sandboxTestDirs } from './test-guard.js';
+
+// Defense in depth: globalSetup already ran this in the main process, but a
+// worker could be started some other way (e.g. an IDE runner).
+assertSafeTestEnvironment();
+
+// Point CLAUDECLAW_CONFIG and STORE_DIR at fresh temp dirs and stop env.ts
+// from reading any .env, so no test can touch the developer's (or the
+// production host's) real config, store, or secrets. Tests that need a
+// specific layout populate these dirs or override the env var themselves.
+sandboxTestDirs();
 
 process.env.DASHBOARD_TOKEN = 'test-contract-token';
 process.env.DASHBOARD_MUTATIONS_ENABLED = process.env.DASHBOARD_MUTATIONS_ENABLED || 'true';
 process.env.WARROOM_ENABLED = process.env.WARROOM_ENABLED || 'false';
-
-// Sandbox CLAUDECLAW_CONFIG to a temp dir so tests that exercise
-// loadAgentConfig or resolveAgentDisplayName don't collide with the
-// developer's real ~/.claudeclaw config. The temp dir is created once
-// per test run; individual tests can populate it with agent.yaml files.
-if (!process.env.CLAUDECLAW_CONFIG) {
-  const testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claudeclaw-test-config-'));
-  fs.mkdirSync(path.join(testConfigDir, 'agents'), { recursive: true });
-  process.env.CLAUDECLAW_CONFIG = testConfigDir;
-}
 
 // Fallback bot token for tests that exercise loadAgentConfig('main').
 // The main agent falls back to TELEGRAM_BOT_TOKEN when agent.yaml omits

@@ -6,8 +6,11 @@
  * 2. Grammy's InputFile + replyWithDocument/replyWithPhoto via mocked context
  * 3. Real Telegram Bot API call to actually send a file to the chat
  *
- * The real API tests require TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID in .env.
- * They're skipped automatically if those aren't set.
+ * The real API tests send actual Telegram messages, so they are OPT-IN:
+ * they run only with RUN_TELEGRAM_INTEGRATION=1 plus TELEGRAM_TEST_BOT_TOKEN
+ * and TELEGRAM_TEST_CHAT_ID in the environment. They never read .env (the
+ * test harness forbids that), so a plain `npm test` on a machine with real
+ * credentials can never message anyone.
  */
 import fs from 'fs';
 import os from 'os';
@@ -30,24 +33,12 @@ function cleanupTempFile(filePath: string): void {
   } catch { /* ignore */ }
 }
 
-// ── Load .env for real API tests ────────────────────────────────────
-function loadEnv(): { token: string; chatId: string } {
-  const envPath = path.resolve(process.cwd(), '.env');
-  let token = '';
-  let chatId = '';
-  try {
-    const content = fs.readFileSync(envPath, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('TELEGRAM_BOT_TOKEN=')) {
-        token = trimmed.slice('TELEGRAM_BOT_TOKEN='.length).replace(/^['"]|['"]$/g, '');
-      }
-      if (trimmed.startsWith('ALLOWED_CHAT_ID=')) {
-        chatId = trimmed.slice('ALLOWED_CHAT_ID='.length).replace(/^['"]|['"]$/g, '');
-      }
-    }
-  } catch { /* no .env */ }
-  return { token, chatId };
+// ── Opt-in credentials for real API tests ──────────────────────────
+function loadIntegrationEnv(): { token: string; chatId: string } | null {
+  if (process.env.RUN_TELEGRAM_INTEGRATION !== '1') return null;
+  const token = process.env.TELEGRAM_TEST_BOT_TOKEN ?? '';
+  const chatId = process.env.TELEGRAM_TEST_CHAT_ID ?? '';
+  return token && chatId ? { token, chatId } : null;
 }
 
 // ── Unit tests: extractFileMarkers → mocked Grammy context ─────────
@@ -180,11 +171,13 @@ describe('file sending: mocked Grammy context', () => {
 
 // ── Real Telegram API tests ─────────────────────────────────────────
 // These actually send a file to your Telegram chat.
-// Skipped if TELEGRAM_BOT_TOKEN or ALLOWED_CHAT_ID are not in .env.
+// Opt-in only: RUN_TELEGRAM_INTEGRATION=1 + TELEGRAM_TEST_BOT_TOKEN + TELEGRAM_TEST_CHAT_ID.
 
 describe('file sending: real Telegram API', () => {
-  const { token, chatId } = loadEnv();
-  const canRunRealTests = !!(token && chatId);
+  const creds = loadIntegrationEnv();
+  const canRunRealTests = creds !== null;
+  const token = creds?.token ?? '';
+  const chatId = creds?.chatId ?? '';
 
   // Create a real temp file for the test
   let tmpFile: string;

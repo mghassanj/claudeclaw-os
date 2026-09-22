@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { readEnvFile } from './env.js';
@@ -20,9 +20,26 @@ function cleanup(): void {
 }
 
 describe('readEnvFile', () => {
+  // The test harness sets CLAUDECLAW_IGNORE_DOTENV=1 so nothing reads a real
+  // .env; these tests exercise the parser itself against a temp file.
+  let savedIgnore: string | undefined;
+  beforeEach(() => {
+    savedIgnore = process.env.CLAUDECLAW_IGNORE_DOTENV;
+    delete process.env.CLAUDECLAW_IGNORE_DOTENV;
+  });
+
   afterEach(() => {
+    if (savedIgnore === undefined) delete process.env.CLAUDECLAW_IGNORE_DOTENV;
+    else process.env.CLAUDECLAW_IGNORE_DOTENV = savedIgnore;
     vi.restoreAllMocks();
     cleanup();
+  });
+
+  it('returns {} when CLAUDECLAW_IGNORE_DOTENV=1', () => {
+    writeEnv('FOO=bar\n');
+    mockCwd();
+    process.env.CLAUDECLAW_IGNORE_DOTENV = '1';
+    expect(readEnvFile(['FOO'])).toEqual({});
   });
 
   function mockCwd(): void {

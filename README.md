@@ -1566,7 +1566,7 @@ npm run status    # Health check. env, bot, DB, service
 npm run build     # Compile TypeScript → dist/
 npm start         # Run compiled bot (production)
 npm run dev       # Run with tsx, no build needed (development)
-npm test          # Run test suite (vitest)
+npm test          # Run test suite (vitest; refuses to run on prod — see CONTRIBUTING.md "Running tests")
 npm run test:e2e  # Run local Playwright dashboard tests with fake providers
 npm run typecheck # Type-check without compiling
 ```
