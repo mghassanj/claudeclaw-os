@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('./gemini.js', () => ({
+vi.mock('./anthropic.js', () => ({
   generateContent: vi.fn(),
   parseJsonResponse: vi.fn(),
 }));
@@ -20,7 +20,7 @@ vi.mock('./logger.js', () => ({
 }));
 
 import { runConsolidation } from './memory-consolidate.js';
-import { generateContent, parseJsonResponse } from './gemini.js';
+import { generateContent, parseJsonResponse } from './anthropic.js';
 import {
   getUnconsolidatedMemories,
   saveConsolidationAtomic,
