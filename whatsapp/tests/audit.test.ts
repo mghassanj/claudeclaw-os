@@ -2,10 +2,16 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { Pool } from "pg";
 import { recordInbound, recordReply, alreadyReplied, close as closeAudit } from "../src/audit.js";
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// Writes real rows, so it only runs against an explicitly provided disposable
+// database. tests/test-setup.ts copies TEST_DATABASE_URL into DATABASE_URL
+// (which src/audit.ts reads); without TEST_DATABASE_URL the suite is skipped
+// and never touches whatever DATABASE_URL happens to be in the environment.
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+// Constructing a Pool does not connect; nothing is opened while skipped.
+const pool = new Pool({ connectionString: TEST_DATABASE_URL });
 const SUFFIX = `test-${Date.now()}`;
 
-describe("audit", () => {
+describe.skipIf(!TEST_DATABASE_URL)("audit (requires TEST_DATABASE_URL)", () => {
   afterAll(async () => {
     await pool.query("DELETE FROM whatsapp_exchanges WHERE group_id LIKE $1", [`${SUFFIX}%`]);
     await pool.end();
