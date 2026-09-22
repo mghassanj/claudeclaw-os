@@ -18,8 +18,7 @@ import {
   sendText, sendMediaFromPath,
 } from "./tools/send.js";
 import { checkVoiceArtifact, isVoiceOrAvatarArtifact } from "./tools/voice-qa.js";
-import { transcribeVoice } from "./tools/transcribe.js";
-import { extractDocument } from "./tools/extract_document.js";
+import { describeInbound, fitAttachments, type InboundMsg } from "./inbound-media.js";
 import { selectMissed, isSelfChatCandidate } from "./catchup.js";
 import { catchUpOpenLoops, notifyOpenLoops, reportSelfChatId } from "./open-loops-hook.js";
 
@@ -120,51 +119,24 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
     if (await alreadyReplied(chatId, msg.id._serialized)) return;
     console.log("[wa] not replied yet, processing");
 
-    let inboundText = msg.body ?? "";
-    let inboundType: "text" | "voice" | "image" = "text";
-
-    // inlineImage is set for image messages so composeReply can pass it to vision
-    let inlineImageBase64: string | undefined;
-    let inlineImageMime: string | undefined;
-
-    if (msg.hasMedia && (msg.type === "audio" || msg.type === "ptt")) {
-      const media = await msg.downloadMedia();
-      const buf = Buffer.from(media.data, "base64");
-      const t = await transcribeVoice(buf, media.mimetype);
-      inboundText = t.text;
-      inboundType = "voice";
-    } else if (msg.hasMedia && msg.type === "image") {
-      inboundType = "image";
-      const media = await msg.downloadMedia();
-      inlineImageBase64 = media.data;           // already base64 from whatsapp-web.js
-      inlineImageMime = media.mimetype;
-      inboundText = (msg.body ?? "").trim() || "[image attached — describe or answer based on its content]";
-    } else if (msg.hasMedia && msg.type === "document") {
-      // document = PDF / docx / xlsx sent by customer
-      inboundType = "image"; // existing enum only has text/voice/image; documents lump under "image"
-      const media = await msg.downloadMedia();
-      const buf = Buffer.from(media.data, "base64");
-      const filename: string = (media as any).filename ?? msg.body ?? "";
-      console.log("[wa] document received:", filename, "mime:", media.mimetype, "bytes:", buf.length);
-      try {
-        const extracted = await extractDocument(buf, media.mimetype, filename);
-        const caption = (msg.body ?? "").trim();
-        inboundText = [
-          `[Document attached: ${filename || media.mimetype}, ${extracted.bytesIn} bytes]`,
-          "",
-          "Extracted content:",
-          extracted.text,
-          "",
-          caption
-            ? `Customer's message with the doc: ${caption}`
-            : "Answer the question implied by the document, or summarize it if no question was asked.",
-        ].join("\n");
-        console.log("[wa] document extracted, chars:", extracted.text.length);
-      } catch (e) {
-        console.warn("[wa] document extraction failed:", e);
-        inboundText = `[Document attached but couldn't extract its text: ${filename || media.mimetype}] Please tell the user the document type is unsupported or corrupted and ask them to share text or a PDF.`;
-      }
+    // Every message type (text, voice, audio, image, sticker, video, GIF,
+    // document incl. scanned PDFs, location, contact card, poll…) becomes a
+    // text description plus optional vision image and forwardable files.
+    const media = await describeInbound(msg as unknown as InboundMsg);
+    if (!media) {
+      console.log("[wa] skipping non-content message type:", msg.type);
+      return;
     }
+    if (media.attachments.length || media.image) {
+      console.log("[wa] media:", media.kind, "attachments:", media.attachments.map((a) => `${a.role}:${a.mime}:${Math.round(a.base64.length * 0.75)}B`).join(","));
+    }
+    const inboundText = media.text;
+    // audit enum is text|voice|image; every file-based kind is logged as "image" as before.
+    const inboundType: "text" | "voice" | "image" =
+      media.kind === "voice" || media.kind === "audio" ? "voice"
+        : ["image", "sticker", "video", "document"].includes(media.kind) ? "image" : "text";
+    const inlineImageBase64 = media.image?.base64;
+    const inlineImageMime = media.image?.mime;
 
     console.log("[wa] type:", inboundType, "lang:", detectLang(inboundText));
     const inboundLang = detectLang(inboundText);
@@ -230,18 +202,24 @@ const onMessage = async (msg: WAMessage): Promise<void> => {
       }, Number(process.env.WA_SELF_INTERIM_MS ?? 60_000));
       // Channel metadata so the main agent knows this is WhatsApp (formatting,
       // length, language) and whether it came from a voice note or image.
-      const bridgeType = msg.type === "document" ? "document" : inboundType;
+      // A plain photo keeps the original image path (server stages it as
+      // "Photo received…"); every other file is forwarded as attachments.
+      const plainImage = media.kind === "image" && !!media.image;
+      const { kept, dropped } = fitAttachments(plainImage ? [] : media.attachments);
       const bridgeMeta: MainBridgeMeta = {
         channel: "whatsapp-self",
         lang: inboundLang,
-        inboundType: bridgeType,
-        ...(inboundType === "image" && inlineImageBase64 && inlineImageMime
-          ? { image: { base64: inlineImageBase64, mime: inlineImageMime } }
-          : {}),
+        inboundType: media.kind,
+        ...(plainImage ? { image: media.image } : {}),
+        ...(kept.length ? { attachments: kept } : {}),
       };
+      let bridgeText = bridgeInboundText(media.kind, inboundText, msg.body ?? "");
+      if (dropped.length) {
+        bridgeText += `\n\n(Not forwarded, too large for the bridge: ${dropped.map((a) => `${a.filename} ${(a.base64.length * 0.75 / 1024 / 1024).toFixed(1)} MB`).join(", ")}. Work from the description above.)`;
+      }
       let bridged: Awaited<ReturnType<typeof runMainBridge>>;
       try {
-        bridged = await runMainBridge(bridgeInboundText(bridgeType, inboundText, msg.body ?? ""), bridgeMeta);
+        bridged = await runMainBridge(bridgeText, bridgeMeta);
       } catch (e) {
         clearTimeout(interim);
         console.error("[wa] main-bridge failed:", e);

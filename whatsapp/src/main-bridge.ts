@@ -9,13 +9,16 @@
 // agent's own limit (AGENT_TIMEOUT_MS) plus time spent queued behind another
 // turn on the same session.
 import http from "node:http";
+import type { Attachment, InboundKind } from "./inbound-media.js";
 
 /** Channel metadata the dashboard's /api/agent/main-turn accepts (all optional). */
 export interface MainBridgeMeta {
   channel: "whatsapp-self";
   lang?: "ar" | "en" | "unknown";
-  inboundType?: "text" | "voice" | "image" | "document";
+  inboundType?: InboundKind;
   image?: { base64: string; mime: string };
+  /** Files to stage for the agent (original + derived frames/pages). */
+  attachments?: Attachment[];
 }
 
 /** A file the agent asked to send with a [SEND_FILE:…] / [SEND_PHOTO:…] marker. */

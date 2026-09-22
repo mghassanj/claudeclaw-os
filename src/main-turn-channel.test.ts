@@ -44,7 +44,7 @@ import { getSession, setSession } from './db.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn } from './memory.js';
 import { emitChatEvent } from './state.js';
 import { runWithTurnContext, takePendingHandoff } from './session-handoff.js';
-import { buildChannelTag, pickBridgeText, redactReply, runMainTurn } from './main-turn.js';
+import { buildChannelTag, parseBridgeAttachments, pickBridgeText, redactReply, runMainTurn, safeUploadName } from './main-turn.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const m = <T>(fn: T) => fn as any;
@@ -161,5 +161,43 @@ describe('runMainTurn', () => {
     expect(fs.readFileSync(saved!).toString('hex')).toBe('89504e470d0a1a0a');
     expect(prompt).toContain('Caption: "what is this?"');
     expect(prompt).toContain('[Channel: WhatsApp self-chat | image]');
+  });
+});
+
+describe('bridge attachments', () => {
+  it('validates the attachments field', () => {
+    expect(parseBridgeAttachments(undefined)).toBeUndefined();
+    expect(parseBridgeAttachments([{ base64: '', mime: 'x', filename: 'a' }, 'junk'])).toBeUndefined();
+    expect(parseBridgeAttachments([{ base64: 'QQ==', mime: 'application/pdf', filename: 'a.pdf', role: 'weird' }]))
+      .toEqual([{ base64: 'QQ==', mime: 'application/pdf', filename: 'a.pdf', role: 'original' }]);
+  });
+
+  it('makes upload names safe but keeps Arabic and the extension', () => {
+    expect(safeUploadName('../../etc/passwd')).toBe('passwd');
+    expect(safeUploadName('عقد العمل (نهائي).pdf')).toBe('عقد_العمل_نهائي_.pdf');
+    expect(safeUploadName('...')).toBe('file');
+  });
+
+  it('saves attachments and lists their paths in the prompt', async () => {
+    vi.clearAllMocks();
+    m(getSession).mockReturnValue('claude:sess-1');
+    m(buildMemoryContext).mockResolvedValue({ contextText: '', surfacedMemoryIds: [], surfacedMemorySummaries: new Map() });
+    m(runAgentWithRetry).mockResolvedValue({ text: 'ok', finalText: 'ok', newSessionId: 'claude:sess-1', usage: null });
+
+    await runMainTurn('[Video attached: clip.mp4]', {
+      channel: 'whatsapp-self', inboundType: 'video',
+      attachments: [
+        { base64: Buffer.from('MP4DATA').toString('base64'), mime: 'video/mp4', filename: 'clip.mp4', role: 'original' },
+        { base64: Buffer.from('JPG').toString('base64'), mime: 'image/jpeg', filename: 'frame-1.jpg', role: 'derived' },
+      ],
+    });
+
+    const prompt = m(runAgentWithRetry).mock.calls[0][0] as string;
+    expect(prompt).toContain('[Channel: WhatsApp self-chat | video]');
+    const paths = [...prompt.matchAll(/: (\/\S+) \(/g)].map((x) => x[1]);
+    expect(paths).toHaveLength(2);
+    expect(paths[0].startsWith(uploadsDir)).toBe(true);
+    expect(fs.readFileSync(paths[0], 'utf8')).toBe('MP4DATA');
+    expect(prompt).toContain('Derived image:');
   });
 });
