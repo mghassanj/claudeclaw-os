@@ -569,8 +569,7 @@ Every skill in `~/.claude/skills/` loads on every session. Call them directly (`
 
 | Command | What it does |
 |---------|-------------|
-| `/wa` | Open the WhatsApp interface. shows recent chats, pick one to read and reply |
-| `/slack` | Open the Slack interface, same flow as WhatsApp |
+| `/slack` | Open the Slack interface: shows recent conversations, pick one to read and reply |
 | `/dashboard` | Get a clickable link to the live web dashboard |
 
 **Security:**
@@ -1073,28 +1072,9 @@ cd whatsapp && npm ci && npm run build && npm start
 
 Open `http://127.0.0.1:9334/qr` and scan it from WhatsApp → Settings → Linked Devices. The session persists, so you only scan once. Set `WA_API_TOKEN` in `.env`; the service's API is locked without it. Agents send on your behalf only through `outbound-cli propose` (see `docs/pa-outbound-rules.md`).
 
-### Use it from Telegram
+### Use it
 
-```
-/wa              list 5 most recent chats (unread first)
-1                open chat #1, show last 10 messages
-r <text>         reply to the open chat
-r 2 <text>       quick-reply to chat #2 without opening it
-```
-
-### Incoming message notifications
-
-When someone messages you on WhatsApp:
-```
-📱 John Smith. new message
-/wa to view & reply
-```
-
-No content is forwarded automatically. You pull it on demand.
-
-### How the outbox works
-
-Messages you send via the bot go into a `wa_outbox` SQLite table. The daemon's outbox poller (every 3 seconds) picks them up and delivers them. If the daemon is temporarily down, messages queue and deliver when it comes back.
+The service bridges your WhatsApp self-chat to the main agent (same session and memory as Telegram) and exposes a token-gated local API. There is no Telegram `/wa` command: the old in-process WhatsApp client and its `wa_outbox` poller were removed.
 
 ### Message security
 
@@ -1364,9 +1344,9 @@ conversation_log  -- Full conversation turns (per agent, used by /respin)
 token_usage       -- Per-turn token counts and cost tracking
 hive_mind         -- Cross-agent activity log
 inter_agent_tasks -- Real-time delegation tracking (@agent: syntax)
-wa_message_map    -- Maps Telegram message IDs to WhatsApp chats
-wa_outbox         -- Queued outgoing WhatsApp messages
-wa_messages       -- Incoming WhatsApp message history (encrypted, 3-day retention)
+wa_message_map    -- Legacy (old in-process WhatsApp client); purged by retention only
+wa_outbox         -- Legacy (old in-process WhatsApp client); purged by retention only
+wa_messages       -- Legacy (old in-process WhatsApp client); purged by retention only
 slack_messages    -- Slack message history (encrypted, 3-day retention)
 ```
 
@@ -1816,7 +1796,6 @@ claudeclaw/
 │   ├── media.ts             Downloads files from Telegram, cleans up after 24h
 │   ├── slack.ts             Slack API client (conversations, messages, send)
 │   ├── slack-cli.ts         CLI wrapper for Slack (used by the slack skill)
-│   ├── whatsapp.ts          WhatsApp client via whatsapp-web.js
 │   ├── dashboard.ts         Web dashboard server (Hono + API routes + token auth)
 │   ├── dashboard-html.ts    Dashboard HTML/CSS/JS (Tailwind + Chart.js, no build step)
 │   ├── state.ts             Shared state and SSE event emitter
@@ -2092,7 +2071,7 @@ Every agent runs the exact same `createBot()` code path as the main bot. There's
 - Voice notes (STT via Groq, TTS via ElevenLabs/Gradium/macOS say)
 - Photo, document, and video handling (including Gemini video analysis)
 - File sending (`[SEND_FILE:...]` markers)
-- All built-in slash commands: /newchat, /respin, /voice, /model, /memory, /stop, /wa, /slack
+- All built-in slash commands: /newchat, /respin, /voice, /model, /memory, /stop, /slack
 - All global skills from `~/.claude/skills/` (auto-discovered and registered in each bot's Telegram command menu)
 - Memory system (FTS5 search, salience decay) -- isolated per agent
 - Context window tracking and compaction warnings

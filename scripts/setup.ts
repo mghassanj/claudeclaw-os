@@ -595,7 +595,7 @@ async function main() {
     : false;
   const wantVideo = await confirm('Video analysis? (send video clips and ask questions about them)', false);
   const wantWarRoom = await confirm('War Room? (live voice boardroom with your agent team, experimental)', false);
-  const wantWhatsApp = await confirm('WhatsApp bridge? (view and reply to WhatsApp from Telegram, highly experimental)', false);
+  const wantWhatsApp = await confirm('WhatsApp bridge? (talk to the main agent from your WhatsApp self-chat, highly experimental)', false);
 
   // WhatsApp explanation if they said yes
   if (wantWhatsApp) {
@@ -1343,7 +1343,7 @@ async function main() {
     info('  WhatsApp → Settings → Linked Devices → Link a Device');
     console.log();
     info('The session persists across restarts. Set WA_API_TOKEN in .env to enable its API.');
-    info('Then use /wa in Telegram to access your chats.');
+    info('Then message yourself on WhatsApp to talk to the main agent.');
     console.log();
     ok('Message bodies are encrypted at rest and auto-deleted after 3 days.');
     ok('The store/ directory is gitignored and will never be committed.');

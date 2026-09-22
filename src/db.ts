@@ -1539,65 +1539,10 @@ export function getRecentTaskOutputs(
     .all(agentId, cutoff) as Array<{ prompt: string; last_result: string; last_run: number }>;
 }
 
-// ── WhatsApp message map ──────────────────────────────────────────────
-
-export function saveWaMessageMap(telegramMsgId: number, waChatId: string, contactName: string): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `INSERT OR REPLACE INTO wa_message_map (telegram_msg_id, wa_chat_id, contact_name, created_at)
-     VALUES (?, ?, ?, ?)`,
-  ).run(telegramMsgId, waChatId, contactName, now);
-}
-
-export function lookupWaChatId(telegramMsgId: number): { waChatId: string; contactName: string } | null {
-  const row = db
-    .prepare('SELECT wa_chat_id, contact_name FROM wa_message_map WHERE telegram_msg_id = ?')
-    .get(telegramMsgId) as { wa_chat_id: string; contact_name: string } | undefined;
-  if (!row) return null;
-  return { waChatId: row.wa_chat_id, contactName: row.contact_name };
-}
-
-export function getRecentWaContacts(limit = 20): Array<{ waChatId: string; contactName: string; lastSeen: number }> {
-  const rows = db.prepare(
-    `SELECT wa_chat_id, contact_name, MAX(created_at) as lastSeen
-     FROM wa_message_map
-     GROUP BY wa_chat_id
-     ORDER BY lastSeen DESC
-     LIMIT ?`,
-  ).all(limit) as Array<{ wa_chat_id: string; contact_name: string; lastSeen: number }>;
-  return rows.map((r) => ({ waChatId: r.wa_chat_id, contactName: r.contact_name, lastSeen: r.lastSeen }));
-}
-
-// ── WhatsApp outbox ──────────────────────────────────────────────────
-
-export interface WaOutboxItem {
-  id: number;
-  to_chat_id: string;
-  body: string;
-  created_at: number;
-}
-
-export function enqueueWaMessage(toChatId: string, body: string): number {
-  const now = Math.floor(Date.now() / 1000);
-  const result = db.prepare(
-    `INSERT INTO wa_outbox (to_chat_id, body, created_at) VALUES (?, ?, ?)`,
-  ).run(toChatId, encryptField(body), now);
-  return result.lastInsertRowid as number;
-}
-
-export function getPendingWaMessages(): WaOutboxItem[] {
-  const rows = db.prepare(
-    `SELECT id, to_chat_id, body, created_at FROM wa_outbox WHERE sent_at IS NULL ORDER BY created_at`,
-  ).all() as WaOutboxItem[];
-  return rows.map((r) => ({ ...r, body: decryptField(r.body) }));
-}
-
-export function markWaMessageSent(id: number): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(`UPDATE wa_outbox SET sent_at = ? WHERE id = ?`).run(now, id);
-}
-
-// ── WhatsApp messages ────────────────────────────────────────────────
+// ── WhatsApp retention ───────────────────────────────────────────────
+// The wa_messages / wa_outbox / wa_message_map tables belonged to the old
+// in-process whatsapp-web.js client (removed). The WhatsApp service in
+// whatsapp/ owns its own storage; the sweep below still purges old rows.
 
 /**
  * Prune WhatsApp messages older than the given number of days.
@@ -1887,42 +1832,6 @@ export function pruneWarRoomMeetings(retentionDays = 90): { meetings: number; co
       convLog: Number(convDel.changes),
     };
   })();
-}
-
-// ── WhatsApp messages ────────────────────────────────────────────────
-
-export function saveWaMessage(
-  chatId: string,
-  contactName: string,
-  body: string,
-  timestamp: number,
-  isFromMe: boolean,
-): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `INSERT INTO wa_messages (chat_id, contact_name, body, timestamp, is_from_me, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, contactName, encryptField(body), timestamp, isFromMe ? 1 : 0, now);
-}
-
-export interface WaMessageRow {
-  id: number;
-  chat_id: string;
-  contact_name: string;
-  body: string;
-  timestamp: number;
-  is_from_me: number;
-  created_at: number;
-}
-
-export function getRecentWaMessages(chatId: string, limit = 20): WaMessageRow[] {
-  const rows = db
-    .prepare(
-      `SELECT * FROM wa_messages WHERE chat_id = ?
-       ORDER BY timestamp DESC LIMIT ?`,
-    )
-    .all(chatId, limit) as WaMessageRow[];
-  return rows.map((r) => ({ ...r, body: decryptField(r.body) }));
 }
 
 // ── Slack messages ────────────────────────────────────────────────

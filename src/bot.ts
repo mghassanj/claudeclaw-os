@@ -35,7 +35,7 @@ import {
   CLAUDE_MODEL_SONNET,
   CLAUDE_MODEL_HAIKU,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
@@ -169,7 +169,6 @@ import {
   checkVoiceArtifact,
 } from './voice.js';
 import { getSlackConversations, getSlackMessages, sendSlackMessage, SlackConversation } from './slack.js';
-import { getWaChats, getWaChatMessages, sendWhatsAppMessage, WaChat } from './whatsapp.js';
 import { registerOutboundHandlers } from './outbound-telegram.js';
 
 // Per-chat voice mode toggle (in-memory, resets on restart)
@@ -197,12 +196,6 @@ export function getMainModelOverride(): string | undefined {
   if (!ALLOWED_CHAT_ID) return undefined;
   return chatModelOverride.get(ALLOWED_CHAT_ID);
 }
-
-// WhatsApp state per Telegram chat
-interface WaStateList { mode: 'list'; chats: WaChat[] }
-interface WaStateChat { mode: 'chat'; chatId: string; chatName: string }
-type WaState = WaStateList | WaStateChat;
-const waState = new Map<string, WaState>();
 
 // Slack state per Telegram chat
 interface SlackStateList { mode: 'list'; convos: SlackConversation[] }
@@ -953,7 +946,6 @@ export function createBot(): Bot {
     { command: 'provider', description: 'Show active provider' },
     { command: 'memory', description: 'View recent memories' },
     { command: 'forget', description: 'Clear session' },
-    { command: 'wa', description: 'Recent WhatsApp messages' },
     { command: 'slack', description: 'Recent Slack messages' },
     { command: 'dashboard', description: 'Open web dashboard' },
     { command: 'stop', description: 'Stop current processing' },
@@ -981,7 +973,6 @@ export function createBot(): Bot {
       '/provider — Show active provider/model source\n' +
       '/memory — View recent memories\n' +
       '/forget — Clear session\n' +
-      '/wa — WhatsApp messages\n' +
       '/slack — Slack messages\n' +
       '/dashboard — Web dashboard\n' +
       '/stop — Stop current processing\n' +
@@ -1214,39 +1205,6 @@ export function createBot(): Bot {
     await ctx.reply('Session cleared. Memories will fade naturally over time.');
   });
 
-  // /wa — pull recent WhatsApp chats on demand
-  bot.command('wa', async (ctx) => {
-    const chatIdStr = ctx.chat!.id.toString();
-    if (await replyIfLocked(ctx)) return;
-
-    try {
-      const chats = await getWaChats(5);
-      if (chats.length === 0) {
-        await ctx.reply('No recent WhatsApp chats found.');
-        return;
-      }
-
-      // Sort: unread first, then by recency
-      chats.sort((a, b) => (b.unreadCount - a.unreadCount) || (b.lastMessageTime - a.lastMessageTime));
-
-      waState.set(chatIdStr, { mode: 'list', chats });
-
-      const lines = chats.map((c, i) => {
-        const unread = c.unreadCount > 0 ? ` <b>(${c.unreadCount} unread)</b>` : '';
-        const preview = c.lastMessage ? `\n   <i>${escapeHtml(c.lastMessage.slice(0, 60))}${c.lastMessage.length > 60 ? '…' : ''}</i>` : '';
-        return `${i + 1}. ${escapeHtml(c.name)}${unread}${preview}`;
-      }).join('\n\n');
-
-      await ctx.reply(
-        `📱 <b>WhatsApp</b>\n\n${lines}\n\n<i>Send a number to open • r &lt;num&gt; &lt;text&gt; to reply</i>`,
-        { parse_mode: 'HTML' },
-      );
-    } catch (err) {
-      logger.error({ err }, '/wa command failed');
-      await ctx.reply('WhatsApp not connected. Make sure WHATSAPP_ENABLED=true and the service is running.');
-    }
-  });
-
   // /slack — pull recent Slack conversations on demand
   bot.command('slack', async (ctx) => {
     const chatIdStr = ctx.chat!.id.toString();
@@ -1261,8 +1219,6 @@ export function createBot(): Bot {
       }
 
       slackState.set(chatIdStr, { mode: 'list', convos });
-      // Clear any WhatsApp state to avoid conflicts
-      waState.delete(chatIdStr);
 
       const lines = convos.map((c, i) => {
         const unread = c.unreadCount > 0 ? ` <b>(${c.unreadCount} unread)</b>` : '';
@@ -1387,7 +1343,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status', ...(AGENT_ID === 'main' ? ['/loops'] : [])]);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status', ...(AGENT_ID === 'main' ? ['/loops'] : [])]);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
@@ -1415,70 +1371,6 @@ export function createBot(): Bot {
       return;
     }
     touchActivity();
-
-    // ── WhatsApp state machine ──────────────────────────────────────
-    const state = waState.get(chatIdStr);
-
-    // "r <num> <text>" — quick reply from list view without opening chat
-    const quickReply = text.match(/^r\s+(\d)\s+(.+)/is);
-    if (quickReply && state?.mode === 'list') {
-      const idx = parseInt(quickReply[1]) - 1;
-      const replyText = quickReply[2].trim();
-      if (idx >= 0 && idx < state.chats.length) {
-        const target = state.chats[idx];
-        try {
-          await sendWhatsAppMessage(target.id, replyText);
-          await ctx.reply(`✓ Sent to <b>${escapeHtml(target.name)}</b>`, { parse_mode: 'HTML' });
-        } catch (err) {
-          logger.error({ err }, 'WhatsApp quick reply failed');
-          await ctx.reply('Failed to send. Check that WhatsApp is still connected.');
-        }
-        return;
-      }
-    }
-
-    // "<num>" or "open 2" etc — open a chat from the list
-    const waSelection = state?.mode === 'list' ? extractSelectionNumber(text) : null;
-    if (state?.mode === 'list' && waSelection !== null) {
-      const idx = waSelection - 1;
-      if (idx >= 0 && idx < state.chats.length) {
-        const target = state.chats[idx];
-        try {
-          const messages = await getWaChatMessages(target.id, 10);
-          waState.set(chatIdStr, { mode: 'chat', chatId: target.id, chatName: target.name });
-
-          const lines = messages.map((m) => {
-            const time = new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            return `<b>${m.fromMe ? 'You' : escapeHtml(m.senderName)}</b> <i>${time}</i>\n${escapeHtml(m.body)}`;
-          }).join('\n\n');
-
-          await ctx.reply(
-            `💬 <b>${escapeHtml(target.name)}</b>\n\n${lines}\n\n<i>r &lt;text&gt; to reply • /wa to go back</i>`,
-            { parse_mode: 'HTML' },
-          );
-        } catch (err) {
-          logger.error({ err }, 'WhatsApp open chat failed');
-          await ctx.reply('Could not open that chat. Try /wa again.');
-        }
-        return;
-      }
-    }
-
-    // "r <text>" — reply to open chat
-    if (state?.mode === 'chat') {
-      const replyMatch = text.match(/^r\s+(.+)/is);
-      if (replyMatch) {
-        const replyText = replyMatch[1].trim();
-        try {
-          await sendWhatsAppMessage(state.chatId, replyText);
-          await ctx.reply(`✓ Sent to <b>${escapeHtml(state.chatName)}</b>`, { parse_mode: 'HTML' });
-        } catch (err) {
-          logger.error({ err }, 'WhatsApp reply failed');
-          await ctx.reply('Failed to send. Check that WhatsApp is still connected.');
-        }
-        return;
-      }
-    }
 
     // ── Slack state machine ────────────────────────────────────────
     const slkState = slackState.get(chatIdStr);
@@ -1547,24 +1439,7 @@ export function createBot(): Bot {
       }
     }
 
-    // Legacy: Telegram-native reply to a forwarded WA message
-    const replyToId = ctx.message.reply_to_message?.message_id;
-    if (replyToId) {
-      const waTarget = lookupWaChatId(replyToId);
-      if (waTarget) {
-        try {
-          await sendWhatsAppMessage(waTarget.waChatId, text);
-          await ctx.reply(`✓ Sent to ${waTarget.contactName} on WhatsApp`);
-        } catch (err) {
-          logger.error({ err }, 'WhatsApp send failed');
-          await ctx.reply('Failed to send WhatsApp message. Check logs.');
-        }
-        return;
-      }
-    }
-
-    // Clear WA/Slack state and pass through to Claude
-    if (state) waState.delete(chatIdStr);
+    // Clear Slack state and pass through to Claude
     if (slkState) slackState.delete(chatIdStr);
     // Fire-and-forget so grammY can process /stop while agent runs
     messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, text));
@@ -1896,27 +1771,5 @@ async function processDashboardMessage(
     emitChatEvent({ type: 'error', chatId: chatIdStr, content: userMessage });
   } finally {
     setProcessing(chatIdStr, false);
-  }
-}
-
-/**
- * Send a brief WhatsApp notification ping to Telegram (no message content).
- * Full message is only shown when user runs /wa.
- */
-export async function notifyWhatsAppIncoming(
-  api: Bot['api'],
-  contactName: string,
-  isGroup: boolean,
-  groupName?: string,
-): Promise<void> {
-  if (!ALLOWED_CHAT_ID) return;
-
-  const origin = isGroup && groupName ? groupName : contactName;
-  const text = `📱 <b>${escapeHtml(origin)}</b> — new message\n<i>/wa to view &amp; reply</i>`;
-
-  try {
-    await api.sendMessage(parseInt(ALLOWED_CHAT_ID), text, { parse_mode: 'HTML' });
-  } catch (err) {
-    logger.error({ err }, 'Failed to send WhatsApp notification');
   }
 }
