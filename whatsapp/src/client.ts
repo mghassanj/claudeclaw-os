@@ -14,7 +14,10 @@ export interface ClientState {
   patched: Promise<void>;
 }
 
-export function buildClient(authPath = "/home/ubuntu/.wwebjs_auth"): ClientState {
+// WA_AUTH_PATH lets the service run as its own Unix user with the session in a
+// directory only that user can read (agents run as ubuntu and must not be able
+// to read or drive the WhatsApp session).
+export function buildClient(authPath = process.env.WA_AUTH_PATH ?? "/home/ubuntu/.wwebjs_auth"): ClientState {
   // Chrome used to run with --remote-debugging-port (puppeteer's default),
   // publishing the port in <profile>/DevToolsActivePort. Agents found it and
   // drove WhatsApp Web directly over CDP (2026-09-21 Nora double-send and

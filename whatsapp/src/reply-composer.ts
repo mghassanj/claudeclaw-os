@@ -344,6 +344,10 @@ export async function composeReply(input: ComposeInput): Promise<ComposeResult> 
         "mcp__mindmapgen__generate_mind_map",
         "mcp__videooverviewgen__generate_video_overview",
       ],
+      // Belt and braces: this agent answers third parties, so it must never get
+      // shell or file-write tools even if allowedTools or the permission mode
+      // change later.
+      disallowedTools: ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"],
       cwd: "/home/ubuntu/claudeclaw-os",
       mcpServers: {
         rag: {
