@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import { buildClient } from "./client.js";
 import type { Message as WAMessage } from "whatsapp-web.js";
 import { startHealthServer } from "./healthcheck.js";
+import { warmContactsCache } from "./wa-api.js";
 import { currentConfig, reloadConfig } from "./config.js";
 import { wasSentByBot, consumeExpectedOutgoing } from "./sent-registry.js";
 import { parseApprovalReply, forwardApprovalDecision } from "./outbound-approval.js";
@@ -488,6 +489,8 @@ async function reportInterruptedSelfChat(chatId: string, msgs: WAMessage[]): Pro
 let loopCatchUpStarted = false;
 state.client.on("ready", () => {
   catchUpMissed().catch((e) => console.error("[wa] catch-up failed:", e));
+  // Contact lookups (/contacts/find) serve from a cache; fill it now so the first one is fast.
+  state.patched.then(() => warmContactsCache(state.client)).catch(() => {});
   // Open-loop replies that arrived while we were down (once per process).
   if (!loopCatchUpStarted) {
     loopCatchUpStarted = true;
