@@ -509,6 +509,16 @@ function createSchema(database: Database.Database): void {
       updated_at          INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_contacts_wa ON contacts(wa_chat_id);
+
+    -- /newchat handoffs waiting for the next fresh-session turn
+    -- (session-handoff.ts). Persisted so a restart between /newchat and the
+    -- next message doesn't lose it; the row is deleted when consumed.
+    CREATE TABLE IF NOT EXISTS pending_handoffs (
+      agent_id    TEXT NOT NULL,
+      chat_id     TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, chat_id)
+    );
   `);
 }
 
@@ -1676,6 +1686,20 @@ export function recordCredHealth(
       fail_streak = excluded.fail_streak
   `).run({ name, status, detail, now: nowSec, changed: changed ? 1 : 0, streak: failStreak, raw: rawStatus });
   return prev ? prev.status : null;
+}
+
+// ── Pending /newchat handoffs (session-handoff.ts) ────────────────────
+
+export function setPendingHandoff(chatId: string, agentId: string, nowSec = Math.floor(Date.now() / 1000)): void {
+  db.prepare(
+    `INSERT INTO pending_handoffs (agent_id, chat_id, created_at) VALUES (?, ?, ?)
+     ON CONFLICT(agent_id, chat_id) DO UPDATE SET created_at = excluded.created_at`,
+  ).run(agentId, chatId, nowSec);
+}
+
+/** Delete the pending mark; true when one existed (so it is consumed at most once). */
+export function deletePendingHandoff(chatId: string, agentId: string): boolean {
+  return db.prepare('DELETE FROM pending_handoffs WHERE agent_id = ? AND chat_id = ?').run(agentId, chatId).changes > 0;
 }
 
 // ── Conversation Log ──────────────────────────────────────────────────

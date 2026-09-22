@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-import { getHiveMindEntries, getRecentConversation } from './db.js';
+import { deletePendingHandoff, getHiveMindEntries, getRecentConversation, setPendingHandoff } from './db.js';
 import { logger } from './logger.js';
 
 /**
@@ -16,7 +16,9 @@ import { logger } from './logger.js';
  *   2. /newchat: the next turn for that chat starts a new session on purpose.
  *      /newchat marks a handoff pending; the first turn afterwards (Telegram
  *      or the WhatsApp bridge) consumes it. /respin already replays history,
- *      so a respin turn only clears the pending mark.
+ *      so a respin turn only clears the pending mark. The mark is stored in
+ *      the DB (pending_handoffs), so it survives a restart between /newchat
+ *      and the next message.
  *
  * The handoff is built from conversation_log (last HANDOFF_TURNS rows for
  * that chat + agent) plus the most recent `session_end` summary in the hive
@@ -113,19 +115,24 @@ export function handoffForCurrentTurn(): string {
   return buildSessionHandoff(ctx.chatId, ctx.agentId, 'self-heal');
 }
 
-// ── /newchat pending handoffs ───────────────────────────────────────
-
-const pendingHandoffs = new Set<string>();
-const key = (chatId: string, agentId: string) => `${agentId}\u0000${chatId}`;
+// ── /newchat pending handoffs (persisted in pending_handoffs) ──────────
 
 /** Called by /newchat: the next fresh-session turn for this chat gets a handoff. */
 export function markHandoffPending(chatId: string, agentId: string): void {
-  pendingHandoffs.add(key(chatId, agentId));
+  try {
+    setPendingHandoff(chatId, agentId);
+  } catch (err) {
+    logger.warn({ err, chatId, agentId }, 'session handoff: could not persist pending mark');
+  }
 }
 
 /** Clear a pending handoff without building it (e.g. /respin supplies its own history). */
 export function clearPendingHandoff(chatId: string, agentId: string): void {
-  pendingHandoffs.delete(key(chatId, agentId));
+  try {
+    deletePendingHandoff(chatId, agentId);
+  } catch (err) {
+    logger.warn({ err, chatId, agentId }, 'session handoff: could not clear pending mark');
+  }
 }
 
 /**
@@ -133,8 +140,11 @@ export function clearPendingHandoff(chatId: string, agentId: string): void {
  * clears the mark so it is injected at most once.
  */
 export function takePendingHandoff(chatId: string, agentId: string): string {
-  const k = key(chatId, agentId);
-  if (!pendingHandoffs.has(k)) return '';
-  pendingHandoffs.delete(k);
-  return buildSessionHandoff(chatId, agentId, 'newchat');
+  let pending = false;
+  try {
+    pending = deletePendingHandoff(chatId, agentId);
+  } catch (err) {
+    logger.warn({ err, chatId, agentId }, 'session handoff: could not read pending mark');
+  }
+  return pending ? buildSessionHandoff(chatId, agentId, 'newchat') : '';
 }

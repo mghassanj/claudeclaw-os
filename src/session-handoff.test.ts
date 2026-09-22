@@ -8,7 +8,7 @@ vi.mock('./logger.js', () => ({
 }));
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { _initTestDatabase, logConversationTurn, logToHiveMind } from './db.js';
+import { _initTestDatabase, deletePendingHandoff, logConversationTurn, logToHiveMind, setPendingHandoff } from './db.js';
 import {
   buildSessionHandoff,
   clearPendingHandoff,
@@ -99,6 +99,25 @@ describe('pending /newchat handoffs', () => {
     markHandoffPending('c1', 'main');
     clearPendingHandoff('c1', 'main');
     expect(takePendingHandoff('c1', 'main')).toBe('');
+  });
+
+  it('lives in the DB, so a mark written before a restart is still consumed after it', () => {
+    seedConversation('c1', 'main', 2);
+    // Written by the previous process (/newchat), nothing held in memory.
+    setPendingHandoff('c1', 'main', 1);
+    const handoff = takePendingHandoff('c1', 'main');
+    expect(handoff).toContain('The user started a new session with /newchat.');
+    expect(handoff).toContain('answer 1');
+    expect(takePendingHandoff('c1', 'main')).toBe('');
+  });
+
+  it('markHandoffPending persists the mark (keyed by chat + agent)', () => {
+    markHandoffPending('c1', 'main');
+    markHandoffPending('c1', 'main'); // idempotent
+    expect(deletePendingHandoff('c1', 'research')).toBe(false);
+    expect(deletePendingHandoff('c2', 'main')).toBe(false);
+    expect(deletePendingHandoff('c1', 'main')).toBe(true);
+    expect(deletePendingHandoff('c1', 'main')).toBe(false);
   });
 });
 
